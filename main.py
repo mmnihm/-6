@@ -1151,7 +1151,6 @@ async def user_catalog_callback_handler(client, query):
         return
 
     if action[1] == "folder" and len(action) == 3:
-        await query.answer()
         try:
             index = int(action[2])
             categories = await db.list_categories()
@@ -1159,6 +1158,7 @@ async def user_catalog_callback_handler(client, query):
         except (ValueError, IndexError):
             await query.answer("分类已更新，请重新打开列表", show_alert=True)
             return
+        await query.answer()
         files = await db.list_category_files(category, limit=12)
         rows = []
         for row in files:
@@ -1167,7 +1167,7 @@ async def user_catalog_callback_handler(client, query):
                 f"📄 {name}", callback_data=f"uc:open:{row['file_key']}"
             )])
             rows.append([InlineKeyboardButton(
-                "⭐ 收藏/取消收藏", callback_data=f"uc:star:{row['file_key']}"
+                "⭐ 收藏/取消收藏", callback_data=f"uc:star:{row['file_key']}:folder"
             )])
         rows.append([InlineKeyboardButton("⬅️ 文件夹列表", callback_data="uc:folders")])
         await message.edit_text(
@@ -1194,7 +1194,7 @@ async def user_catalog_callback_handler(client, query):
             )])
             rows.append([InlineKeyboardButton(
                 "⭐ 收藏/取消收藏",
-                callback_data=f"uc:star:{row['file_key']}",
+                callback_data=f"uc:star:{row['file_key']}:{'history' if is_history else 'favorites'}",
             )])
         rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
         body = title + "\n\n" + (
@@ -1216,8 +1216,26 @@ async def user_catalog_callback_handler(client, query):
             return
         added = await db.toggle_favorite(user.id, action[2])
         await query.answer("⭐ 已加入收藏" if added else "已取消收藏")
-        if len(action) > 3 and action[3] == "refresh":
-            pass
+        if len(action) > 3 and action[3] == "favorites":
+            records = await db.list_favorites(user.id, 12)
+            rows = []
+            for row in records:
+                rows.append([InlineKeyboardButton(
+                    f"📄 {row['file_name'][:32]}",
+                    callback_data=f"uc:open:{row['file_key']}",
+                )])
+                rows.append([InlineKeyboardButton(
+                    "⭐ 取消收藏",
+                    callback_data=f"uc:star:{row['file_key']}:favorites",
+                )])
+            rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
+            await message.edit_text(
+                "⭐ 收藏列表\\n\\n" + (
+                    "\\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
+                    if records else "这里暂时没有收藏。"
+                ),
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
         return
 
 
