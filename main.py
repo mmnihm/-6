@@ -89,31 +89,30 @@ async def is_admin(user_id: int) -> bool:
     return config.ADMIN_ID == user_id
 
 
-async def has_access(user_id: int) -> bool:
+async def get_membership_tier(user_id: int):
     if await is_admin(user_id):
-        return True
+        return "超级管理员"
     if await db.is_banned(user_id):
         log.info("Membership denied: user %s is in the local ban list", user_id)
-        return False
+        return None
     if await db.has_manual_membership(user_id):
-        return True
+        return "手动会员"
 
     group_id = await get_member_group_id()
     if not group_id:
         log.error("Membership check cannot run: member group is not bound")
-        return False
+        return None
 
     try:
-        # Pyrogram uses its local peer database to resolve MTProto IDs.
-        # Warm both peers before get_chat_member, otherwise a valid member
-        # can be rejected with PeerIdInvalid after a fresh deployment.
+        # Warm Telegram peers before checking membership to avoid false
+        # PeerIdInvalid results after a fresh deployment.
         group = await app.get_chat(group_id)
         if int(group.id) != int(group_id):
             log.error(
                 "Membership group resolution mismatch: configured=%s resolved=%s",
                 group_id, getattr(group, "id", None),
             )
-            return False
+            return None
 
         target = await app.get_users(user_id)
         if int(target.id) != int(user_id):
@@ -121,7 +120,7 @@ async def has_access(user_id: int) -> bool:
                 "Membership user resolution mismatch: requested=%s resolved=%s",
                 user_id, getattr(target, "id", None),
             )
-            return False
+            return None
 
         member = await app.get_chat_member(group.id, target.id)
         status = member.status
@@ -130,32 +129,38 @@ async def has_access(user_id: int) -> bool:
             user_id, group_id, getattr(status, "value", status),
         )
         if status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
-            return False
+            return None
         if status == ChatMemberStatus.RESTRICTED:
-            return bool(getattr(member, "is_member", False))
-        return status in (
+            return "黄金会员" if getattr(member, "is_member", False) else None
+        if status in (
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.OWNER,
-        )
+        ):
+            return "黄金会员"
+        return None
     except UserNotParticipant:
         log.info(
             "Membership check: Telegram confirms user %s is not in group %s",
             user_id, group_id,
         )
-        return False
+        return None
     except PeerIdInvalid:
         log.exception(
             "Membership peer resolution failed after warming peers: user=%s group=%s",
             user_id, group_id,
         )
-        return False
+        return None
     except Exception:
         log.exception(
             "Membership check failed: user=%s group=%s",
             user_id, group_id,
         )
-        return False
+        return None
+
+
+async def has_access(user_id: int) -> bool:
+    return await get_membership_tier(user_id) is not None
 
 
 def media_details(message):
@@ -329,7 +334,8 @@ async def start_handler(client, message):
     if not await has_access(user.id):
         await message.reply_text("⛔ 本机器人仅对会员开放。请先加入会员群。")
         return
-    await message.reply_text(WELCOME)
+    tier = await get_membership_tier(user.id)
+    await message.reply_text(f"{WELCOME}\n\n🏅 当前身份：{tier}")
 
 
 @app.on_message(
