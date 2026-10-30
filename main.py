@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import secrets
 from datetime import datetime, timezone
 
@@ -60,6 +61,15 @@ app = Client(
     bot_token=config.BOT_TOKEN,
 )
 
+SCANNER_WORKDIR = os.path.dirname(config.DATABASE_PATH) or "."
+SCANNER_SESSION_PATH = os.path.join(SCANNER_WORKDIR, "member_cloud_scanner.session")
+scanner = (
+    Client("member_cloud_scanner", api_id=config.API_ID,
+           api_hash=config.API_HASH, workdir=SCANNER_WORKDIR)
+    if os.path.exists(SCANNER_SESSION_PATH) else None
+)
+scan_task = None
+
 WELCOME = (
     "☁️ 会员文件网盘\n\n"
     "• 发送文件：自动保存到主频道和备份频道\n"
@@ -119,6 +129,90 @@ def parse_category(message) -> str:
     if first.startswith("分类:") or first.startswith("分类："):
         return first[3:].strip()[:40] or "未分类"
     return "未分类"
+
+
+def guess_category(message, media_type, file_name):
+    explicit = parse_category(message)
+    if explicit != "未分类":
+        return explicit
+    name = (file_name or "").lower()
+    rules = (
+        ("电视剧", ("电视剧", "连续剧", "season", "episode", "第", "集")),
+        ("动漫", ("动漫", "动画", "番剧", "anime")),
+        ("电影", ("电影", "movie", "bluray", "web-dl")),
+        ("综艺", ("综艺", "真人秀", "variety")),
+        ("短视频", ("短视频", "短片", "reels", "tiktok")),
+        ("音乐", ("音乐", "歌曲", "专辑", "music", "album")),
+        ("教程", ("教程", "课程", "教学", "course", "lesson")),
+    )
+    for category, keywords in rules:
+        if any(word in name for word in keywords):
+            return category
+    return {
+        "video": "视频",
+        "photo": "图片",
+        "animation": "动图",
+        "audio": "音频",
+        "voice": "语音",
+        "document": "文档",
+    }.get(media_type, "其他")
+
+
+async def run_history_scan(primary_channel_id, backup_channel_id):
+    global scan_task
+    try:
+        for channel_id, other_channel_id in (
+            (primary_channel_id, backup_channel_id),
+            (backup_channel_id, primary_channel_id),
+        ):
+            progress = await db.get_scan_progress(channel_id)
+            if progress["completed"]:
+                continue
+            offset_id = progress["last_message_id"]
+            log.info("History scan started for channel %s from offset %s", channel_id, offset_id)
+            async for item in scanner.get_chat_history(channel_id, offset_id=offset_id):
+                media_type, file_name, fingerprint = media_details(item)
+                created_at = (
+                    item.date.isoformat() if getattr(item, "date", None) else
+                    datetime.now(timezone.utc).isoformat()
+                )
+                if media_type and fingerprint:
+                    category = guess_category(item, media_type, file_name)
+                    await db.save_scanned_message(
+                        channel_id, other_channel_id, primary_channel_id,
+                        item.id, fingerprint, file_name, media_type, category,
+                        created_at, config.ADMIN_ID,
+                        secrets.token_urlsafe(9).replace("-", "").replace("_"),
+                    )
+                else:
+                    await db.advance_scan_cursor(channel_id, item.id)
+            await db.mark_scan_completed(channel_id)
+
+        primary_progress = await db.get_scan_progress(primary_channel_id)
+        backup_progress = await db.get_scan_progress(backup_channel_id)
+        _, total_files, _, _ = await db.stats()
+        await app.send_message(
+            config.ADMIN_ID,
+            "✅ 主备份频道历史扫描完成\n"
+            f"主频道已检查媒体：{primary_progress['scanned_count']}\n"
+            f"备份频道已检查媒体：{backup_progress['scanned_count']}\n"
+            f"当前目录文件总数：{total_files}\n\n"
+            "只有主、备份频道都能匹配到的资源才会加入可取回目录。",
+        )
+    except asyncio.CancelledError:
+        await app.send_message(config.ADMIN_ID, "⏸️ 历史扫描已暂停。再次发送 /scan 可从上次进度继续。")
+        raise
+    except Exception:
+        log.exception("History scan failed")
+        try:
+            await app.send_message(
+                config.ADMIN_ID,
+                "⚠️ 历史扫描遇到错误，已保留进度。修复频道访问或稍后发送 /scan 继续。",
+            )
+        except Exception:
+            log.exception("Could not notify admin about scan failure")
+    finally:
+        scan_task = None
 
 
 async def reply_admin_only(message):
@@ -391,6 +485,87 @@ async def bind_member_group_in_chat_handler(client, message):
     )
 
 
+@app.on_message(filters.private & filters.command("scan"))
+async def scan_history_handler(client, message):
+    global scan_task
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    if scanner is None:
+        await message.reply_text(
+            "⚠️ 尚未登录历史扫描账号。\n"
+            "请在部署终端运行：python login_scanner.py\n"
+            "使用一个普通 Telegram 账号登录，并确保 data 目录使用持久化存储。"
+        )
+        return
+    if scan_task and not scan_task.done():
+        await message.reply_text("⏳ 历史扫描正在运行。发送 /scanstatus 查看进度。")
+        return
+    primary, backup = await get_storage_channels()
+    if not primary or not backup:
+        await message.reply_text("❌ 请先绑定主存储频道和备份频道。")
+        return
+    try:
+        await scanner.get_chat(primary)
+        await scanner.get_chat(backup)
+    except Exception:
+        log.exception("Scanner account cannot access both storage channels")
+        await message.reply_text(
+            "❌ 扫描账号无法访问主频道或备份频道。\n"
+            "请先用普通 Telegram 账号加入这两个私有频道，再重新运行 /scan。"
+        )
+        return
+    p = await db.get_scan_progress(primary)
+    b = await db.get_scan_progress(backup)
+    if p["completed"] and b["completed"]:
+        await message.reply_text("✅ 两个频道的历史扫描已完成。已有目录会保留，新增资源由机器人正常登记。")
+        return
+    scan_task = asyncio.create_task(run_history_scan(primary, backup))
+    await message.reply_text(
+        "🚀 已启动主、备份频道历史扫描。\n"
+        "只读取文件信息并建立目录，不下载、不转发、不删除原消息。\n\n"
+        "发送 /scanstatus 查看进度；发送 /scanstop 可暂停，之后可继续。"
+    )
+
+
+@app.on_message(filters.private & filters.command("scanstatus"))
+async def scan_status_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    primary, backup = await get_storage_channels()
+    if not primary or not backup:
+        await message.reply_text("主频道或备份频道尚未绑定。")
+        return
+    p = await db.get_scan_progress(primary)
+    b = await db.get_scan_progress(backup)
+    running = bool(scan_task and not scan_task.done())
+    def label(progress):
+        return "已完成" if progress["completed"] else (
+            f"进行中/待继续（最近消息 ID：{progress['last_message_id']}）"
+        )
+    await message.reply_text(
+        f"📊 历史扫描状态：{'运行中' if running else '未运行'}\n\n"
+        f"主频道：{label(p)}\n已检查媒体：{p['scanned_count']}\n\n"
+        f"备份频道：{label(b)}\n已检查媒体：{b['scanned_count']}"
+    )
+
+
+@app.on_message(filters.private & filters.command("scanstop"))
+async def scan_stop_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    if scan_task and not scan_task.done():
+        scan_task.cancel()
+        await message.reply_text("⏸️ 已请求暂停扫描，进度会保留。")
+    else:
+        await message.reply_text("当前没有正在运行的扫描任务。")
+
+
 @app.on_message(filters.private & filters.command("import"))
 async def import_help_handler(client, message):
     user = message.from_user
@@ -522,7 +697,7 @@ async def admin_callback_handler(client, query):
             "📖 管理命令速查\n\n"
             "/bindgroup — 绑定会员群\n/bindmain — 绑定主存储频道\n/bindbackup — 绑定备份频道\n/storage — 查看绑定状态\n"
             "/grant 用户ID 天数|永久 — 授权会员\n/revoke 用户ID — 取消授权\n/ban 用户ID 原因 — 封禁\n/unban 用户ID — 解封\n"
-            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量导入仓库群旧文件（转发给机器人）\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
+            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scan — 自动扫描主备份频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
             reply_markup=back_keyboard(),
         )
 
@@ -734,8 +909,22 @@ async def main():
     global BOT_USERNAME
     await db.initialize()
     await app.start()
+    scanner_started = False
     runner = None
     try:
+        global scanner
+        if scanner is not None:
+            try:
+                await scanner.start()
+                scanner_started = True
+                scanner_me = await scanner.get_me()
+                if scanner_me.is_bot:
+                    raise RuntimeError("History scanner must be a normal Telegram user account")
+                log.info("History scanner ready: user %s", scanner_me.id)
+            except Exception:
+                log.exception("History scanner is unavailable; bot will continue without history scanning")
+                scanner = None
+
         me = await app.get_me()
         BOT_USERNAME = me.username
         log.info("Bot started: @%s", me.username)
@@ -750,6 +939,8 @@ async def main():
     finally:
         if runner is not None:
             await runner.cleanup()
+        if scanner_started and scanner is not None:
+            await scanner.stop()
         await app.stop()
 
 
