@@ -258,7 +258,7 @@ async def run_history_scan(primary_channel_id, backup_channel_id):
             f"主频道已检查媒体：{primary_progress['scanned_count']}\n"
             f"备份频道已检查媒体：{backup_progress['scanned_count']}\n"
             f"当前目录文件总数：{total_files}\n\n"
-            "只有主、备份频道都能匹配到的资源才会加入可取回目录。",
+            "主频道资源可直接进入目录；备份频道中匹配到的副本会自动补全，取回时优先使用主频道。",
         )
     except asyncio.CancelledError:
         await app.send_message(config.ADMIN_ID, "⏸️ 历史扫描已暂停。再次发送 /scan 可从上次进度继续。")
