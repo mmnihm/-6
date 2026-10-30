@@ -9,7 +9,9 @@ from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ChatMemberStatus, ChatType
-from pyrogram.errors import FloodWait, PeerIdInvalid, UserNotParticipant
+from pyrogram.errors import (
+    FloodWait, PeerIdInvalid, UserNotParticipant, SessionPasswordNeeded,
+)
 
 import config
 from database import Database
@@ -23,6 +25,8 @@ log = logging.getLogger("member-cloud")
 db = Database(config.DATABASE_PATH)
 BOT_USERNAME = None
 pending_channel_bindings = {}
+scanner_login_states = {}
+scanner_login_clients = {}
 
 
 def admin_keyboard():
@@ -31,6 +35,7 @@ def admin_keyboard():
         [InlineKeyboardButton("👥 绑定会员群", callback_data="mc:bindgroup")],
         [InlineKeyboardButton("👤 会员管理", callback_data="mc:members"), InlineKeyboardButton("📂 文件管理", callback_data="mc:files")],
         [InlineKeyboardButton("📢 群发广播", callback_data="mc:broadcast"), InlineKeyboardButton("📊 数据统计", callback_data="mc:stats")],
+        [InlineKeyboardButton("🔐 扫描账号登录", callback_data="mc:scannerlogin")],
         [InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
     ])
 
@@ -485,6 +490,187 @@ async def bind_member_group_in_chat_handler(client, message):
     )
 
 
+@app.on_message(filters.private & filters.command("scanlogin"))
+async def scanner_login_start_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    if scanner is not None and scanner.is_connected:
+        await message.reply_text("✅ 扫描账号已经登录。可以直接发送 /scan 开始扫描。")
+        return
+    old_client = scanner_login_clients.pop(user.id, None)
+    if old_client:
+        try:
+            await old_client.disconnect()
+        except Exception:
+            pass
+    login_client = Client(
+        "member_cloud_scanner",
+        api_id=config.API_ID,
+        api_hash=config.API_HASH,
+        workdir=SCANNER_WORKDIR,
+    )
+    try:
+        await login_client.connect()
+    except Exception:
+        log.exception("Could not connect scanner login client")
+        await message.reply_text("❌ 无法连接 Telegram 登录服务，请稍后重试。")
+        return
+    scanner_login_clients[user.id] = login_client
+    scanner_login_states[user.id] = {"step": "phone"}
+    await message.reply_text(
+        "🔐 扫描账号登录\n\n"
+        "请发送专门用于扫描的普通 Telegram 账号手机号（含国家区号，例如 +1）。\n"
+        "接下来 Telegram 会发送登录验证码，你需要在这里输入验证码；如开启两步验证，还需要输入密码。\n\n"
+        "⚠️ 建议使用专用扫描账号，不要使用存有重要私聊的主账号。验证码/两步验证密码会短暂经过本机器人私聊，处理后会尝试立即删除输入消息。\n"
+        "发送 /scancancel 可取消。"
+    )
+
+
+@app.on_message(filters.private & filters.command("scancancel"))
+async def scanner_login_cancel_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    login_client = scanner_login_clients.pop(user.id, None)
+    scanner_login_states.pop(user.id, None)
+    if login_client:
+        try:
+            await login_client.disconnect()
+        except Exception:
+            log.exception("Could not disconnect cancelled scanner login")
+    await message.reply_text("已取消扫描账号登录流程。")
+
+
+@app.on_message(
+    filters.private & filters.text & ~filters.command
+)
+async def scanner_login_input_handler(client, message):
+    global scanner
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        return
+    state = scanner_login_states.get(user.id)
+    login_client = scanner_login_clients.get(user.id)
+    if not state or not login_client:
+        return
+    value = (message.text or "").strip()
+    if not value:
+        return
+
+    if state["step"] == "phone":
+        phone = value.replace(" ", "").replace("-", "")
+        try:
+            sent = await login_client.send_code(phone)
+            state.update({
+                "step": "code",
+                "phone": phone,
+                "phone_code_hash": sent.phone_code_hash,
+            })
+            await message.reply_text(
+                "📩 已请求 Telegram 登录验证码。\n"
+                "请查看 Telegram 官方服务消息或短信，把收到的验证码发送到这里。\n"
+                "不要发送其他账号的验证码。"
+            )
+        except Exception:
+            log.exception("Could not request scanner login code")
+            await message.reply_text("❌ 验证码发送失败，请检查手机号和网络后发送 /scancancel，再重新 /scanlogin。")
+        return
+
+    if state["step"] == "code":
+        try:
+            signed_in = await login_client.sign_in(
+                state["phone"], state["phone_code_hash"], value
+            )
+        except SessionPasswordNeeded:
+            state["step"] = "password"
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await message.reply_text(
+                "🔒 这个账号开启了两步验证。\n"
+                "请发送该扫描账号的两步验证密码。处理后会尝试立即删除密码消息。"
+            )
+            return
+        except Exception:
+            log.exception("Scanner account verification code failed")
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await message.reply_text("❌ 验证码无效或已过期。请发送 /scancancel 后重新 /scanlogin。")
+            return
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        if getattr(signed_in, "is_bot", False):
+            await login_client.log_out()
+            scanner_login_clients.pop(user.id, None)
+            scanner_login_states.pop(user.id, None)
+            await message.reply_text("❌ 不能使用机器人账号，请使用普通 Telegram 用户账号。")
+            return
+    elif state["step"] == "password":
+        try:
+            signed_in = await login_client.check_password(value)
+        except Exception:
+            log.exception("Scanner account two-step password failed")
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await message.reply_text("❌ 两步验证密码不正确。请重新输入，或发送 /scancancel 取消。")
+            return
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        if getattr(signed_in, "is_bot", False):
+            await login_client.log_out()
+            scanner_login_clients.pop(user.id, None)
+            scanner_login_states.pop(user.id, None)
+            await message.reply_text("❌ 不能使用机器人账号，请使用普通 Telegram 用户账号。")
+            return
+    else:
+        return
+
+    try:
+        await login_client.disconnect()
+        scanner = Client(
+            "member_cloud_scanner",
+            api_id=config.API_ID,
+            api_hash=config.API_HASH,
+            workdir=SCANNER_WORKDIR,
+        )
+        await scanner.start()
+        scanner_me = await scanner.get_me()
+        if scanner_me.is_bot:
+            raise RuntimeError("Scanner login must be a normal user account")
+        scanner_login_clients.pop(user.id, None)
+        scanner_login_states.pop(user.id, None)
+        await message.reply_text(
+            "✅ 扫描账号登录成功！\n"
+            f"账号 ID：{scanner_me.id}\n"
+            "登录会话已保存在部署平台的数据目录中。\n\n"
+            "请确保平台的数据目录启用了持久化存储。现在可以发送 /scan 开始扫描主、备份频道。"
+        )
+    except Exception:
+        log.exception("Could not activate scanner after login")
+        try:
+            await login_client.disconnect()
+        except Exception:
+            pass
+        scanner = None
+        scanner_login_clients.pop(user.id, None)
+        scanner_login_states.pop(user.id, None)
+        await message.reply_text(
+            "⚠️ 验证通过，但扫描账号启动失败。请确认部署平台的数据目录可写并且已持久化，然后重新 /scanlogin。"
+        )
+
+
 @app.on_message(filters.private & filters.command("scan"))
 async def scan_history_handler(client, message):
     global scan_task
@@ -495,8 +681,7 @@ async def scan_history_handler(client, message):
     if scanner is None:
         await message.reply_text(
             "⚠️ 尚未登录历史扫描账号。\n"
-            "请在部署终端运行：python login_scanner.py\n"
-            "使用一个普通 Telegram 账号登录，并确保 data 目录使用持久化存储。"
+            "请先发送 /scanlogin，在机器人私聊中完成登录。"
         )
         return
     if scan_task and not scan_task.done():
@@ -694,12 +879,25 @@ async def admin_callback_handler(client, query):
     elif action == "stats":
         users, files, members, banned = await db.stats()
         await message.edit_text(f"📊 数据统计\n\n用户总数：{users}\n文件总数：{files}\n有效手动会员：{members}\n封禁用户：{banned}", reply_markup=back_keyboard())
+    elif action == "scannerlogin":
+        await message.edit_text(
+            "🔐 扫描账号设置\n\n"
+            "使用普通 Telegram 用户账号读取主、备份频道历史。建议使用专用账号，并先将它加入两个私有频道。\n\n"
+            "点击下方按钮后，机器人会引导你输入手机号、登录验证码及（如有）两步验证密码。敏感输入会尝试立即删除。\n"
+            "登录成功后会保存在部署平台的数据目录中；请确保该目录已启用持久化。",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 开始登录", callback_data="mc:scannerloginstart")],
+                [InlineKeyboardButton("⬅️ 返回", callback_data="mc:home")],
+            ]),
+        )
+    elif action == "scannerloginstart":
+        await message.reply_text("请发送 /scanlogin 开始登录流程。")
     elif action == "commands":
         await message.edit_text(
             "📖 管理命令速查\n\n"
             "/bindgroup — 绑定会员群\n/bindmain — 绑定主存储频道\n/bindbackup — 绑定备份频道\n/storage — 查看绑定状态\n"
             "/grant 用户ID 天数|永久 — 授权会员\n/revoke 用户ID — 取消授权\n/ban 用户ID 原因 — 封禁\n/unban 用户ID — 解封\n"
-            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scan — 自动扫描主备份频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
+            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scan — 自动扫描主备份频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
             reply_markup=back_keyboard(),
         )
 
