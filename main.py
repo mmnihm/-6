@@ -471,9 +471,7 @@ async def directory_export_upload_handler(client, message):
             })
         if not clean_resources:
             raise ValueError("文件中没有可迁移的媒体资源。")
-        primary, backup = await get_storage_channels()
-        if not primary or not backup:
-            raise ValueError("主频道或备份频道尚未绑定，请先完成 /bindmain 和 /bindbackup。")
+        # Source-linked directory import does not require destination storage channels.
         await status.edit_text(
             f"🔎 正在检查重复资源…共 {len(clean_resources)} 条，请稍候。"
         )
@@ -492,7 +490,7 @@ async def directory_export_upload_handler(client, message):
             f"📄 资源清单：{len(clean_resources)} 个\n"
             f"⏭️ 已导入/重复：{existing} 个\n"
             f"⚠️ 无效记录：{invalid} 个\n\n"
-            "当前只完成预览，尚未复制任何文件。\n"
+            "本次只导入目录和资源索引，不复制文件；原文件继续保留在 Cangku 频道。\n"
             "确认开始请发送：/importconfirm\n"
             "取消本次预览请发送：/importcancel"
         )
