@@ -342,6 +342,45 @@ async def bind_member_group_handler(client, message):
     )
 
 
+@app.on_message((filters.group | filters.supergroup) & filters.command("bindgroup"))
+async def bind_member_group_in_chat_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await message.reply_text("⛔ 仅超级管理员可绑定会员群。")
+        return
+
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("❌ 请在需要绑定的会员群内发送 /bindgroup。")
+        return
+
+    me = await client.get_me()
+    try:
+        bot_member = await client.get_chat_member(message.chat.id, me.id)
+    except Exception:
+        log.exception("Could not verify bot membership in group %s", message.chat.id)
+        await message.reply_text("❌ 机器人无法读取本群成员状态。请确认机器人已加入群组，并将机器人设为管理员后重试。")
+        return
+
+    valid_statuses = (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+        ChatMemberStatus.RESTRICTED,
+    )
+    if bot_member.status not in valid_statuses:
+        await message.reply_text("❌ 机器人尚未加入本群，请先添加机器人后重试。")
+        return
+
+    await db.set_setting("member_group_id", str(message.chat.id))
+    pending_channel_bindings.pop(user.id, None)
+    await message.reply_text(
+        "✅ 会员群绑定成功！\\n"
+        f"群组：{message.chat.title or '未命名'}\\n"
+        f"群 ID：{message.chat.id}\\n\\n"
+        "机器人已记录这个私密群组。可回到私聊发送 /storage 查看绑定状态。"
+    )
+
+
 @app.on_message(filters.private & filters.command("storage"))
 async def storage_status_handler(client, message):
     user = message.from_user
@@ -417,7 +456,8 @@ async def admin_callback_handler(client, query):
         label = {"bindgroup": "会员群", "bindmain": "主存储私有频道", "bindbackup": "备份私有频道"}[action]
         await message.edit_text(
             f"📨 请把{label}中的任意一条普通消息直接转发给机器人。\n\n"
-            "请勿复制粘贴消息。机器人需要先加入对应群/频道；两个存储频道还需要授予管理员及发消息权限。",
+            "会员群：推荐直接在会员群内发送 /bindgroup，无需转发。\\n"
+            "存储频道：仍可直接转发一条频道消息；机器人需要是频道管理员。",
             reply_markup=back_keyboard(),
         )
     elif action == "members":
