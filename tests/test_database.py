@@ -1,6 +1,9 @@
 import os
 import tempfile
 import unittest
+import faulthandler
+
+faulthandler.dump_traceback_later(30, repeat=True)
 
 from database import Database
 
