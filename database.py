@@ -42,7 +42,9 @@ class PostgresCompat:
         return await self.connection.execute(self.adapt_sql(sql), params or ())
 
     async def executemany(self, sql, params):
-        return await self.connection.executemany(self.adapt_sql(sql), params)
+        async with self.connection.cursor() as cursor:
+            await cursor.executemany(self.adapt_sql(sql), params)
+            return cursor.rowcount
 
     async def executescript(self, script):
         for statement in script.split(";"):
