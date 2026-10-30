@@ -14,6 +14,5 @@ def required(name: str) -> str:
 BOT_TOKEN = required("BOT_TOKEN")
 API_ID = int(required("API_ID"))
 API_HASH = required("API_HASH")
-MEMBER_GROUP_ID = int(required("MEMBER_GROUP_ID"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/bot.db")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
