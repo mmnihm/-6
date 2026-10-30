@@ -801,6 +801,23 @@ async def directory_import_confirm_handler(client, message):
     & (filters.document | filters.video | filters.audio | filters.photo |
        filters.animation | filters.voice)
 )
+async def retry_missing_backup(client, file_key, primary_channel_id, primary_message_id, backup_channel_id):
+    """Retry a missing backup without risking the already-published primary copy."""
+    try:
+        record = await db.get_file(file_key)
+        if not record or int(record["backup_message_id"] or 0) > 0:
+            return
+        copied = await client.copy_message(
+            chat_id=backup_channel_id,
+            from_chat_id=primary_channel_id,
+            message_id=primary_message_id,
+        )
+        if await db.update_backup_message_id(file_key, copied.id):
+            log.info("Backup copy completed for file %s (message %s)", file_key, copied.id)
+    except Exception:
+        log.exception("Automatic backup retry failed for file %s", file_key)
+
+
 async def upload_handler(client, message):
     user = message.from_user
     if not user:
@@ -824,61 +841,87 @@ async def upload_handler(client, message):
     if not primary_channel_id or not backup_channel_id:
         await message.reply_text("⚠️ 网盘尚未完成双频道绑定，请管理员先使用 /bindmain 和 /bindbackup。")
         return
+    if primary_channel_id == backup_channel_id:
+        await message.reply_text("❌ 主存储频道和备份频道不能是同一个频道，请管理员检查 /storage。")
+        return
 
     category = parse_category(message)
-    status = await message.reply_text("⏳ 正在保存到主频道和备份频道…")
+    status = await message.reply_text("⏳ 正在检查频道权限并保存文件…")
     primary_id = None
-    backup_id = None
+    backup_id = 0
+    step = "检查主频道权限"
     try:
+        me = await client.get_me()
+        for label, channel_id in (("主频道", primary_channel_id), ("备份频道", backup_channel_id)):
+            member = await client.get_chat_member(channel_id, me.id)
+            if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+                raise RuntimeError(f"{label}中机器人不是管理员（当前状态：{member.status}）")
+            if member.status == ChatMemberStatus.ADMINISTRATOR:
+                privileges = getattr(member, "privileges", None)
+                if privileges is not None and not getattr(privileges, "can_post_messages", False):
+                    raise RuntimeError(f"{label}中机器人没有“发布消息”权限")
+
+        step = "保存主频道"
         primary = await client.copy_message(
             chat_id=primary_channel_id,
             from_chat_id=message.chat.id,
             message_id=message.id,
         )
         primary_id = primary.id
-        backup = await client.copy_message(
-            chat_id=backup_channel_id,
-            from_chat_id=message.chat.id,
-            message_id=message.id,
-        )
-        backup_id = backup.id
 
+        step = "保存备份频道"
+        backup_error = None
+        try:
+            backup = await client.copy_message(
+                chat_id=backup_channel_id,
+                from_chat_id=message.chat.id,
+                message_id=message.id,
+            )
+            backup_id = backup.id
+        except Exception as exc:
+            backup_error = exc
+            log.exception("Backup-channel copy failed; keeping primary copy")
+
+        step = "写入文件数据库"
         key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
         inserted = await db.add_file(
             key, user.id, file_name, media_type,
-            primary.id, backup.id, category, source_fingerprint
+            primary_id, backup_id, category, source_fingerprint
         )
         if not inserted:
-            for channel_id, message_id in (
-                (primary_channel_id, primary.id),
-                (backup_channel_id, backup.id),
-            ):
-                try:
-                    await client.delete_messages(channel_id, message_id)
-                except Exception:
-                    log.warning("Could not remove duplicate import copy %s", message_id)
-            await status.edit_text(f"⏭️ 已跳过重复文件：{file_name}")
+            await status.edit_text(f"⏭️ 已跳过重复文件：{file_name}\n数据库中已存在相同文件记录。")
             return
+
+        step = "生成分享链接"
+        global BOT_USERNAME
+        if not BOT_USERNAME:
+            BOT_USERNAME = (await client.get_me()).username
+        link = share_url(key)
+        if backup_error:
+            await status.edit_text(
+                "⚠️ 文件已保存到主频道，分享链接已生成；备份频道暂未成功，系统会保留主副本。\n"
+                f"📂 分类：{category}\n📄 文件：{file_name}\n\n"
+                f"🔗 分享链接：\n{link}\n\n"
+                f"备份原因：{type(backup_error).__name__}: {str(backup_error)[:250]}",
+                disable_web_page_preview=True,
+            )
+            asyncio.create_task(retry_missing_backup(client, key, primary_channel_id, primary_id, backup_channel_id))
+        else:
+            await status.edit_text(
+                "✅ 双频道保存成功\n"
+                f"📂 分类：{category}\n📄 文件：{file_name}\n\n"
+                f"🔗 分享链接：\n{link}",
+                disable_web_page_preview=True,
+            )
+    except Exception as exc:
+        log.exception("Upload/store failed at step: %s", step)
+        # Never delete a successfully stored channel copy on a later-stage error.
+        detail = f"{type(exc).__name__}: {str(exc)[:350]}"
         await status.edit_text(
-            "✅ 双频道保存成功\n"
-            f"📂 分类：{category}\n"
-            f"📄 文件：{file_name}\n\n"
-            f"🔗 分享链接：\n{share_url(key)}",
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        log.exception("Upload/store failed")
-        for channel_id, message_id in (
-            (primary_channel_id, primary_id),
-            (backup_channel_id, backup_id),
-        ):
-            if message_id is not None:
-                try:
-                    await client.delete_messages(channel_id, message_id)
-                except Exception:
-                    log.warning("Could not roll back storage message %s", message_id)
-        await status.edit_text(
-            "❌ 保存失败，未生成分享链接。请检查两个私有频道的机器人管理员权限。"
+            f"❌ 文件保存失败（步骤：{step}）\n{detail}\n\n"
+            + (f"主频道消息已保存，消息 ID：{primary_id}。请管理员检查数据库/分享链接步骤；未删除该副本。"
+               if primary_id is not None else
+               "主频道尚未确认保存成功。请管理员检查频道管理员身份、发布消息权限及 Telegram 网络。")
         )
 
 
@@ -914,6 +957,14 @@ async def bind_channel_forward_handler(client, message):
         return
 
     if not is_group_binding:
+        if member.status == ChatMemberStatus.ADMINISTRATOR:
+            privileges = getattr(member, "privileges", None)
+            if privileges is not None and not getattr(privileges, "can_post_messages", False):
+                await message.reply_text(
+                    "❌ 机器人虽然是频道管理员，但没有“发布消息”权限。\n"
+                    "请在频道管理权限中允许机器人发布消息后，再重新绑定。"
+                )
+                return
         other_key = "storage_backup_channel_id" if setting_key == "storage_primary_channel_id" else "storage_primary_channel_id"
         other_id = await db.get_setting(other_key)
         if other_id and int(other_id) == source.id:
@@ -1698,28 +1749,41 @@ async def user_catalog_callback_handler(client, query):
             return
         total = next((int(row["file_count"] or 0) for row in await db.list_categories()
                       if row["share_key"] == share_key), 0)
+        saved_offset = await db.get_category_delivery_progress(user.id, share_key)
+        # A stale button must never make a user receive already-delivered batches again.
+        offset = max(offset, saved_offset)
         batch = await db.list_category_files(category["name"], limit=20, offset=offset)
         if not batch:
-            await query.answer("这一批没有可获取的资源", show_alert=True)
+            await query.answer("这个目录的资源已经领取完毕", show_alert=True)
             return
         await query.answer("开始发送，最多20个文件")
-        progress = await message.reply_text(f"📥 正在获取「{category['name']}」第 {offset // 20 + 1} 批资源（最多20个）…")
+        progress = await message.reply_text(
+            f"📥 正在获取「{category['name']}」第 {offset // 20 + 1} 批资源（最多20个）…"
+        )
         sent = failed = 0
-        for item in batch:
-            ok, _ = await send_catalog_file(client, user.id, item["file_key"])
+        next_offset = offset
+        for index, item in enumerate(batch):
+            ok, error_text = await send_catalog_file(client, user.id, item["file_key"])
             if ok:
                 sent += 1
+                next_offset = offset + index + 1
+                await db.set_category_delivery_progress(user.id, share_key, next_offset)
             else:
                 failed += 1
+                log.warning(
+                    "Folder delivery paused: user=%s share_key=%s offset=%s file=%s reason=%s",
+                    user.id, share_key, offset + index, item["file_key"], error_text,
+                )
+                break
             await asyncio.sleep(0.05)
         text_result = (
-            f"📦 本批发送完成\n\n成功：{sent} 个\n失败：{failed} 个"
+            f"📦 本批发送完成\n\n成功：{sent} 个\n失败：{failed} 个\n"
+            f"已记录领取进度：{next_offset}/{total}"
         )
-        next_offset = offset + len(batch)
         buttons = []
         if next_offset < total:
             buttons.append([InlineKeyboardButton(
-                "📥 获取下一批（最多20个）",
+                "📥 获取下一批（最多20个）" if failed == 0 else "🔄 重试未发送文件",
                 callback_data=f"uc:getfolder:{share_key}:{next_offset}",
             )])
         buttons.append([InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")])
