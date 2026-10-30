@@ -252,18 +252,26 @@ class Database:
                     updated_at=excluded.updated_at
             """, (channel_id, message_id, iso_now()))
 
+            current = await (await db.execute("""
+                SELECT message_id, file_name, media_type, category, created_at
+                FROM scanner_messages
+                WHERE channel_id=? AND fingerprint=?
+            """, (channel_id, fingerprint))).fetchone()
             other = await (await db.execute("""
                 SELECT message_id, file_name, media_type, category, created_at
                 FROM scanner_messages
                 WHERE channel_id=? AND fingerprint=?
             """, (other_channel_id, fingerprint))).fetchone()
             inserted = False
-            if other:
+            if current and other:
                 if channel_id == primary_channel_id:
-                    primary_id, backup_id = message_id, other["message_id"]
-                    source = (file_name, media_type, category, created_at)
+                    primary_id, backup_id = current["message_id"], other["message_id"]
+                    source = (
+                        current["file_name"], current["media_type"],
+                        current["category"], current["created_at"]
+                    )
                 else:
-                    primary_id, backup_id = other["message_id"], message_id
+                    primary_id, backup_id = other["message_id"], current["message_id"]
                     source = (
                         other["file_name"], other["media_type"],
                         other["category"], other["created_at"]
