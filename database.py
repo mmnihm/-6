@@ -702,7 +702,7 @@ class Database:
                 LEFT JOIN files ON files.category=all_categories.category
                 LEFT JOIN categories ON categories.name=all_categories.category
                 GROUP BY all_categories.category, categories.description,
-                         categories.created_at, categories.updated_at
+                         categories.created_at, categories.updated_at, categories.share_key
                 ORDER BY lower(all_categories.category)
             """)).fetchall()
 
