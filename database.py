@@ -375,6 +375,25 @@ class Database:
                 "SELECT * FROM files WHERE source_fingerprint=?", (fingerprint,)
             )).fetchone()
 
+    async def get_existing_fingerprints(self, fingerprints):
+        """Return already-imported fingerprints with a small number of batched queries."""
+        values = list(dict.fromkeys(fingerprints))
+        found = set()
+        # Keep each IN clause below common SQLite parameter limits.
+        for start in range(0, len(values), 500):
+            batch = values[start:start + 500]
+            if not batch:
+                continue
+            placeholders = ",".join("?" for _ in batch)
+            async with self.connect() as db:
+                rows = await (await db.execute(
+                    f"SELECT source_fingerprint FROM files "
+                    f"WHERE source_fingerprint IN ({placeholders})",
+                    batch,
+                )).fetchall()
+            found.update(row["source_fingerprint"] for row in rows)
+        return found
+
     async def add_file(self, key, owner_id, file_name, media_type,
                        primary_id, backup_id, category="未分类",
                        source_fingerprint=None):
