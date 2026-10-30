@@ -7,6 +7,7 @@ on:
 jobs:
   database:
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,4 +18,4 @@ jobs:
       - name: Compile sources
         run: python -m compileall -q .
       - name: Run database tests
-        run: python -m unittest discover -s tests -v
+        run: timeout 120s python -u -m unittest discover -s tests -v
