@@ -5,7 +5,7 @@ import faulthandler
 
 faulthandler.dump_traceback_later(30, repeat=True)
 
-from database import Database
+from database import Database, PostgresCompat
 
 
 class DatabaseTests(unittest.IsolatedAsyncioTestCase):
@@ -16,6 +16,20 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.temp_dir.cleanup()
+
+    async def test_postgres_sql_adapter_translates_sqlite_syntax(self):
+        sql = PostgresCompat.adapt_sql(
+            "INSERT OR IGNORE INTO files(file_key) VALUES(?)"
+        )
+        self.assertEqual(
+            sql,
+            "INSERT INTO files(file_key) VALUES(%s) ON CONFLICT DO NOTHING",
+        )
+        search_sql = PostgresCompat.adapt_sql(
+            "SELECT * FROM files WHERE file_name LIKE ? ORDER BY category COLLATE NOCASE"
+        )
+        self.assertIn("file_name ILIKE %s", search_sql)
+        self.assertIn("ORDER BY lower(category)", search_sql)
 
     async def test_only_one_first_admin_can_claim(self):
         self.assertTrue(await self.db.claim_first_admin(101))
