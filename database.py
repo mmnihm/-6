@@ -282,6 +282,19 @@ class Database:
             await db.commit()
             return bool(other), inserted
 
+    async def advance_scan_cursor(self, channel_id, message_id):
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT INTO scanner_progress(
+                    channel_id, last_message_id, scanned_count, completed, updated_at
+                ) VALUES(?, ?, 0, 0, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    last_message_id=excluded.last_message_id,
+                    completed=0,
+                    updated_at=excluded.updated_at
+            """, (channel_id, message_id, iso_now()))
+            await db.commit()
+
     async def get_scan_progress(self, channel_id):
         async with self.connect() as db:
             row = await (await db.execute(
