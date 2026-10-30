@@ -37,6 +37,22 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         row = await self.db.get_file("abc123")
         self.assertEqual(row["category"], "电影")
 
+    async def test_public_catalog_search_and_category_filter(self):
+        await self.db.add_file("key001", 101, "movie-one.mp4", "video", 11, 22, "电影")
+        await self.db.add_file("key002", 101, "lesson.pdf", "document", 12, 23, "教程")
+
+        rows, categories, total = await self.db.public_catalog(query="movie")
+        self.assertEqual(total, 1)
+        self.assertEqual(rows[0]["file_name"], "movie-one.mp4")
+        self.assertEqual(set(rows[0].keys()), {
+            "file_key", "file_name", "media_type", "category", "created_at"
+        })
+        self.assertEqual(set(categories), {"电影", "教程"})
+
+        rows, _, total = await self.db.public_catalog(category="教程")
+        self.assertEqual(total, 1)
+        self.assertEqual(rows[0]["file_name"], "lesson.pdf")
+
     async def test_ban_and_user_tracking(self):
         await self.db.touch_user(404)
         self.assertFalse(await self.db.is_banned(404))
