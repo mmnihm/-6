@@ -270,6 +270,12 @@ class Database:
             category_column_names = {row["name"] for row in category_columns}
             if "updated_at" not in category_column_names:
                 await db.execute("ALTER TABLE categories ADD COLUMN updated_at TEXT")
+            if "share_key" not in category_column_names:
+                await db.execute("ALTER TABLE categories ADD COLUMN share_key TEXT")
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_categories_share_key "
+                "ON categories(share_key) WHERE share_key IS NOT NULL"
+            )
             await db.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_files_source_fingerprint
                 ON files(source_fingerprint)
@@ -664,12 +670,14 @@ class Database:
         now = iso_now()
         created = str(created_at or now)
         async with self.connect() as db:
+            share_key = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]
             await db.execute(
-                "INSERT INTO categories(name, created_at, description, updated_at) "
-                "VALUES(?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET "
+                "INSERT INTO categories(name, created_at, description, updated_at, share_key) "
+                "VALUES(?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET "
                 "description=CASE WHEN excluded.description<>'' THEN excluded.description "
-                "ELSE categories.description END",
-                (name, created, str(description or "")[:1000], now),
+                "ELSE categories.description END, "
+                "share_key=COALESCE(NULLIF(categories.share_key, ''), excluded.share_key)",
+                (name, created, str(description or "")[:1000], now, share_key),
             )
             await db.commit()
 
@@ -683,8 +691,9 @@ class Database:
                        SUM(COALESCE(files.file_size, 0)) AS total_size,
                        COALESCE(categories.description, '') AS description,
                        COALESCE(categories.created_at, MIN(files.created_at)) AS created_at,
-                       COALESCE(categories.updated_at, MAX(files.created_at),
-                                categories.created_at) AS updated_at
+                       COALESCE(MAX(files.created_at), categories.updated_at,
+                                categories.created_at) AS updated_at,
+                       categories.share_key AS share_key
                 FROM (
                     SELECT category FROM files
                     UNION
@@ -696,6 +705,13 @@ class Database:
                          categories.created_at, categories.updated_at
                 ORDER BY lower(all_categories.category)
             """)).fetchall()
+
+    async def get_category_by_share_key(self, share_key):
+        async with self.connect() as db:
+            return await (await db.execute(
+                "SELECT name, description, created_at, updated_at, share_key "
+                "FROM categories WHERE share_key=?", (share_key,)
+            )).fetchone()
 
     async def list_category_files(self, category, limit=8, offset=0):
         async with self.connect() as db:
