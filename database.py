@@ -64,6 +64,24 @@ class Database:
                     banned_by INTEGER NOT NULL,
                     banned_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS scanner_messages (
+                    channel_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT '未分类',
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(channel_id, message_id),
+                    UNIQUE(channel_id, fingerprint)
+                );
+                CREATE TABLE IF NOT EXISTS scanner_progress (
+                    channel_id INTEGER PRIMARY KEY,
+                    last_message_id INTEGER NOT NULL DEFAULT 0,
+                    scanned_count INTEGER NOT NULL DEFAULT 0,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
             """)
             # Upgrade databases created by the first project revision.
             columns = await (await db.execute("PRAGMA table_info(files)")).fetchall()
@@ -209,6 +227,83 @@ class Database:
                   primary_id, backup_id, iso_now(), source_fingerprint))
             await db.commit()
             return cur.rowcount == 1
+
+    async def save_scanned_message(
+        self, channel_id, other_channel_id, primary_channel_id,
+        message_id, fingerprint, file_name, media_type, category,
+        created_at, owner_id, file_key
+    ):
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT OR IGNORE INTO scanner_messages(
+                    channel_id, message_id, fingerprint, file_name,
+                    media_type, category, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            """, (channel_id, message_id, fingerprint, file_name,
+                  media_type, category, created_at))
+            await db.execute("""
+                INSERT INTO scanner_progress(
+                    channel_id, last_message_id, scanned_count, completed, updated_at
+                ) VALUES(?, ?, 1, 0, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    last_message_id=excluded.last_message_id,
+                    scanned_count=scanner_progress.scanned_count + 1,
+                    completed=0,
+                    updated_at=excluded.updated_at
+            """, (channel_id, message_id, iso_now()))
+
+            other = await (await db.execute("""
+                SELECT message_id, file_name, media_type, category, created_at
+                FROM scanner_messages
+                WHERE channel_id=? AND fingerprint=?
+            """, (other_channel_id, fingerprint))).fetchone()
+            inserted = False
+            if other:
+                if channel_id == primary_channel_id:
+                    primary_id, backup_id = message_id, other["message_id"]
+                    source = (file_name, media_type, category, created_at)
+                else:
+                    primary_id, backup_id = other["message_id"], message_id
+                    source = (
+                        other["file_name"], other["media_type"],
+                        other["category"], other["created_at"]
+                    )
+                cur = await db.execute("""
+                    INSERT OR IGNORE INTO files(
+                        file_key, owner_id, file_name, media_type, category,
+                        primary_message_id, backup_message_id, created_at,
+                        source_fingerprint
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    file_key, owner_id, source[0], source[1], source[2],
+                    primary_id, backup_id, source[3], fingerprint
+                ))
+                inserted = cur.rowcount == 1
+            await db.commit()
+            return bool(other), inserted
+
+    async def get_scan_progress(self, channel_id):
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT * FROM scanner_progress WHERE channel_id=?", (channel_id,)
+            )).fetchone()
+            if row:
+                return dict(row)
+            return {
+                "channel_id": channel_id, "last_message_id": 0,
+                "scanned_count": 0, "completed": 0, "updated_at": None
+            }
+
+    async def mark_scan_completed(self, channel_id):
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT INTO scanner_progress(
+                    channel_id, last_message_id, scanned_count, completed, updated_at
+                ) VALUES(?, 0, 0, 1, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    completed=1, updated_at=excluded.updated_at
+            """, (channel_id, iso_now()))
+            await db.commit()
 
     async def get_file(self, key):
         async with self.connect() as db:
