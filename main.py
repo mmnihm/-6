@@ -4,6 +4,7 @@ import secrets
 from datetime import datetime, timezone
 
 from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ChatMemberStatus, ChatType
 from pyrogram.errors import FloodWait, PeerIdInvalid, UserNotParticipant
 
@@ -18,6 +19,20 @@ log = logging.getLogger("member-cloud")
 db = Database(config.DATABASE_PATH)
 BOT_USERNAME = None
 pending_channel_bindings = {}
+
+
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗄 双频道存储", callback_data="mc:storage")],
+        [InlineKeyboardButton("👥 绑定会员群", callback_data="mc:bindgroup")],
+        [InlineKeyboardButton("👤 会员管理", callback_data="mc:members"), InlineKeyboardButton("📂 文件管理", callback_data="mc:files")],
+        [InlineKeyboardButton("📢 群发广播", callback_data="mc:broadcast"), InlineKeyboardButton("📊 数据统计", callback_data="mc:stats")],
+        [InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
+    ])
+
+
+def back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")]])
 pending_binding_filter = filters.create(
     lambda _, __, message: bool(
         message.from_user and message.from_user.id in pending_channel_bindings
@@ -29,6 +44,11 @@ async def get_storage_channels():
     primary = await db.get_setting("storage_primary_channel_id")
     backup = await db.get_setting("storage_backup_channel_id")
     return (int(primary) if primary else None, int(backup) if backup else None)
+
+
+async def get_member_group_id():
+    value = await db.get_setting("member_group_id")
+    return int(value) if value else None
 
 app = Client(
     "member_cloud_bot",
@@ -57,8 +77,11 @@ async def has_access(user_id: int) -> bool:
         return False
     if await db.has_manual_membership(user_id):
         return True
+    group_id = await get_member_group_id()
+    if not group_id:
+        return False
     try:
-        member = await app.get_chat_member(config.MEMBER_GROUP_ID, user_id)
+        member = await app.get_chat_member(group_id, user_id)
         if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
             return False
         if member.status == ChatMemberStatus.RESTRICTED:
@@ -233,8 +256,14 @@ async def bind_channel_forward_handler(client, message):
     if not setting_key:
         return
     source = message.forward_from_chat
-    if not source or source.type != ChatType.CHANNEL:
-        await message.reply_text("❌ 没识别到频道来源。请从私有频道直接转发一条普通消息，不要复制粘贴。")
+    if not source:
+        await message.reply_text("❌ 没识别到转发来源。请从对应的频道或会员群直接转发一条普通消息，不要复制粘贴。")
+        return
+    is_group_binding = setting_key == "member_group_id"
+    allowed_types = (ChatType.GROUP, ChatType.SUPERGROUP) if is_group_binding else (ChatType.CHANNEL,)
+    if source.type not in allowed_types:
+        expected = "会员群" if is_group_binding else "私有频道"
+        await message.reply_text(f"❌ 来源类型不正确，请直接转发一条{expected}消息。")
         return
 
     me = await client.get_me()
@@ -243,28 +272,31 @@ async def bind_channel_forward_handler(client, message):
     except Exception:
         await message.reply_text("❌ 机器人无法访问这个频道。请先把机器人添加为该频道管理员，再重新转发消息。")
         return
-    if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-        await message.reply_text("❌ 机器人还不是这个频道的管理员，请先授予管理员权限。")
+    valid_statuses = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER) if not is_group_binding else (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED)
+    if member.status not in valid_statuses:
+        await message.reply_text("❌ 机器人尚未加入这个群/频道，请先添加机器人后重新绑定。")
         return
 
-    other_key = (
-        "storage_backup_channel_id"
-        if setting_key == "storage_primary_channel_id"
-        else "storage_primary_channel_id"
-    )
-    other_id = await db.get_setting(other_key)
-    if other_id and int(other_id) == source.id:
-        await message.reply_text("❌ 主存储频道和备份频道不能绑定为同一个频道。")
-        return
+    if not is_group_binding:
+        other_key = "storage_backup_channel_id" if setting_key == "storage_primary_channel_id" else "storage_primary_channel_id"
+        other_id = await db.get_setting(other_key)
+        if other_id and int(other_id) == source.id:
+            await message.reply_text("❌ 主存储频道和备份频道不能绑定为同一个频道。")
+            return
 
     await db.set_setting(setting_key, str(source.id))
     pending_channel_bindings.pop(user.id, None)
-    label = "主存储频道" if setting_key == "storage_primary_channel_id" else "备份存储频道"
+    labels = {
+        "storage_primary_channel_id": "主存储频道",
+        "storage_backup_channel_id": "备份存储频道",
+        "member_group_id": "会员群",
+    }
+    label = labels.get(setting_key, "目标群/频道")
     await message.reply_text(
         f"✅ {label}绑定成功！\n"
-        f"频道：{source.title or '未命名频道'}\n"
-        f"频道 ID：{source.id}\n\n"
-        "可使用 /storage 查看双频道绑定状态。"
+        f"名称：{source.title or '未命名'}\n"
+        f"ID：{source.id}\n\n"
+        "可发送 /storage 查看绑定状态，或 /admin 打开管理面板。"
     )
 
 
@@ -294,6 +326,19 @@ async def bind_backup_channel_handler(client, message):
     )
 
 
+@app.on_message(filters.private & filters.command("bindgroup"))
+async def bind_member_group_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    pending_channel_bindings[user.id] = "member_group_id"
+    await message.reply_text(
+        "👥 请把会员群中的任意一条消息直接转发到这里。\n"
+        "机器人必须已经加入会员群，建议设为管理员以确保成员状态查询正常。"
+    )
+
+
 @app.on_message(filters.private & filters.command("storage"))
 async def storage_status_handler(client, message):
     user = message.from_user
@@ -301,11 +346,13 @@ async def storage_status_handler(client, message):
         await reply_admin_only(message)
         return
     primary, backup = await get_storage_channels()
+    group_id = await get_member_group_id()
     await message.reply_text(
-        "🗄 双频道绑定状态\n\n"
+        "🗄 机器人绑定状态\n\n"
+        f"会员群：{group_id or '未绑定'}\n"
         f"主存储频道：{primary or '未绑定'}\n"
         f"备份存储频道：{backup or '未绑定'}\n\n"
-        "绑定命令：/bindmain、/bindbackup"
+        "绑定命令：/bindgroup、/bindmain、/bindbackup"
     )
 
 
@@ -316,26 +363,98 @@ async def admin_handler(client, message):
         await reply_admin_only(message)
         return
     users, files, members, banned = await db.stats()
+    group_id = await get_member_group_id()
+    primary, backup = await get_storage_channels()
     await message.reply_text(
-        "👑 超级管理员面板\n\n"
-        f"用户数：{users}\n文件数：{files}\n"
-        f"手动有效授权：{members}\n封禁用户：{banned}\n\n"
-        "管理命令：\n"
-        "/grant 用户ID 天数|永久 — 手动授权\n"
-        "/revoke 用户ID — 取消手动授权\n"
-        "/ban 用户ID 原因 — 封禁用户\n"
-        "/unban 用户ID — 解除封禁\n"
-        "/users — 最近用户 ID 列表\n"
-        "/members — 手动授权列表\n"
-        "/files — 最近文件列表\n"
-        "/category 文件码 分类 — 修改分类\n"
-        "/share 文件码1 文件码2 — 批量生成分享链接\n"
-        "/broadcast 消息内容 — 广播全部已记录用户\n"
-        "/bindmain — 绑定主存储频道（转发频道消息）\n"
-        "/bindbackup — 绑定备份存储频道（转发频道消息）\n"
-        "/storage — 查看双频道绑定状态\n"
-        "/admin — 刷新统计"
+        "👑 超级管理员控制面板\\n\\n"
+        f"会员群：{'已绑定' if group_id else '未绑定'}\\n"
+        f"主存储：{'已绑定' if primary else '未绑定'}  |  备份：{'已绑定' if backup else '未绑定'}\\n\\n"
+        f"用户：{users}  |  文件：{files}\\n"
+        f"手动会员：{members}  |  封禁：{banned}\\n\\n"
+        "请选择下方按钮管理机器人。",
+        reply_markup=admin_keyboard(),
     )
+
+
+@app.on_callback_query(filters.regex(r"^mc:"))
+async def admin_callback_handler(client, query):
+    user = query.from_user
+    if not user or not await is_admin(user.id):
+        await query.answer("无管理员权限", show_alert=True)
+        return
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    message = query.message
+    if action == "home":
+        users, files, members, banned = await db.stats()
+        group_id = await get_member_group_id()
+        primary, backup = await get_storage_channels()
+        text = (
+            "👑 超级管理员控制面板\\n\\n"
+            f"会员群：{'已绑定' if group_id else '未绑定'}\\n"
+            f"主存储：{'已绑定' if primary else '未绑定'}  |  备份：{'已绑定' if backup else '未绑定'}\\n\\n"
+            f"用户：{users}  |  文件：{files}\\n手动会员：{members}  |  封禁：{banned}\\n\\n请选择下方按钮管理机器人。"
+        )
+        await message.edit_text(text, reply_markup=admin_keyboard())
+    elif action == "storage":
+        primary, backup = await get_storage_channels()
+        group_id = await get_member_group_id()
+        await message.edit_text(
+            "🗄 绑定设置\\n\\n"
+            f"会员群：{group_id or '未绑定'}\\n主存储频道：{primary or '未绑定'}\\n备份频道：{backup or '未绑定'}\\n\\n选择需要绑定或刷新状态：",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👥 绑定会员群", callback_data="mc:bindgroup")],
+                [InlineKeyboardButton("📥 绑定主频道", callback_data="mc:bindmain"), InlineKeyboardButton("📥 绑定备份频道", callback_data="mc:bindbackup")],
+                [InlineKeyboardButton("⬅️ 返回", callback_data="mc:home")],
+            ]),
+        )
+    elif action in ("bindgroup", "bindmain", "bindbackup"):
+        setting = {"bindgroup": "member_group_id", "bindmain": "storage_primary_channel_id", "bindbackup": "storage_backup_channel_id"}[action]
+        pending_channel_bindings[user.id] = setting
+        label = {"bindgroup": "会员群", "bindmain": "主存储私有频道", "bindbackup": "备份私有频道"}[action]
+        await message.edit_text(
+            f"📨 请把{label}中的任意一条普通消息直接转发给机器人。\\n\\n"
+            "请勿复制粘贴消息。机器人需要先加入对应群/频道；两个存储频道还需要授予管理员及发消息权限。",
+            reply_markup=back_keyboard(),
+        )
+    elif action == "members":
+        rows = await db.list_manual_members()
+        if not rows:
+            body = "暂无手动授权记录。\\n\\n授权：/grant 用户ID 天数|永久\\n取消：/revoke 用户ID\\n封禁：/ban 用户ID 原因\\n解封：/unban 用户ID"
+        else:
+            now = datetime.now(timezone.utc)
+            lines = []
+            for row in rows:
+                expiry = row["expires_at"]
+                if expiry is None:
+                    label = "永久"
+                else:
+                    try:
+                        expiry_dt = datetime.fromisoformat(expiry)
+                        label = "已过期" if expiry_dt <= now else expiry_dt.strftime("%Y-%m-%d %H:%M UTC")
+                    except ValueError:
+                        label = "日期异常"
+                lines.append(f"{row['user_id']} — {label}")
+            body = "👥 手动会员列表\\n" + "\\n".join(lines) + "\\n\\n授权：/grant 用户ID 天数|永久\\n取消：/revoke 用户ID"
+        await message.edit_text(body, reply_markup=back_keyboard())
+    elif action == "files":
+        rows = await db.list_files(15)
+        lines = [f"{row['file_key']} | {row['category']} | {row['file_name'][:40]}" for row in rows]
+        body = "📂 最近文件（最多 15 个）\\n" + ("\\n".join(lines) if lines else "暂无文件记录") + "\\n\\n修改分类：/category 文件码 分类\\n批量分享：/share 文件码1 文件码2"
+        await message.edit_text(body, reply_markup=back_keyboard())
+    elif action == "broadcast":
+        await message.edit_text("📢 广播操作\\n\\n发送：/broadcast 广播内容\\n机器人会向已记录用户逐一发送，并返回成功/失败数量。", reply_markup=back_keyboard())
+    elif action == "stats":
+        users, files, members, banned = await db.stats()
+        await message.edit_text(f"📊 数据统计\\n\\n用户总数：{users}\\n文件总数：{files}\\n有效手动会员：{members}\\n封禁用户：{banned}", reply_markup=back_keyboard())
+    elif action == "commands":
+        await message.edit_text(
+            "📖 管理命令速查\\n\\n"
+            "/bindgroup — 绑定会员群\\n/bindmain — 绑定主存储频道\\n/bindbackup — 绑定备份频道\\n/storage — 查看绑定状态\\n"
+            "/grant 用户ID 天数|永久 — 授权会员\\n/revoke 用户ID — 取消授权\\n/ban 用户ID 原因 — 封禁\\n/unban 用户ID — 解封\\n"
+            "/members — 会员列表\\n/users — 用户列表\\n/files — 文件列表\\n/category 文件码 分类 — 修改分类\\n/share 文件码1 文件码2 — 批量分享\\n/broadcast 内容 — 广播",
+            reply_markup=back_keyboard(),
+        )
 
 
 @app.on_message(filters.private & filters.command("grant"))
