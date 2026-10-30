@@ -200,6 +200,30 @@ class Database:
                 "SELECT * FROM files ORDER BY created_at DESC LIMIT ?", (limit,)
             )).fetchall()
 
+    async def public_catalog(self, query="", category="", limit=30, offset=0):
+        conditions = []
+        params = []
+        if query:
+            conditions.append("(file_name LIKE ? OR category LIKE ?)")
+            params.extend((f"%{query}%", f"%{query}%"))
+        if category:
+            conditions.append("category=?")
+            params.append(category)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        async with self.connect() as db:
+            categories = await (await db.execute(
+                "SELECT DISTINCT category FROM files ORDER BY category COLLATE NOCASE"
+            )).fetchall()
+            total = (await (await db.execute(
+                "SELECT COUNT(*) AS n FROM files" + where, params
+            )).fetchone())["n"]
+            rows = await (await db.execute(
+                "SELECT file_key, file_name, media_type, category, created_at "
+                "FROM files" + where + " ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                params + [limit, offset],
+            )).fetchall()
+            return rows, [row["category"] for row in categories], total
+
     async def set_file_category(self, key: str, category: str) -> bool:
         async with self.connect() as db:
             cur = await db.execute(
