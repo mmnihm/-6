@@ -689,6 +689,21 @@ class Database:
 
     async def list_categories(self):
         async with self.connect() as db:
+            # Ensure categories discovered from uploads/scans also receive stable
+            # share keys, so folder favorites and deep links work for every folder.
+            names = await (await db.execute(
+                "SELECT DISTINCT category FROM files WHERE category IS NOT NULL AND category<>''"
+            )).fetchall()
+            for item in names:
+                name = str(item["category"])
+                share_key = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]
+                await db.execute(
+                    "INSERT OR IGNORE INTO categories(name, created_at, description, updated_at, share_key) "
+                    "VALUES(?, ?, '', ?, ?)",
+                    (name, iso_now(), iso_now(), share_key),
+                )
+            if names:
+                await db.commit()
             return await (await db.execute("""
                 SELECT all_categories.category,
                        COUNT(files.file_key) AS file_count,
