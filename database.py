@@ -1,5 +1,6 @@
 import os
 import aiosqlite
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 
 
@@ -15,17 +16,21 @@ class Database:
     def __init__(self, path: str):
         self.path = path
 
+    @asynccontextmanager
     async def connect(self):
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         db = await aiosqlite.connect(self.path)
         db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("PRAGMA foreign_keys=ON")
-        await db.execute("PRAGMA busy_timeout=5000")
-        return db
+        try:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.execute("PRAGMA busy_timeout=5000")
+            yield db
+        finally:
+            await db.close()
 
     async def initialize(self):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             await db.executescript("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -68,7 +73,7 @@ class Database:
             await db.commit()
 
     async def claim_first_admin(self, user_id: int) -> bool:
-        async with await self.connect() as db:
+        async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             row = await (await db.execute(
                 "SELECT value FROM settings WHERE key='superadmin_id'"
@@ -84,7 +89,7 @@ class Database:
             return True
 
     async def get_admin_id(self):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             row = await (await db.execute(
                 "SELECT value FROM settings WHERE key='superadmin_id'"
             )).fetchone()
@@ -92,7 +97,7 @@ class Database:
 
     async def touch_user(self, user_id: int):
         now = iso_now()
-        async with await self.connect() as db:
+        async with self.connect() as db:
             await db.execute("""
                 INSERT INTO users(user_id, first_seen, last_seen)
                 VALUES(?, ?, ?)
@@ -101,7 +106,7 @@ class Database:
             await db.commit()
 
     async def is_banned(self, user_id: int) -> bool:
-        async with await self.connect() as db:
+        async with self.connect() as db:
             row = await (await db.execute(
                 "SELECT 1 FROM banned_users WHERE user_id=?", (user_id,)
             )).fetchone()
@@ -111,7 +116,7 @@ class Database:
         expires = None
         if days is not None:
             expires = (utc_now() + timedelta(days=days)).isoformat()
-        async with await self.connect() as db:
+        async with self.connect() as db:
             await db.execute("""
                 INSERT INTO manual_members(user_id, expires_at, granted_by, granted_at)
                 VALUES(?, ?, ?, ?)
@@ -123,7 +128,7 @@ class Database:
             await db.commit()
 
     async def has_manual_membership(self, user_id: int) -> bool:
-        async with await self.connect() as db:
+        async with self.connect() as db:
             row = await (await db.execute(
                 "SELECT expires_at FROM manual_members WHERE user_id=?", (user_id,)
             )).fetchone()
@@ -137,12 +142,12 @@ class Database:
                 return False
 
     async def revoke_member(self, user_id: int):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             await db.execute("DELETE FROM manual_members WHERE user_id=?", (user_id,))
             await db.commit()
 
     async def ban_user(self, user_id: int, reason: str, admin_id: int):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             await db.execute("""
                 INSERT INTO banned_users(user_id, reason, banned_by, banned_at)
                 VALUES(?, ?, ?, ?)
@@ -153,13 +158,13 @@ class Database:
             await db.commit()
 
     async def unban_user(self, user_id: int):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             await db.execute("DELETE FROM banned_users WHERE user_id=?", (user_id,))
             await db.commit()
 
     async def add_file(self, key, owner_id, file_name, media_type,
                        primary_id, backup_id, category="未分类"):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             await db.execute("""
                 INSERT INTO files(file_key, owner_id, file_name, media_type, category,
                                   primary_message_id, backup_message_id, created_at)
@@ -169,19 +174,19 @@ class Database:
             await db.commit()
 
     async def get_file(self, key):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             return await (await db.execute(
                 "SELECT * FROM files WHERE file_key=?", (key,)
             )).fetchone()
 
     async def list_files(self, limit=20):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             return await (await db.execute(
                 "SELECT * FROM files ORDER BY created_at DESC LIMIT ?", (limit,)
             )).fetchall()
 
     async def set_file_category(self, key: str, category: str) -> bool:
-        async with await self.connect() as db:
+        async with self.connect() as db:
             cur = await db.execute(
                 "UPDATE files SET category=? WHERE file_key=?", (category, key)
             )
@@ -189,21 +194,21 @@ class Database:
             return cur.rowcount > 0
 
     async def list_user_ids(self):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             rows = await (await db.execute(
                 "SELECT user_id FROM users ORDER BY user_id"
             )).fetchall()
             return [row["user_id"] for row in rows]
 
     async def list_manual_members(self, limit=30):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             return await (await db.execute("""
                 SELECT user_id, expires_at FROM manual_members
                 ORDER BY granted_at DESC LIMIT ?
             """, (limit,))).fetchall()
 
     async def stats(self):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             users = (await (await db.execute(
                 "SELECT COUNT(*) n FROM users"
             )).fetchone())["n"]
