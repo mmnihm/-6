@@ -4,7 +4,7 @@ import secrets
 from datetime import datetime, timezone
 
 from pyrogram import Client, filters
-from pyrogram.enums import ChatMemberStatus
+from pyrogram.enums import ChatMemberStatus, ChatType
 from pyrogram.errors import FloodWait, PeerIdInvalid, UserNotParticipant
 
 import config
@@ -16,6 +16,19 @@ logging.basicConfig(
 )
 log = logging.getLogger("member-cloud")
 db = Database(config.DATABASE_PATH)
+BOT_USERNAME = None
+pending_channel_bindings = {}
+pending_binding_filter = filters.create(
+    lambda _, __, message: bool(
+        message.from_user and message.from_user.id in pending_channel_bindings
+    )
+)
+
+
+async def get_storage_channels():
+    primary = await db.get_setting("storage_primary_channel_id")
+    backup = await db.get_setting("storage_backup_channel_id")
+    return (int(primary) if primary else None, int(backup) if backup else None)
 
 app = Client(
     "member_cloud_bot",
@@ -68,7 +81,9 @@ def media_details(message):
 
 
 def share_url(key: str) -> str:
-    return f"https://t.me/{config.BOT_USERNAME}?start=file_{key}"
+    if not BOT_USERNAME:
+        raise RuntimeError("Bot username is not initialized")
+    return f"https://t.me/{BOT_USERNAME}?start=file_{key}"
 
 
 def parse_category(message) -> str:
@@ -110,10 +125,14 @@ async def start_handler(client, message):
         if not record:
             await message.reply_text("❌ 分享链接无效或文件不存在。")
             return
+        primary_channel_id, backup_channel_id = await get_storage_channels()
+        if not primary_channel_id or not backup_channel_id:
+            await message.reply_text("⚠️ 管理员尚未绑定主存储和备份频道，请稍后再试。")
+            return
         try:
             await client.copy_message(
                 chat_id=user.id,
-                from_chat_id=config.STORAGE_CHANNEL_ID,
+                from_chat_id=primary_channel_id,
                 message_id=record["primary_message_id"],
             )
         except Exception:
@@ -121,7 +140,7 @@ async def start_handler(client, message):
             try:
                 await client.copy_message(
                     chat_id=user.id,
-                    from_chat_id=config.BACKUP_CHANNEL_ID,
+                    from_chat_id=backup_channel_id,
                     message_id=record["backup_message_id"],
                 )
             except Exception:
@@ -153,19 +172,24 @@ async def upload_handler(client, message):
     if not media_type:
         return
 
+    primary_channel_id, backup_channel_id = await get_storage_channels()
+    if not primary_channel_id or not backup_channel_id:
+        await message.reply_text("⚠️ 网盘尚未完成双频道绑定，请管理员先使用 /bindmain 和 /bindbackup。")
+        return
+
     category = parse_category(message)
     status = await message.reply_text("⏳ 正在保存到主频道和备份频道…")
     primary_id = None
     backup_id = None
     try:
         primary = await client.copy_message(
-            chat_id=config.STORAGE_CHANNEL_ID,
+            chat_id=primary_channel_id,
             from_chat_id=message.chat.id,
             message_id=message.id,
         )
         primary_id = primary.id
         backup = await client.copy_message(
-            chat_id=config.BACKUP_CHANNEL_ID,
+            chat_id=backup_channel_id,
             from_chat_id=message.chat.id,
             message_id=message.id,
         )
@@ -186,8 +210,8 @@ async def upload_handler(client, message):
     except Exception:
         log.exception("Upload/store failed")
         for channel_id, message_id in (
-            (config.STORAGE_CHANNEL_ID, primary_id),
-            (config.BACKUP_CHANNEL_ID, backup_id),
+            (primary_channel_id, primary_id),
+            (backup_channel_id, backup_id),
         ):
             if message_id is not None:
                 try:
@@ -197,6 +221,92 @@ async def upload_handler(client, message):
         await status.edit_text(
             "❌ 保存失败，未生成分享链接。请检查两个私有频道的机器人管理员权限。"
         )
+
+
+@app.on_message(filters.private & filters.forwarded & pending_binding_filter)
+async def bind_channel_forward_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        return
+
+    setting_key = pending_channel_bindings.get(user.id)
+    if not setting_key:
+        return
+    source = message.forward_from_chat
+    if not source or source.type != ChatType.CHANNEL:
+        await message.reply_text("❌ 没识别到频道来源。请从私有频道直接转发一条普通消息，不要复制粘贴。")
+        return
+
+    me = await client.get_me()
+    try:
+        member = await client.get_chat_member(source.id, me.id)
+    except Exception:
+        await message.reply_text("❌ 机器人无法访问这个频道。请先把机器人添加为该频道管理员，再重新转发消息。")
+        return
+    if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+        await message.reply_text("❌ 机器人还不是这个频道的管理员，请先授予管理员权限。")
+        return
+
+    other_key = (
+        "storage_backup_channel_id"
+        if setting_key == "storage_primary_channel_id"
+        else "storage_primary_channel_id"
+    )
+    other_id = await db.get_setting(other_key)
+    if other_id and int(other_id) == source.id:
+        await message.reply_text("❌ 主存储频道和备份频道不能绑定为同一个频道。")
+        return
+
+    await db.set_setting(setting_key, str(source.id))
+    pending_channel_bindings.pop(user.id, None)
+    label = "主存储频道" if setting_key == "storage_primary_channel_id" else "备份存储频道"
+    await message.reply_text(
+        f"✅ {label}绑定成功！\\n"
+        f"频道：{source.title or '未命名频道'}\\n"
+        f"频道 ID：{source.id}\\n\\n"
+        "可使用 /storage 查看双频道绑定状态。"
+    )
+
+
+@app.on_message(filters.private & filters.command("bindmain"))
+async def bind_main_channel_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    pending_channel_bindings[user.id] = "storage_primary_channel_id"
+    await message.reply_text(
+        "📥 请把主存储私有频道中的任意一条消息，直接转发到这里。\\n"
+        "要求：机器人必须已经是该频道管理员。"
+    )
+
+
+@app.on_message(filters.private & filters.command("bindbackup"))
+async def bind_backup_channel_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    pending_channel_bindings[user.id] = "storage_backup_channel_id"
+    await message.reply_text(
+        "📥 请把备份存储私有频道中的任意一条消息，直接转发到这里。\\n"
+        "要求：机器人必须已经是该频道管理员。"
+    )
+
+
+@app.on_message(filters.private & filters.command("storage"))
+async def storage_status_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    primary, backup = await get_storage_channels()
+    await message.reply_text(
+        "🗄 双频道绑定状态\\n\\n"
+        f"主存储频道：{primary or '未绑定'}\\n"
+        f"备份存储频道：{backup or '未绑定'}\\n\\n"
+        "绑定命令：/bindmain、/bindbackup"
+    )
 
 
 @app.on_message(filters.private & filters.command("admin"))
@@ -221,6 +331,9 @@ async def admin_handler(client, message):
         "/category 文件码 分类 — 修改分类\n"
         "/share 文件码1 文件码2 — 批量生成分享链接\n"
         "/broadcast 消息内容 — 广播全部已记录用户\n"
+        "/bindmain — 绑定主存储频道（转发频道消息）\n"
+        "/bindbackup — 绑定备份存储频道（转发频道消息）\n"
+        "/storage — 查看双频道绑定状态\n"
         "/admin — 刷新统计"
     )
 
@@ -429,9 +542,11 @@ async def broadcast_handler(client, message):
 
 
 async def main():
+    global BOT_USERNAME
     await db.initialize()
     await app.start()
     me = await app.get_me()
+    BOT_USERNAME = me.username
     log.info("Bot started: @%s", me.username)
     try:
         await asyncio.Event().wait()
