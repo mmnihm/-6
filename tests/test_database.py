@@ -37,6 +37,20 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         row = await self.db.get_file("abc123")
         self.assertEqual(row["category"], "电影")
 
+    async def test_duplicate_source_fingerprint_is_ignored(self):
+        first = await self.db.add_file(
+            "firstkey", 101, "sample.mp4", "video", 11, 22,
+            "电影", "telegram-file-unique-id"
+        )
+        second = await self.db.add_file(
+            "secondkey", 101, "sample-copy.mp4", "video", 12, 23,
+            "电影", "telegram-file-unique-id"
+        )
+        self.assertTrue(first)
+        self.assertFalse(second)
+        row = await self.db.get_file_by_fingerprint("telegram-file-unique-id")
+        self.assertEqual(row["file_key"], "firstkey")
+
     async def test_public_catalog_search_and_category_filter(self):
         await self.db.add_file("key001", 101, "movie-one.mp4", "video", 11, 22, "电影")
         await self.db.add_file("key002", 101, "lesson.pdf", "document", 12, 23, "教程")
