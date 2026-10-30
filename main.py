@@ -175,8 +175,13 @@ async def run_history_scan(primary_channel_id, backup_channel_id):
             if progress["completed"]:
                 continue
             offset_id = progress["last_message_id"]
-            log.info("History scan started for channel %s from offset %s", channel_id, offset_id)
-            async for item in scanner.get_chat_history(channel_id, offset_id=offset_id):
+            chat = await resolve_scanner_chat(channel_id)
+            resolved_channel_id = int(chat.id)
+            log.info(
+                "History scan started for channel %s (%s) from offset %s",
+                resolved_channel_id, getattr(chat, "title", ""), offset_id
+            )
+            async for item in scanner.get_chat_history(resolved_channel_id, offset_id=offset_id):
                 media_type, file_name, fingerprint = media_details(item)
                 created_at = (
                     item.date.isoformat() if getattr(item, "date", None) else
@@ -673,19 +678,56 @@ async def scanner_login_input_handler(client, message):
 
 
 async def resolve_scanner_chat(channel_id):
-    """Resolve a private channel from the user account's dialogs to populate its access hash."""
-    async for dialog in scanner.get_dialogs():
-        chat = getattr(dialog, "chat", None)
-        if chat and getattr(chat, "id", None) == channel_id:
+    """Resolve a channel like Cangku's scanner: direct lookup first, then scan all dialogs."""
+    if scanner is None or not scanner.is_connected:
+        raise RuntimeError("扫描账号尚未连接")
+
+    wanted = int(channel_id)
+    direct_error = None
+
+    # First try the normal peer lookup, matching Cangku's getInputEntity-first flow.
+    try:
+        chat = await scanner.get_chat(wanted)
+        if int(getattr(chat, "id", 0)) == wanted:
+            log.info("Scanner channel resolved directly: id=%s title=%s", wanted, getattr(chat, "title", ""))
             return chat
+    except Exception as exc:
+        direct_error = f"{type(exc).__name__}: {exc}"
+        log.info("Direct scanner channel lookup failed for %s; searching dialogs: %s", wanted, direct_error)
+
+    # A private channel's numeric ID is not sufficient without its access_hash.
+    # get_dialogs() hydrates Pyrogram's peer cache; retain the resolved Chat object.
+    dialog_count = 0
+    async for dialog in scanner.get_dialogs(limit=0):
+        dialog_count += 1
+        chat = getattr(dialog, "chat", None) or dialog
+        candidate_id = getattr(chat, "id", None)
+        if candidate_id is None:
+            candidate_id = getattr(dialog, "id", None)
+        try:
+            matched = int(candidate_id) == wanted
+        except (TypeError, ValueError):
+            matched = False
+        if matched:
+            log.info(
+                "Scanner channel resolved from dialogs: id=%s title=%s dialogs=%s",
+                wanted, getattr(chat, "title", ""), dialog_count
+            )
+            # A second lookup now uses the peer information loaded from the dialog.
+            try:
+                return await scanner.get_chat(chat.id)
+            except Exception:
+                return chat
+
     raise LookupError(
-        "频道未出现在扫描账号的对话列表中。请确认登录的是已加入该频道的普通账号，"
-        "并在 Telegram 客户端打开该频道后重新运行 /scancheck。"
+        f"扫描账号的对话列表中没有频道 {wanted}（已检查 {dialog_count} 个对话）。"
+        "请确认当前登录的普通账号确实加入了该频道，并且没有被移出或封禁。"
+        + (f" 直接查询错误：{direct_error}" if direct_error else "")
     )
 
 
 async def inspect_scan_channel(channel_id):
-    """Resolve channel peer from dialogs, then verify membership and history access."""
+    """Resolve the channel entity first, then verify membership and history access."""
     result = {
         "channel_id": channel_id,
         "title": str(channel_id),
@@ -697,8 +739,6 @@ async def inspect_scan_channel(channel_id):
         "member_warning": None,
     }
     try:
-        # Numeric channel IDs alone are not enough for a fresh Pyrogram user session:
-        # the account must have the channel's access hash in its local peer database.
         chat = await resolve_scanner_chat(channel_id)
         result["title"] = getattr(chat, "title", None) or getattr(chat, "first_name", None) or str(channel_id)
         result["chat_type"] = str(getattr(chat, "type", "未知"))
@@ -715,8 +755,6 @@ async def inspect_scan_channel(channel_id):
             result["error"] = f"扫描账号当前状态为 {result['member_status']}，不在频道内"
             return result
     except Exception as exc:
-        # Some channel configurations do not expose member details;
-        # the actual history read below is the decisive permission check.
         result["member_warning"] = f"{type(exc).__name__}: {exc}"
 
     try:
