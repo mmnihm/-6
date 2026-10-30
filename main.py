@@ -233,7 +233,7 @@ def folder_detail_text(category_row, files, page, member_group_id):
         f"　• 消息数：{int(category_row['file_count'] or 0)} 条",
         f"　• 图片数：{int(category_row['image_count'] or 0)} 张",
         f"　• 视频数：{int(category_row['video_count'] or 0)} 个",
-        f"　• 总大小：{format_folder_size(category_row['total_size'])}",
+        f"　• 总大小：{format_folder_size(category_row['total_size'])}（已统计 {int(category_row['sized_count'] or 0)}/{int(category_row['file_count'] or 0)} 个资源）",
         "",
         f"📅 创建时间：{format_folder_datetime(category_row['created_at'])}",
         f"✏️ 最后更新：{format_folder_datetime(category_row['updated_at'])}",
