@@ -36,6 +36,7 @@ class PostgresCompat:
         statement = statement.replace(
             "ORDER BY category COLLATE NOCASE", "ORDER BY lower(category)"
         )
+        statement = statement.replace(" LIKE ", " ILIKE ")
         return statement
 
     async def execute(self, sql, params=()):
