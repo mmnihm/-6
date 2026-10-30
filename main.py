@@ -114,6 +114,21 @@ async def get_membership_tier(user_id: int):
             )
             return None
 
+        # Telegram only guarantees getChatMember for other users when the bot
+        # is an administrator in the target group.
+        bot_user = await app.get_me()
+        bot_member = await app.get_chat_member(group.id, bot_user.id)
+        if bot_member.status not in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        ):
+            log.error(
+                "Membership verification unavailable: bot is not an admin "
+                "in bound group %s (bot status=%s)",
+                group_id, getattr(bot_member.status, "value", bot_member.status),
+            )
+            return None
+
         target = await app.get_users(user_id)
         if int(target.id) != int(user_id):
             log.error(
@@ -575,14 +590,14 @@ async def bind_member_group_in_chat_handler(client, message):
         await message.reply_text("❌ 机器人无法读取本群成员状态。请确认机器人已加入群组，并将机器人设为管理员后重试。")
         return
 
-    valid_statuses = (
-        ChatMemberStatus.MEMBER,
+    if bot_member.status not in (
         ChatMemberStatus.ADMINISTRATOR,
         ChatMemberStatus.OWNER,
-        ChatMemberStatus.RESTRICTED,
-    )
-    if bot_member.status not in valid_statuses:
-        await message.reply_text("❌ 机器人尚未加入本群，请先添加机器人后重试。")
+    ):
+        await message.reply_text(
+            "❌ 机器人当前不是本群管理员，不能可靠验证其他群成员。\n\n"
+            "请先把机器人设为管理员（不需要授予额外管理权限），再重新发送 /bindgroup。"
+        )
         return
 
     await db.set_setting("member_group_id", str(message.chat.id))
@@ -591,7 +606,9 @@ async def bind_member_group_in_chat_handler(client, message):
         "✅ 会员群绑定成功！\n"
         f"群组：{message.chat.title or '未命名'}\n"
         f"群 ID：{message.chat.id}\n\n"
-        "机器人已记录这个私密群组。可回到私聊发送 /storage 查看绑定状态。"
+        "机器人已记录这个私密群组。\n"
+        "已确认机器人是群管理员，可以验证群成员身份。\n"
+        "可回到私聊发送 /storage 查看绑定状态。"
     )
 
 
@@ -1372,10 +1389,78 @@ async def admin_callback_handler(client, query):
     elif action == "commands":
         await message.edit_text(
             "📖 管理命令速查\n\n"
-            "/bindgroup — 绑定会员群\n/bindmain — 绑定主存储频道\n/bindbackup — 绑定备份频道\n/storage — 查看绑定状态\n"
+            "/bindgroup — 绑定会员群\n/membercheck [用户ID] — 检查会员群和成员权限\n/bindmain — 绑定主存储频道\n/bindbackup — 绑定备份频道\n/storage — 查看绑定状态\n"
             "/grant 用户ID 天数|永久 — 授权会员\n/revoke 用户ID — 取消授权\n/ban 用户ID 原因 — 封禁\n/unban 用户ID — 解封\n"
             "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scancheck — 分别检查主备份频道访问和历史读取权限\n/scan — 自动扫描主备份频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
             reply_markup=back_keyboard(),
+        )
+
+
+@app.on_message(filters.private & filters.command("membercheck"))
+async def membercheck_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+
+    group_id = await get_member_group_id()
+    if not group_id:
+        await message.reply_text(
+            "❌ 尚未绑定会员群。\n"
+            "请把机器人添加到会员群并设为管理员，然后在群内发送 /bindgroup。"
+        )
+        return
+
+    try:
+        group = await client.get_chat(group_id)
+        me = await client.get_me()
+        bot_member = await client.get_chat_member(group.id, me.id)
+        bot_status = getattr(bot_member.status, "value", str(bot_member.status))
+        lines = [
+            "🔎 会员群权限诊断",
+            f"群名称：{group.title or '未命名'}",
+            f"群 ID：{group.id}",
+            f"机器人状态：{bot_status}",
+        ]
+        if bot_member.status not in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        ):
+            lines.append(
+                "❌ 机器人不是群管理员，无法可靠查询普通成员。"
+                "请提升为管理员后再试。"
+            )
+            await message.reply_text("\n".join(lines))
+            return
+
+        if len(message.command) > 1:
+            target_id = int(message.command[1])
+            target = await client.get_chat_member(group.id, target_id)
+            target_status = getattr(target.status, "value", str(target.status))
+            lines.append(f"用户 {target_id} 状态：{target_status}")
+            if target.status in (
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.OWNER,
+            ) or (
+                target.status == ChatMemberStatus.RESTRICTED
+                and getattr(target, "is_member", False)
+            ):
+                lines.append("✅ 该用户应获得黄金会员权限。")
+            else:
+                lines.append("❌ 该用户当前不属于有效群成员。")
+        else:
+            lines.append("✅ 机器人管理员权限正常。")
+            lines.append("可追加用户数字 ID 检查成员状态：/membercheck 用户ID")
+        await message.reply_text("\n".join(lines))
+    except ValueError:
+        await message.reply_text("用法：/membercheck 用户数字ID")
+    except Exception as exc:
+        log.exception("Member group diagnostic failed for group %s", group_id)
+        await message.reply_text(
+            "❌ 会员群诊断失败："
+            f"{type(exc).__name__}: {str(exc)[:300]}\n"
+            "请确认机器人仍在该群且拥有管理员身份。"
         )
 
 
