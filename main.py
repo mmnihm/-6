@@ -1209,7 +1209,7 @@ async def user_catalog_callback_handler(client, query):
         await query.answer(result if ok else result, show_alert=not ok)
         return
 
-    if action[1] == "star" and len(action) == 3:
+    if action[1] == "star" and len(action) >= 3:
         record = await db.get_file(action[2])
         if not record:
             await query.answer("文件不存在或已被移除", show_alert=True)
@@ -1230,8 +1230,8 @@ async def user_catalog_callback_handler(client, query):
                 )])
             rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
             await message.edit_text(
-                "⭐ 收藏列表\\n\\n" + (
-                    "\\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
+                "⭐ 收藏列表\n\n" + (
+                    "\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
                     if records else "这里暂时没有收藏。"
                 ),
                 reply_markup=InlineKeyboardMarkup(rows),
