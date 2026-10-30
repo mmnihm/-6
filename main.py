@@ -70,7 +70,7 @@ WELCOME = (
 
 
 async def is_admin(user_id: int) -> bool:
-    return await db.get_admin_id() == user_id
+    return config.ADMIN_ID == user_id
 
 
 async def has_access(user_id: int) -> bool:
@@ -131,16 +131,6 @@ async def start_handler(client, message):
     if not user:
         return
     await db.touch_user(user.id)
-
-    # The first private /start atomically claims the one-time superadmin slot.
-    if await db.get_admin_id() is None:
-        if await db.claim_first_admin(user.id):
-            await message.reply_text(
-                "👑 首位管理员认领成功！\n"
-                "你现在是本机器人的超级管理员。\n\n"
-                + WELCOME + "\n\n发送 /admin 查看管理命令。"
-            )
-            return
 
     payload = message.command[1] if len(message.command) > 1 else ""
     if payload.startswith("file_"):
