@@ -543,9 +543,11 @@ async def scan_status_handler(client, message):
     b = await db.get_scan_progress(backup)
     running = bool(scan_task and not scan_task.done())
     def label(progress):
-        return "已完成" if progress["completed"] else (
-            f"进行中/待继续（最近消息 ID：{progress['last_message_id']}）"
-        )
+        if progress["completed"]:
+            return "已完成"
+        if not progress["last_message_id"] and not progress["scanned_count"]:
+            return "未开始"
+        return f"待继续（最近消息 ID：{progress['last_message_id']}）"
     await message.reply_text(
         f"📊 历史扫描状态：{'运行中' if running else '未运行'}\n\n"
         f"主频道：{label(p)}\n已检查媒体：{p['scanned_count']}\n\n"
