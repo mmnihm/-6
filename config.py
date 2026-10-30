@@ -16,5 +16,7 @@ API_ID = int(required("API_ID"))
 API_HASH = required("API_HASH")
 ADMIN_ID = int(required("ADMIN_ID"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/bot.db")
+# EthioDeploy injects this automatically when the PostgreSQL addon is enabled.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 WEB_PORT = int(os.getenv("PORT") or os.getenv("WEB_PORT", "8080"))
