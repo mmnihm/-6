@@ -22,7 +22,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("member-cloud")
-db = Database(config.DATABASE_PATH)
+db = Database(config.DATABASE_PATH, database_url=config.DATABASE_URL)
 BOT_USERNAME = None
 pending_channel_bindings = {}
 scanner_login_states = {}
