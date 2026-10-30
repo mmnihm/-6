@@ -72,6 +72,21 @@ class Database:
                 )
             await db.commit()
 
+    async def get_setting(self, key: str):
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT value FROM settings WHERE key=?", (key,)
+            )).fetchone()
+            return row["value"] if row else None
+
+    async def set_setting(self, key: str, value: str):
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT INTO settings(key, value) VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """, (key, str(value)))
+            await db.commit()
+
     async def claim_first_admin(self, user_id: int) -> bool:
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
