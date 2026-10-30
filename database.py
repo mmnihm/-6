@@ -689,6 +689,7 @@ class Database:
                        SUM(CASE WHEN lower(files.media_type) IN ('photo', 'image') THEN 1 ELSE 0 END) AS image_count,
                        SUM(CASE WHEN lower(files.media_type) = 'video' THEN 1 ELSE 0 END) AS video_count,
                        SUM(COALESCE(files.file_size, 0)) AS total_size,
+                       SUM(CASE WHEN COALESCE(files.file_size, 0) > 0 THEN 1 ELSE 0 END) AS sized_count,
                        COALESCE(categories.description, '') AS description,
                        COALESCE(categories.created_at, MIN(files.created_at)) AS created_at,
                        COALESCE(MAX(files.created_at), categories.updated_at,
