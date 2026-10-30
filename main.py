@@ -547,7 +547,8 @@ async def start_handler(client, message):
         if category_index is None:
             await message.reply_text("⚠️ 文件夹不存在或已被移除。")
             return
-        files = await db.list_category_files(category_row["name"], limit=12, offset=0)
+        category_row = categories[category_index]
+        files = await db.list_category_files(category_row["category"], limit=12, offset=0)
         await message.reply_text(
             folder_detail_text(category_row, files, 0, await get_member_group_id()),
             reply_markup=folder_detail_keyboard(
