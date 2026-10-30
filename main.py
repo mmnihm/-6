@@ -891,7 +891,34 @@ async def admin_callback_handler(client, query):
             ]),
         )
     elif action == "scannerloginstart":
-        await message.reply_text("请发送 /scanlogin 开始登录流程。")
+        if scanner is not None and scanner.is_connected:
+            await message.edit_text("✅ 扫描账号已经登录，可以直接发送 /scan 开始扫描。", reply_markup=back_keyboard())
+        else:
+            old_client = scanner_login_clients.pop(user.id, None)
+            if old_client:
+                try:
+                    await old_client.disconnect()
+                except Exception:
+                    pass
+            login_client = Client(
+                "member_cloud_scanner",
+                api_id=config.API_ID,
+                api_hash=config.API_HASH,
+                workdir=SCANNER_WORKDIR,
+            )
+            try:
+                await login_client.connect()
+                scanner_login_clients[user.id] = login_client
+                scanner_login_states[user.id] = {"step": "phone"}
+                await message.edit_text(
+                    "🔐 请发送扫描账号的手机号（含国家区号，例如 +1）。\n\n"
+                    "随后按提示输入 Telegram 登录验证码；如开启两步验证，还需要输入密码。\n"
+                    "建议使用专用扫描账号。验证码/密码会短暂经过本机器人私聊，处理后会尝试立即删除。\n\n"
+                    "发送 /scancancel 可取消。"
+                )
+            except Exception:
+                log.exception("Could not start scanner login from admin panel")
+                await message.edit_text("❌ 无法启动登录流程，请稍后重试。", reply_markup=back_keyboard())
     elif action == "commands":
         await message.edit_text(
             "📖 管理命令速查\n\n"
@@ -1145,7 +1172,7 @@ async def main():
     finally:
         if runner is not None:
             await runner.cleanup()
-        if scanner_started and scanner is not None:
+        if scanner is not None and scanner.is_connected:
             await scanner.stop()
         await app.stop()
 
