@@ -49,7 +49,8 @@ class Database:
                     category TEXT NOT NULL DEFAULT '未分类',
                     primary_message_id INTEGER NOT NULL,
                     backup_message_id INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    source_fingerprint TEXT
                 );
                 CREATE TABLE IF NOT EXISTS manual_members (
                     user_id INTEGER PRIMARY KEY,
@@ -66,10 +67,20 @@ class Database:
             """)
             # Upgrade databases created by the first project revision.
             columns = await (await db.execute("PRAGMA table_info(files)")).fetchall()
-            if "category" not in {row["name"] for row in columns}:
+            column_names = {row["name"] for row in columns}
+            if "category" not in column_names:
                 await db.execute(
                     "ALTER TABLE files ADD COLUMN category TEXT NOT NULL DEFAULT '未分类'"
                 )
+            if "source_fingerprint" not in column_names:
+                await db.execute(
+                    "ALTER TABLE files ADD COLUMN source_fingerprint TEXT"
+                )
+            await db.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_files_source_fingerprint
+                ON files(source_fingerprint)
+                WHERE source_fingerprint IS NOT NULL
+            """)
             await db.commit()
 
     async def get_setting(self, key: str):
@@ -177,16 +188,27 @@ class Database:
             await db.execute("DELETE FROM banned_users WHERE user_id=?", (user_id,))
             await db.commit()
 
-    async def add_file(self, key, owner_id, file_name, media_type,
-                       primary_id, backup_id, category="未分类"):
+    async def get_file_by_fingerprint(self, fingerprint: str):
         async with self.connect() as db:
-            await db.execute("""
-                INSERT INTO files(file_key, owner_id, file_name, media_type, category,
-                                  primary_message_id, backup_message_id, created_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            return await (await db.execute(
+                "SELECT * FROM files WHERE source_fingerprint=?", (fingerprint,)
+            )).fetchone()
+
+    async def add_file(self, key, owner_id, file_name, media_type,
+                       primary_id, backup_id, category="未分类",
+                       source_fingerprint=None):
+        async with self.connect() as db:
+            cur = await db.execute("""
+                INSERT OR IGNORE INTO files(
+                    file_key, owner_id, file_name, media_type, category,
+                    primary_message_id, backup_message_id, created_at,
+                    source_fingerprint
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (key, owner_id, file_name, media_type, category,
-                  primary_id, backup_id, iso_now()))
+                  primary_id, backup_id, iso_now(), source_fingerprint))
             await db.commit()
+            return cur.rowcount == 1
 
     async def get_file(self, key):
         async with self.connect() as db:
