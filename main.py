@@ -285,6 +285,70 @@ async def reply_admin_only(message):
     await message.reply_text("⛔ 仅超级管理员可使用此命令。")
 
 
+def user_home_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📜 历史访问", callback_data="uc:history"),
+         InlineKeyboardButton("🗂️ 文件夹列表", callback_data="uc:folders")],
+        [InlineKeyboardButton("⭐ 收藏列表", callback_data="uc:favorites")],
+    ])
+
+
+async def user_home_text(user_id):
+    tier = await get_membership_tier(user_id)
+    stats = await db.catalog_stats()
+    return (
+        "🤖 欢迎使用网盘机器人\n\n"
+        f"🏅 会员级别：{tier or '未开通'}\n\n"
+        "📊 资源统计\n"
+        f"• 文件夹：{stats['folders']} 个\n"
+        f"• 消息：{stats['messages']} 条\n"
+        f"• 图片：{stats['images']} 张\n"
+        f"• 视频：{stats['videos']} 个\n\n"
+        "请选择下方功能："
+    )
+
+
+async def send_catalog_file(client, user_id, file_key):
+    record = await db.get_file(file_key)
+    if not record:
+        return False, "文件不存在或已被移除。"
+    primary_channel_id, backup_channel_id = await get_storage_channels()
+    if not primary_channel_id:
+        return False, "管理员尚未绑定主存储频道。"
+    try:
+        copied = await client.copy_message(
+            chat_id=user_id,
+            from_chat_id=primary_channel_id,
+            message_id=record["primary_message_id"],
+        )
+    except Exception:
+        log.warning("Primary copy failed for %s; trying backup", file_key, exc_info=True)
+        backup_message_id = int(record["backup_message_id"] or 0)
+        if not backup_channel_id or backup_message_id <= 0:
+            return False, "主存储文件暂时无法取回，而且尚未建立备份副本。"
+        try:
+            copied = await client.copy_message(
+                chat_id=user_id,
+                from_chat_id=backup_channel_id,
+                message_id=backup_message_id,
+            )
+        except Exception:
+            log.exception("Both storage copies failed for %s", file_key)
+            return False, "文件暂时无法取回，请联系管理员检查存储频道。"
+    await db.record_history(user_id, file_key)
+    try:
+        await client.edit_message_reply_markup(
+            chat_id=user_id,
+            message_id=copied.id,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⭐ 收藏/取消收藏", callback_data=f"uc:star:{file_key}")
+            ]]),
+        )
+    except Exception:
+        log.debug("Could not attach favorite button to delivered file %s", file_key, exc_info=True)
+    return True, "文件已发送。"
+
+
 @app.on_message(filters.private & filters.command("start"))
 async def start_handler(client, message):
     user = message.from_user
@@ -297,45 +361,18 @@ async def start_handler(client, message):
         if not await has_access(user.id):
             await message.reply_text("⛔ 仅限会员群成员使用。请先加入会员群后重试。")
             return
-        key = payload[5:]
-        record = await db.get_file(key)
-        if not record:
-            await message.reply_text("❌ 分享链接无效或文件不存在。")
-            return
-        primary_channel_id, backup_channel_id = await get_storage_channels()
-        if not primary_channel_id or not backup_channel_id:
-            await message.reply_text("⚠️ 管理员尚未绑定主存储和备份频道，请稍后再试。")
-            return
-        try:
-            await client.copy_message(
-                chat_id=user.id,
-                from_chat_id=primary_channel_id,
-                message_id=record["primary_message_id"],
-            )
-        except Exception:
-            log.warning("Primary copy failed for %s; trying backup", key, exc_info=True)
-            backup_message_id = int(record["backup_message_id"] or 0)
-            if backup_message_id <= 0:
-                await message.reply_text(
-                    "❌ 主存储文件暂时无法取回，而且该文件尚未建立备份副本。请联系管理员检查。"
-                )
-                return
-            try:
-                await client.copy_message(
-                    chat_id=user.id,
-                    from_chat_id=backup_channel_id,
-                    message_id=backup_message_id,
-                )
-            except Exception:
-                log.exception("Both storage copies failed for %s", key)
-                await message.reply_text("❌ 文件暂时无法取回，请联系管理员检查主备份频道。")
+        ok, result = await send_catalog_file(client, user.id, payload[5:])
+        if not ok:
+            await message.reply_text(f"❌ {result}")
         return
 
     if not await has_access(user.id):
         await message.reply_text("⛔ 本机器人仅对会员开放。请先加入会员群。")
         return
-    tier = await get_membership_tier(user.id)
-    await message.reply_text(f"{WELCOME}\n\n🏅 当前身份：{tier}")
+    await message.reply_text(
+        await user_home_text(user.id),
+        reply_markup=user_home_keyboard(),
+    )
 
 
 @app.on_message(
@@ -1074,6 +1111,112 @@ async def admin_handler(client, message):
         "请选择下方按钮管理机器人。",
         reply_markup=admin_keyboard(),
     )
+
+
+@app.on_callback_query(filters.regex(r"^uc:"))
+async def user_catalog_callback_handler(client, query):
+    user = query.from_user
+    if not user or not await has_access(user.id):
+        await query.answer("仅限会员群成员使用", show_alert=True)
+        return
+    await query.answer()
+    action = query.data.split(":")
+    message = query.message
+    if not message:
+        return
+
+    if action[1] == "home":
+        await message.edit_text(
+            await user_home_text(user.id),
+            reply_markup=user_home_keyboard(),
+        )
+        return
+
+    if action[1] == "folders":
+        categories = await db.list_categories()
+        rows = [
+            [InlineKeyboardButton(
+                f"🗂 {row['category']}（{row['file_count']}）",
+                callback_data=f"uc:folder:{index}",
+            )]
+            for index, row in enumerate(categories)
+        ]
+        rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
+        await message.edit_text(
+            "🗂️ 文件夹列表\n\n选择分类查看文件："
+            if categories else "🗂️ 暂无文件夹分类。",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if action[1] == "folder" and len(action) == 3:
+        try:
+            index = int(action[2])
+            categories = await db.list_categories()
+            category = categories[index]["category"]
+        except (ValueError, IndexError):
+            await query.answer("分类已更新，请重新打开列表", show_alert=True)
+            return
+        files = await db.list_category_files(category, limit=12)
+        rows = []
+        for row in files:
+            name = row["file_name"][:28]
+            rows.append([InlineKeyboardButton(
+                f"📄 {name}", callback_data=f"uc:open:{row['file_key']}"
+            )])
+            rows.append([InlineKeyboardButton(
+                "⭐ 收藏/取消收藏", callback_data=f"uc:star:{row['file_key']}"
+            )])
+        rows.append([InlineKeyboardButton("⬅️ 文件夹列表", callback_data="uc:folders")])
+        await message.edit_text(
+            f"🗂️ {category}\n\n"
+            + ("\n".join(f"• {row['file_name'][:45]}" for row in files)
+               if files else "这个分类暂时没有文件。"),
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if action[1] in ("history", "favorites"):
+        is_history = action[1] == "history"
+        records = (
+            await db.list_user_history(user.id, 12)
+            if is_history else await db.list_favorites(user.id, 12)
+        )
+        title = "📜 历史访问" if is_history else "⭐ 收藏列表"
+        rows = []
+        for row in records:
+            rows.append([InlineKeyboardButton(
+                f"📄 {row['file_name'][:32]}",
+                callback_data=f"uc:open:{row['file_key']}",
+            )])
+            if is_history:
+                rows.append([InlineKeyboardButton(
+                    "⭐ 收藏/取消收藏",
+                    callback_data=f"uc:star:{row['file_key']}",
+                )])
+        rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
+        body = title + "\n\n" + (
+            "\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
+            if records else "这里暂时没有记录。"
+        )
+        await message.edit_text(body, reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if action[1] == "open" and len(action) == 3:
+        ok, result = await send_catalog_file(client, user.id, action[2])
+        await query.answer(result if ok else result, show_alert=not ok)
+        return
+
+    if action[1] == "star" and len(action) == 3:
+        record = await db.get_file(action[2])
+        if not record:
+            await query.answer("文件不存在或已被移除", show_alert=True)
+            return
+        added = await db.toggle_favorite(user.id, action[2])
+        await query.answer("⭐ 已加入收藏" if added else "已取消收藏")
+        if len(action) > 3 and action[3] == "refresh":
+            pass
+        return
 
 
 @app.on_callback_query(filters.regex(r"^mc:"))
