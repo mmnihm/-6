@@ -760,7 +760,7 @@ async def build_info_handler(client, message):
             scanner_id = f"读取失败：{type(exc).__name__}: {exc}"
     await message.reply_text(
         "🧩 机器人运行版本\n"
-        "GitHub main 提交：0214fea5d60be7115feb35f908fa4c6f9287d909\n"
+        "扫描诊断版本：scan-diagnostics-0214fea\n"
         f"扫描账号：{scanner_id if scanner_id is not None else '未连接'}\n"
         f"运行文件：{os.path.abspath(__file__)}"
     )
