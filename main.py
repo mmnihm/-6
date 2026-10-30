@@ -3,6 +3,8 @@ import logging
 import secrets
 from datetime import datetime, timezone
 
+from aiohttp import web
+
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ChatMemberStatus, ChatType
@@ -10,6 +12,7 @@ from pyrogram.errors import FloodWait, PeerIdInvalid, UserNotParticipant
 
 import config
 from database import Database
+from web_catalog import create_catalog_app
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -664,12 +667,22 @@ async def main():
     global BOT_USERNAME
     await db.initialize()
     await app.start()
-    me = await app.get_me()
-    BOT_USERNAME = me.username
-    log.info("Bot started: @%s", me.username)
+    runner = None
     try:
+        me = await app.get_me()
+        BOT_USERNAME = me.username
+        log.info("Bot started: @%s", me.username)
+
+        runner = web.AppRunner(create_catalog_app(db, lambda: BOT_USERNAME))
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", config.WEB_PORT)
+        await site.start()
+        log.info("Public catalog listening on port %s", config.WEB_PORT)
+
         await asyncio.Event().wait()
     finally:
+        if runner is not None:
+            await runner.cleanup()
         await app.stop()
 
 
