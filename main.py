@@ -261,9 +261,9 @@ async def bind_channel_forward_handler(client, message):
     pending_channel_bindings.pop(user.id, None)
     label = "主存储频道" if setting_key == "storage_primary_channel_id" else "备份存储频道"
     await message.reply_text(
-        f"✅ {label}绑定成功！\\n"
-        f"频道：{source.title or '未命名频道'}\\n"
-        f"频道 ID：{source.id}\\n\\n"
+        f"✅ {label}绑定成功！\n"
+        f"频道：{source.title or '未命名频道'}\n"
+        f"频道 ID：{source.id}\n\n"
         "可使用 /storage 查看双频道绑定状态。"
     )
 
@@ -276,7 +276,7 @@ async def bind_main_channel_handler(client, message):
         return
     pending_channel_bindings[user.id] = "storage_primary_channel_id"
     await message.reply_text(
-        "📥 请把主存储私有频道中的任意一条消息，直接转发到这里。\\n"
+        "📥 请把主存储私有频道中的任意一条消息，直接转发到这里。\n"
         "要求：机器人必须已经是该频道管理员。"
     )
 
@@ -289,7 +289,7 @@ async def bind_backup_channel_handler(client, message):
         return
     pending_channel_bindings[user.id] = "storage_backup_channel_id"
     await message.reply_text(
-        "📥 请把备份存储私有频道中的任意一条消息，直接转发到这里。\\n"
+        "📥 请把备份存储私有频道中的任意一条消息，直接转发到这里。\n"
         "要求：机器人必须已经是该频道管理员。"
     )
 
@@ -302,9 +302,9 @@ async def storage_status_handler(client, message):
         return
     primary, backup = await get_storage_channels()
     await message.reply_text(
-        "🗄 双频道绑定状态\\n\\n"
-        f"主存储频道：{primary or '未绑定'}\\n"
-        f"备份存储频道：{backup or '未绑定'}\\n\\n"
+        "🗄 双频道绑定状态\n\n"
+        f"主存储频道：{primary or '未绑定'}\n"
+        f"备份存储频道：{backup or '未绑定'}\n\n"
         "绑定命令：/bindmain、/bindbackup"
     )
 
