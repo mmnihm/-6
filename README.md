@@ -70,7 +70,7 @@ python main.py
 - 机器人需同时具备读取会员群成员状态、向两个私有频道发送消息的权限。
 - 上传成功必须同时写入主频道和备份频道；若任一频道失败，不会把该文件登记为可分享文件。
 - 分享链接使用 Telegram 深链，取回时优先主频道，失败时尝试备份频道。
-- SQLite 使用 WAL 模式；数据库和频道消息都应纳入 VPS 备份计划。
+- EthioDeploy 使用托管 PostgreSQL 保存业务数据；本地或未配置 `DATABASE_URL` 时回退到 SQLite。PostgreSQL 插件提供平台备份，Telegram 私有频道仍是文件内容的主存储。
 
 ## 许可证
 
