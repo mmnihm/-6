@@ -344,7 +344,7 @@ async def bind_member_group_handler(client, message):
     )
 
 
-@app.on_message((filters.group | filters.supergroup) & filters.command("bindgroup"))
+@app.on_message(filters.group & filters.command("bindgroup"))
 async def bind_member_group_in_chat_handler(client, message):
     user = message.from_user
     if not user or not await is_admin(user.id):
