@@ -1,6 +1,7 @@
 import os
 import aiosqlite
 import re
+import secrets
 from contextlib import asynccontextmanager
 
 import psycopg
@@ -408,20 +409,14 @@ class Database:
                 FROM scanner_messages
                 WHERE channel_id=? AND fingerprint=?
             """, (other_channel_id, fingerprint))).fetchone()
+
+            # Primary files are available immediately; backups are optional.
+            primary = current if channel_id == primary_channel_id else other
+            backup = other if channel_id == primary_channel_id else current
             inserted = False
-            if current and other:
-                if channel_id == primary_channel_id:
-                    primary_id, backup_id = current["message_id"], other["message_id"]
-                    source = (
-                        current["file_name"], current["media_type"],
-                        current["category"], current["created_at"]
-                    )
-                else:
-                    primary_id, backup_id = other["message_id"], current["message_id"]
-                    source = (
-                        other["file_name"], other["media_type"],
-                        other["category"], other["created_at"]
-                    )
+            if primary:
+                primary_id = primary["message_id"]
+                backup_id = backup["message_id"] if backup else 0
                 cur = await db.execute("""
                     INSERT OR IGNORE INTO files(
                         file_key, owner_id, file_name, media_type, category,
@@ -429,12 +424,48 @@ class Database:
                         source_fingerprint
                     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    file_key, owner_id, source[0], source[1], source[2],
-                    primary_id, backup_id, source[3], fingerprint
+                    file_key, owner_id, primary["file_name"],
+                    primary["media_type"], primary["category"],
+                    primary_id, backup_id, primary["created_at"], fingerprint
                 ))
                 inserted = cur.rowcount == 1
+                if backup:
+                    await db.execute("""
+                        UPDATE files SET backup_message_id=?
+                        WHERE source_fingerprint=? AND primary_message_id=?
+                          AND backup_message_id=0
+                    """, (backup_id, fingerprint, primary_id))
             await db.commit()
             return bool(other), inserted
+
+    async def publish_primary_catalog(self, primary_channel_id, owner_id):
+        """Backfill primary-channel items scanned by older dual-match-only code."""
+        created = 0
+        async with self.connect() as db:
+            rows = await (await db.execute("""
+                SELECT s.message_id, s.fingerprint, s.file_name,
+                       s.media_type, s.category, s.created_at
+                FROM scanner_messages AS s
+                LEFT JOIN files AS f ON f.source_fingerprint=s.fingerprint
+                WHERE s.channel_id=? AND f.file_key IS NULL
+                ORDER BY s.message_id
+            """, (primary_channel_id,))).fetchall()
+            for row in rows:
+                key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
+                cur = await db.execute("""
+                    INSERT OR IGNORE INTO files(
+                        file_key, owner_id, file_name, media_type, category,
+                        primary_message_id, backup_message_id, created_at,
+                        source_fingerprint
+                    ) VALUES(?, ?, ?, ?, ?, ?, 0, ?, ?)
+                """, (
+                    key, owner_id, row["file_name"], row["media_type"],
+                    row["category"], row["message_id"], row["created_at"],
+                    row["fingerprint"]
+                ))
+                created += int(cur.rowcount == 1)
+            await db.commit()
+        return created
 
     async def advance_scan_cursor(self, channel_id, message_id):
         async with self.connect() as db:
