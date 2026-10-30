@@ -596,7 +596,11 @@ class Database:
                 INSERT INTO category_delivery_progress(user_id, share_key, next_offset, updated_at)
                 VALUES(?, ?, ?, ?)
                 ON CONFLICT(user_id, share_key) DO UPDATE SET
-                    next_offset=MAX(category_delivery_progress.next_offset, excluded.next_offset),
+                    next_offset=CASE
+                        WHEN category_delivery_progress.next_offset > excluded.next_offset
+                        THEN category_delivery_progress.next_offset
+                        ELSE excluded.next_offset
+                    END,
                     updated_at=excluded.updated_at
             """, (user_id, share_key, max(0, int(next_offset)), iso_now()))
             await db.commit()
