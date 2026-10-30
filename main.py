@@ -545,7 +545,7 @@ async def scanner_login_cancel_handler(client, message):
 
 
 @app.on_message(
-    filters.private & filters.text & ~filters.command
+    filters.private & filters.text & ~filters.regex(r"^/")
 )
 async def scanner_login_input_handler(client, message):
     global scanner
