@@ -20,6 +20,8 @@ async def main():
         me = await client.get_me()
         if me.is_bot:
             raise RuntimeError("Please sign in with a normal Telegram user account, not a bot.")
+        async for _dialog in client.get_dialogs():
+            pass
         print(f"Scanner account ready: {me.id}")
         print("The login session is saved in the persistent data directory.")
     finally:
