@@ -531,6 +531,31 @@ async def start_handler(client, message):
     await db.touch_user(user.id)
 
     payload = message.command[1] if len(message.command) > 1 else ""
+    if payload.startswith("folder_"):
+        if not await has_access(user.id):
+            await message.reply_text("⛔ 仅限会员群成员使用。请先加入会员群后重试。")
+            return
+        category_row = await db.get_category_by_share_key(payload[7:])
+        if not category_row:
+            await message.reply_text("⚠️ 这个文件夹分享链接已失效或不存在。")
+            return
+        categories = await db.list_categories()
+        category_index = next(
+            (i for i, row in enumerate(categories) if row["category"] == category_row["name"]),
+            None,
+        )
+        if category_index is None:
+            await message.reply_text("⚠️ 文件夹不存在或已被移除。")
+            return
+        files = await db.list_category_files(category_row["name"], limit=12, offset=0)
+        await message.reply_text(
+            folder_detail_text(category_row, files, 0, await get_member_group_id()),
+            reply_markup=folder_detail_keyboard(
+                category_index, files, 0, len(files) == 12
+            ),
+            disable_web_page_preview=True,
+        )
+        return
     if payload.startswith("file_"):
         if not await has_access(user.id):
             await message.reply_text("⛔ 仅限会员群成员使用。请先加入会员群后重试。")
@@ -580,12 +605,29 @@ async def directory_export_upload_handler(client, message):
         if not isinstance(directories, list) or not isinstance(resources, list):
             raise ValueError("目录或资源清单缺失。")
         clean_directories = []
+        seen_directories = set()
         for item in directories:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name") or "").strip()[:120]
-            if name and name not in clean_directories:
-                clean_directories.append(name)
+            if not name or name in seen_directories:
+                continue
+            seen_directories.add(name)
+            created_at = None
+            raw_created_at = item.get("createdAt")
+            try:
+                if raw_created_at:
+                    timestamp = float(raw_created_at)
+                    if timestamp > 100000000000:
+                        timestamp /= 1000
+                    created_at = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                created_at = str(raw_created_at)[:64] if raw_created_at else None
+            clean_directories.append({
+                "name": name,
+                "description": str(item.get("description") or "")[:1000],
+                "created_at": created_at,
+            })
         clean_resources = []
         seen = set()
         invalid = 0
@@ -605,6 +647,19 @@ async def directory_export_upload_handler(client, message):
             if source_key in seen:
                 continue
             seen.add(source_key)
+            resource_created_at = None
+            try:
+                resource_date = float(item.get("date") or 0)
+                if resource_date > 0:
+                    resource_created_at = datetime.fromtimestamp(
+                        resource_date, timezone.utc
+                    ).isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+            try:
+                file_size = max(0, int(item.get("size") or item.get("fileSize") or item.get("bytes") or 0))
+            except (TypeError, ValueError):
+                file_size = 0
             clean_resources.append({
                 "chat_id": chat_id,
                 "message_id": message_id,
@@ -612,6 +667,8 @@ async def directory_export_upload_handler(client, message):
                 "media_type": str(item.get("fileType") or "document")[:32].lower(),
                 "category": str(item.get("category") or "未分类").strip()[:120] or "未分类",
                 "source_fingerprint": source_key,
+                "file_size": file_size,
+                "created_at": resource_created_at,
             })
         if not clean_resources:
             raise ValueError("文件中没有可迁移的媒体资源。")
@@ -681,8 +738,10 @@ async def directory_import_confirm_handler(client, message):
     status = await message.reply_text("⏳ 正在导入目录和资源索引，不会复制或移动原文件…")
     success = skipped = failed = 0
     try:
-        for category in pending["directories"]:
-            await db.save_category(category)
+        for folder in pending["directories"]:
+            await db.save_category(
+                folder["name"], folder.get("description", ""), folder.get("created_at")
+            )
 
         total = len(pending["resources"])
         for index, item in enumerate(pending["resources"], 1):
@@ -694,7 +753,8 @@ async def directory_import_confirm_handler(client, message):
                     file_key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
                     inserted = await db.add_file(
                         file_key, user.id, item["file_name"], item["media_type"],
-                        item["message_id"], 0, item["category"], fingerprint
+                        item["message_id"], 0, item["category"], fingerprint,
+                        item.get("file_size", 0), item.get("created_at")
                     )
                     if inserted:
                         await db.save_category(item["category"])
@@ -1533,36 +1593,23 @@ async def user_catalog_callback_handler(client, query):
     if action[1] == "folder" and len(action) >= 3:
         try:
             index = int(action[2])
-            offset = int(action[3]) if len(action) > 3 else 0
+            offset = max(0, int(action[3])) if len(action) > 3 else 0
             categories = await db.list_categories()
-            category = categories[index]["category"]
+            category_row = categories[index]
+            category = category_row["category"]
         except (ValueError, IndexError):
             await query.answer("分类已更新，请重新打开列表", show_alert=True)
             return
         await query.answer()
         files = await db.list_category_files(category, limit=12, offset=offset)
-        rows = []
-        for row in files:
-            name = row["file_name"][:28]
-            rows.append([InlineKeyboardButton(
-                f"📄 {name}", callback_data=f"uc:open:{row['file_key']}"
-            )])
-            rows.append([InlineKeyboardButton(
-                "⭐ 收藏/取消收藏", callback_data=f"uc:star:{row['file_key']}:folder"
-            )])
-        nav = []
-        if offset > 0:
-            nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"uc:folder:{index}:{max(0, offset - 12)}"))
-        if len(files) == 12:
-            nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"uc:folder:{index}:{offset + 12}"))
-        if nav:
-            rows.append(nav)
-        rows.append([InlineKeyboardButton("⬅️ 文件夹列表", callback_data="uc:folders")])
+        page = offset // 12
+        group_id = await get_member_group_id()
         await message.edit_text(
-            f"🗂️ {category}（第 {offset // 12 + 1} 页）\n\n"
-            + ("\n".join(f"• {row['file_name'][:45]}" for row in files)
-               if files else "这个分类暂时没有文件。"),
-            reply_markup=InlineKeyboardMarkup(rows),
+            folder_detail_text(category_row, files, page, group_id),
+            reply_markup=folder_detail_keyboard(
+                index, files, page, len(files) == 12
+            ),
+            disable_web_page_preview=True,
         )
         return
 
