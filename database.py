@@ -177,7 +177,10 @@ class Database:
                 first_seen TEXT NOT NULL,
                 last_seen TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS categories (\n                name TEXT PRIMARY KEY,\n                created_at TEXT NOT NULL\n            );\n            CREATE TABLE IF NOT EXISTS files (
+            CREATE TABLE IF NOT EXISTS categories (
+                name TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            );\n            CREATE TABLE IF NOT EXISTS files (
                 file_key TEXT PRIMARY KEY,
                 owner_id BIGINT NOT NULL,
                 file_name TEXT NOT NULL,
