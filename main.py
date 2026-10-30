@@ -745,6 +745,27 @@ def format_scan_check(result, label):
     return "\n".join(lines)
 
 
+@app.on_message(filters.private & filters.command("build"))
+async def build_info_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    scanner_id = None
+    if scanner is not None and scanner.is_connected:
+        try:
+            scanner_me = await scanner.get_me()
+            scanner_id = scanner_me.id
+        except Exception as exc:
+            scanner_id = f"读取失败：{type(exc).__name__}: {exc}"
+    await message.reply_text(
+        "🧩 机器人运行版本\n"
+        "GitHub main 提交：7d742debc28b0a644072c68e1ea194c1adf1b16f\n"
+        f"扫描账号：{scanner_id if scanner_id is not None else '未连接'}\n"
+        f"运行文件：{os.path.abspath(__file__)}"
+    )
+
+
 @app.on_message(filters.private & filters.command("scancheck"))
 async def scan_check_handler(client, message):
     user = message.from_user
