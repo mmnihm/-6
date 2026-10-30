@@ -843,7 +843,7 @@ async def build_info_handler(client, message):
             scanner_id = f"读取失败：{type(exc).__name__}: {exc}"
     await message.reply_text(
         "🧩 机器人运行版本\n"
-        "扫描诊断版本：cangku-style-scan-9d8864f\n"
+        "会员验证版本：peer-warmup-44e31a3\n"
         f"扫描账号：{scanner_id if scanner_id is not None else '未连接'}\n"
         f"运行文件：{os.path.abspath(__file__)}"
     )
