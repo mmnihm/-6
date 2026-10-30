@@ -381,15 +381,22 @@ async def start_handler(client, message):
     )
 
 
-@app.on_message(filters.private & filters.document & filters.user(config.ADMIN_ID))
+@app.on_message(filters.private & filters.document)
 async def directory_export_upload_handler(client, message):
-    """Receive a Cangku JSON export and prepare a safe preview; no files are copied yet."""
+    """Receive an admin's Cangku JSON export and prepare a safe preview."""
     user = message.from_user
-    if not user or not await is_admin(user.id):
+    if not user:
         return
+    if not await is_admin(user.id):
+        # Preserve the existing normal-upload flow for non-admin users.
+        await upload_handler(client, message)
+        return
+
+    # Acknowledge immediately so the admin can see that the document was received.
+    status = await message.reply_text("⏳ 已收到文件，正在检查是否为 Cangku 目录迁移 JSON…")
     document = message.document
     if not document or not (document.file_name or "").lower().endswith(".json"):
-        await message.reply_text("⚠️ 请发送 Cangku 导出的 JSON 文件。")
+        await status.edit_text("⚠️ 已收到文件，但文件名不是 .json。请发送 Cangku 导出的原始 JSON 文件。")
         return
     local_path = None
     try:
@@ -451,7 +458,7 @@ async def directory_export_upload_handler(client, message):
             "source_exported_at": str(payload.get("exportedAt") or ""),
             "invalid": invalid,
         }
-        await message.reply_text(
+        await status.edit_text(
             "📦 Cangku 目录迁移预览\n\n"
             f"📁 文件夹：{len(clean_directories)} 个\n"
             f"📄 资源清单：{len(clean_resources)} 个\n"
@@ -463,7 +470,7 @@ async def directory_export_upload_handler(client, message):
         )
     except Exception as exc:
         log.exception("Could not prepare Cangku directory import")
-        await message.reply_text(f"❌ 无法读取迁移文件：{str(exc)[:500]}")
+        await status.edit_text(f"❌ 无法读取迁移文件：{str(exc)[:500]}")
     finally:
         if local_path and os.path.exists(local_path):
             try:
