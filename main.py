@@ -1119,13 +1119,13 @@ async def user_catalog_callback_handler(client, query):
     if not user or not await has_access(user.id):
         await query.answer("仅限会员群成员使用", show_alert=True)
         return
-    await query.answer()
     action = query.data.split(":")
     message = query.message
     if not message:
         return
 
     if action[1] == "home":
+        await query.answer()
         await message.edit_text(
             await user_home_text(user.id),
             reply_markup=user_home_keyboard(),
@@ -1133,6 +1133,7 @@ async def user_catalog_callback_handler(client, query):
         return
 
     if action[1] == "folders":
+        await query.answer()
         categories = await db.list_categories()
         rows = [
             [InlineKeyboardButton(
@@ -1150,6 +1151,7 @@ async def user_catalog_callback_handler(client, query):
         return
 
     if action[1] == "folder" and len(action) == 3:
+        await query.answer()
         try:
             index = int(action[2])
             categories = await db.list_categories()
@@ -1177,6 +1179,7 @@ async def user_catalog_callback_handler(client, query):
         return
 
     if action[1] in ("history", "favorites"):
+        await query.answer()
         is_history = action[1] == "history"
         records = (
             await db.list_user_history(user.id, 12)
@@ -1189,11 +1192,10 @@ async def user_catalog_callback_handler(client, query):
                 f"📄 {row['file_name'][:32]}",
                 callback_data=f"uc:open:{row['file_key']}",
             )])
-            if is_history:
-                rows.append([InlineKeyboardButton(
-                    "⭐ 收藏/取消收藏",
-                    callback_data=f"uc:star:{row['file_key']}",
-                )])
+            rows.append([InlineKeyboardButton(
+                "⭐ 收藏/取消收藏",
+                callback_data=f"uc:star:{row['file_key']}",
+            )])
         rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
         body = title + "\n\n" + (
             "\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
