@@ -1,4 +1,5 @@
 import asyncio
+import aiohttp
 import logging
 import os
 import secrets
@@ -59,6 +60,25 @@ async def get_member_group_id():
     value = await db.get_setting("member_group_id")
     return int(value) if value else None
 
+async def telegram_bot_api(method: str, payload: dict):
+    """Call Telegram Bot API directly, avoiding Pyrogram user-peer cache lookups."""
+    url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/{method}"
+    timeout = aiohttp.ClientTimeout(total=12)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload) as response:
+                data = await response.json(content_type=None)
+    except Exception as exc:
+        # Do not include the request URL: it contains the bot token.
+        raise RuntimeError(
+            f"Telegram {method} network error: {type(exc).__name__}"
+        ) from None
+    if not isinstance(data, dict) or not data.get("ok"):
+        error_code = data.get("error_code", "unknown") if isinstance(data, dict) else "unknown"
+        description = data.get("description", "invalid API response") if isinstance(data, dict) else "invalid API response"
+        raise RuntimeError(f"Telegram {method} failed ({error_code}): {description}")
+    return data.get("result")
+
 app = Client(
     "member_cloud_bot",
     api_id=config.API_ID,
@@ -104,72 +124,40 @@ async def get_membership_tier(user_id: int):
         return None
 
     try:
-        # Warm Telegram peers before checking membership to avoid false
-        # PeerIdInvalid results after a fresh deployment.
-        group = await app.get_chat(group_id)
-        if int(group.id) != int(group_id):
-            log.error(
-                "Membership group resolution mismatch: configured=%s resolved=%s",
-                group_id, getattr(group, "id", None),
-            )
-            return None
-
-        # Telegram only guarantees getChatMember for other users when the bot
-        # is an administrator in the target group.
+        # Match Cangku's proven approach: Bot API accepts numeric user IDs
+        # directly and does not depend on Pyrogram's local Peer/access_hash cache.
         bot_user = await app.get_me()
-        bot_member = await app.get_chat_member(group.id, bot_user.id)
-        if bot_member.status not in (
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        ):
-            log.error(
-                "Membership verification unavailable: bot is not an admin "
-                "in bound group %s (bot status=%s)",
-                group_id, getattr(bot_member.status, "value", bot_member.status),
-            )
-            return None
-
-        target = await app.get_users(user_id)
-        if int(target.id) != int(user_id):
-            log.error(
-                "Membership user resolution mismatch: requested=%s resolved=%s",
-                user_id, getattr(target, "id", None),
-            )
-            return None
-
-        member = await app.get_chat_member(group.id, target.id)
-        status = member.status
-        log.info(
-            "Membership check: user=%s group=%s status=%s",
-            user_id, group_id, getattr(status, "value", status),
+        bot_member = await telegram_bot_api(
+            "getChatMember",
+            {"chat_id": group_id, "user_id": bot_user.id},
         )
-        if status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+        bot_status = str(bot_member.get("status", ""))
+        if bot_status not in ("administrator", "creator"):
+            log.error(
+                "Membership verification unavailable: bot is not admin "
+                "in bound group %s (bot status=%s)",
+                group_id, bot_status,
+            )
             return None
-        if status == ChatMemberStatus.RESTRICTED:
-            return "黄金会员" if getattr(member, "is_member", False) else None
-        if status in (
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        ):
+
+        member = await telegram_bot_api(
+            "getChatMember",
+            {"chat_id": group_id, "user_id": int(user_id)},
+        )
+        status = str(member.get("status", ""))
+        log.info(
+            "Membership check via Bot API: user=%s group=%s status=%s",
+            user_id, group_id, status,
+        )
+        if status in ("member", "administrator", "creator"):
+            return "黄金会员"
+        if status == "restricted" and member.get("is_member") is True:
             return "黄金会员"
         return None
-    except UserNotParticipant:
-        log.info(
-            "Membership check: Telegram confirms user %s is not in group %s",
-            user_id, group_id,
-        )
-        return None
-    except PeerIdInvalid:
-        log.exception(
-            "Membership peer resolution failed after warming peers: user=%s group=%s",
-            user_id, group_id,
-        )
-        return None
-    except Exception:
-        log.exception(
-            "Membership check failed: user=%s group=%s",
-            user_id, group_id,
+    except Exception as exc:
+        log.error(
+            "Bot API membership check failed: user=%s group=%s error=%s",
+            user_id, group_id, str(exc)[:400],
         )
         return None
 
@@ -582,18 +570,24 @@ async def bind_member_group_in_chat_handler(client, message):
         await message.reply_text("❌ 请在需要绑定的会员群内发送 /bindgroup。")
         return
 
-    me = await client.get_me()
     try:
-        bot_member = await client.get_chat_member(message.chat.id, me.id)
-    except Exception:
-        log.exception("Could not verify bot membership in group %s", message.chat.id)
-        await message.reply_text("❌ 机器人无法读取本群成员状态。请确认机器人已加入群组，并将机器人设为管理员后重试。")
+        me = await client.get_me()
+        bot_member = await telegram_bot_api(
+            "getChatMember",
+            {"chat_id": message.chat.id, "user_id": me.id},
+        )
+    except Exception as exc:
+        log.error(
+            "Could not verify bot membership in group %s: %s",
+            message.chat.id, str(exc)[:400],
+        )
+        await message.reply_text(
+            "❌ 无法通过 Telegram Bot API 读取机器人在本群的状态："
+            f"{str(exc)[:250]}"
+        )
         return
 
-    if bot_member.status not in (
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.OWNER,
-    ):
+    if bot_member.get("status") not in ("administrator", "creator"):
         await message.reply_text(
             "❌ 机器人当前不是本群管理员，不能可靠验证其他群成员。\n\n"
             "请先把机器人设为管理员（不需要授予额外管理权限），再重新发送 /bindgroup。"
@@ -606,9 +600,8 @@ async def bind_member_group_in_chat_handler(client, message):
         "✅ 会员群绑定成功！\n"
         f"群组：{message.chat.title or '未命名'}\n"
         f"群 ID：{message.chat.id}\n\n"
-        "机器人已记录这个私密群组。\n"
-        "已确认机器人是群管理员，可以验证群成员身份。\n"
-        "可回到私聊发送 /storage 查看绑定状态。"
+        "已通过 Telegram Bot API 确认机器人管理员身份。\n"
+        "会员资格将直接按用户数字 ID 实时验证。"
     )
 
 
@@ -1412,55 +1405,52 @@ async def membercheck_handler(client, message):
         return
 
     try:
-        group = await client.get_chat(group_id)
+        group = await telegram_bot_api("getChat", {"chat_id": group_id})
         me = await client.get_me()
-        bot_member = await client.get_chat_member(group.id, me.id)
-        bot_status = getattr(bot_member.status, "value", str(bot_member.status))
+        bot_member = await telegram_bot_api(
+            "getChatMember",
+            {"chat_id": group_id, "user_id": me.id},
+        )
+        bot_status = str(bot_member.get("status", "unknown"))
         lines = [
-            "🔎 会员群权限诊断",
-            f"群名称：{group.title or '未命名'}",
-            f"群 ID：{group.id}",
+            "🔎 会员群权限诊断（Telegram Bot API）",
+            f"群名称：{group.get('title') or '未命名'}",
+            f"群 ID：{group_id}",
             f"机器人状态：{bot_status}",
         ]
-        if bot_member.status not in (
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        ):
-            lines.append(
-                "❌ 机器人不是群管理员，无法可靠查询普通成员。"
-                "请提升为管理员后再试。"
-            )
+        if bot_status not in ("administrator", "creator"):
+            lines.append("❌ 机器人不是群管理员，无法可靠查询普通成员。")
             await message.reply_text("\n".join(lines))
             return
 
         if len(message.command) > 1:
             target_id = int(message.command[1])
-            target = await client.get_chat_member(group.id, target_id)
-            target_status = getattr(target.status, "value", str(target.status))
+            target = await telegram_bot_api(
+                "getChatMember",
+                {"chat_id": group_id, "user_id": target_id},
+            )
+            target_status = str(target.get("status", "unknown"))
             lines.append(f"用户 {target_id} 状态：{target_status}")
-            if target.status in (
-                ChatMemberStatus.MEMBER,
-                ChatMemberStatus.ADMINISTRATOR,
-                ChatMemberStatus.OWNER,
-            ) or (
-                target.status == ChatMemberStatus.RESTRICTED
-                and getattr(target, "is_member", False)
+            if target_status in ("member", "administrator", "creator") or (
+                target_status == "restricted" and target.get("is_member") is True
             ):
-                lines.append("✅ 该用户应获得黄金会员权限。")
+                lines.append("✅ Bot API 确认该用户是有效群成员，应获得黄金会员权限。")
             else:
-                lines.append("❌ 该用户当前不属于有效群成员。")
+                lines.append("❌ Bot API 返回该用户不是有效群成员。")
         else:
             lines.append("✅ 机器人管理员权限正常。")
-            lines.append("可追加用户数字 ID 检查成员状态：/membercheck 用户ID")
+            lines.append("可追加用户数字 ID 检查：/membercheck 用户ID")
         await message.reply_text("\n".join(lines))
     except ValueError:
         await message.reply_text("用法：/membercheck 用户数字ID")
     except Exception as exc:
-        log.exception("Member group diagnostic failed for group %s", group_id)
+        log.error(
+            "Member group diagnostic failed for group %s: %s",
+            group_id, str(exc)[:400],
+        )
         await message.reply_text(
             "❌ 会员群诊断失败："
-            f"{type(exc).__name__}: {str(exc)[:300]}\n"
-            "请确认机器人仍在该群且拥有管理员身份。"
+            f"{type(exc).__name__}: {str(exc)[:300]}"
         )
 
 
