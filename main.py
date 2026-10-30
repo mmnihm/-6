@@ -46,7 +46,11 @@ async def has_access(user_id: int) -> bool:
         return True
     try:
         member = await app.get_chat_member(config.MEMBER_GROUP_ID, user_id)
-        return member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+        if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+            return False
+        if member.status == ChatMemberStatus.RESTRICTED:
+            return bool(getattr(member, "is_member", False))
+        return True
     except (UserNotParticipant, PeerIdInvalid):
         return False
     except Exception:
