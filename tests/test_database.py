@@ -72,14 +72,18 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             "movie.mp4", "video", "电影", created, 101, "scan-key-1"
         )
         self.assertFalse(matched)
-        self.assertFalse(inserted)
+        self.assertTrue(inserted)
+
+        row = await self.db.get_file_by_fingerprint("same-file-unique-id")
+        self.assertEqual(row["primary_message_id"], 501)
+        self.assertEqual(row["backup_message_id"], 0)
 
         matched, inserted = await self.db.save_scanned_message(
             200, 100, 100, 801, "same-file-unique-id",
             "movie-copy.mp4", "video", "视频", created, 101, "scan-key-2"
         )
         self.assertTrue(matched)
-        self.assertTrue(inserted)
+        self.assertFalse(inserted)
 
         row = await self.db.get_file_by_fingerprint("same-file-unique-id")
         self.assertEqual(row["primary_message_id"], 501)
@@ -92,6 +96,37 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.db.mark_scan_completed(100)
         self.assertEqual((await self.db.get_scan_progress(100))["completed"], 1)
 
+    async def test_primary_only_scan_is_published_without_backup(self):
+        created = "2026-10-30T10:00:00+00:00"
+        matched, inserted = await self.db.save_scanned_message(
+            100, 200, 100, 501, "primary-only-id",
+            "primary.mp4", "video", "视频", created, 101, "scan-key-primary"
+        )
+        self.assertFalse(matched)
+        self.assertTrue(inserted)
+        row = await self.db.get_file_by_fingerprint("primary-only-id")
+        self.assertEqual(row["primary_message_id"], 501)
+        self.assertEqual(row["backup_message_id"], 0)
+        rows, _, total = await self.db.public_catalog()
+        self.assertEqual(total, 1)
+        self.assertEqual(rows[0]["file_name"], "primary.mp4")
+
+    async def test_primary_catalog_backfills_legacy_scan_records(self):
+        created = "2026-10-30T10:00:00+00:00"
+        async with self.db.connect() as connection:
+            await connection.execute("""
+                INSERT INTO scanner_messages(
+                    channel_id, message_id, fingerprint, file_name,
+                    media_type, category, created_at
+                ) VALUES(100, 601, 'legacy-primary-id', 'legacy.mp4',
+                         'video', '视频', ?)
+            """, (created,))
+            await connection.commit()
+        self.assertEqual(await self.db.publish_primary_catalog(100, 101), 1)
+        self.assertEqual(await self.db.publish_primary_catalog(100, 101), 0)
+        row = await self.db.get_file_by_fingerprint("legacy-primary-id")
+        self.assertEqual(row["primary_message_id"], 601)
+        self.assertEqual(row["backup_message_id"], 0)
     async def test_public_catalog_search_and_category_filter(self):
         await self.db.add_file("key001", 101, "movie-one.mp4", "video", 11, 22, "电影")
         await self.db.add_file("key002", 101, "lesson.pdf", "document", 12, 23, "教程")
