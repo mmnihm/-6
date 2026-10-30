@@ -929,8 +929,13 @@ async def scan_history_handler(client, message):
         return
     p = await db.get_scan_progress(primary)
     b = await db.get_scan_progress(backup)
+    backfilled = await db.publish_primary_catalog(primary, config.ADMIN_ID)
     if p["completed"] and b["completed"]:
-        await message.reply_text("✅ 两个频道的历史扫描已完成。已有目录会保留，新增资源由机器人正常登记。")
+        await message.reply_text(
+            "✅ 两个频道的历史扫描已完成。\n"
+            f"本次从已保存的主频道扫描记录补入目录：{backfilled} 个文件。\n"
+            "已有文件和扫描进度均已保留。"
+        )
         return
     scan_task = asyncio.create_task(run_history_scan(primary, backup))
     await message.reply_text(
