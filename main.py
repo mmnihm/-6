@@ -515,6 +515,117 @@ async def send_catalog_file(client, user_id, file_key):
     return True, "文件已发送。"
 
 
+async def send_catalog_batch(client, user_id, share_key, offset, batch):
+    """Copy each contiguous run of files from one source with Telegram copyMessages."""
+    sent = failed = 0
+    next_offset = offset
+    primary_channel_id, backup_channel_id = await get_storage_channels()
+    prepared = []
+
+    for item in batch:
+        record = await db.get_file(item["file_key"])
+        if not record:
+            prepared.append((item, None, None, None))
+            continue
+        fingerprint = str(record["source_fingerprint"] or "")
+        if fingerprint.startswith("cangku:"):
+            parts = fingerprint.split(":", 2)
+            if len(parts) != 3:
+                prepared.append((item, record, None, None))
+                continue
+            source_chat_id = int(parts[1])
+            source_message_id = int(parts[2])
+            backup_message_id = int(record["backup_message_id"] or 0)
+            if backup_channel_id and backup_message_id > 0:
+                source = (int(backup_channel_id), backup_message_id)
+            else:
+                source = (source_chat_id, source_message_id)
+        else:
+            source = (
+                (int(primary_channel_id), int(record["primary_message_id"]))
+                if primary_channel_id and record["primary_message_id"] else None
+            )
+        prepared.append((item, record, source[0] if source else None, source[1] if source else None))
+
+    index = 0
+    while index < len(prepared):
+        item, record, source_chat_id, source_message_id = prepared[index]
+        if not record or source_chat_id is None or source_message_id is None:
+            ok, _ = await send_catalog_file(client, user_id, item["file_key"])
+            if not ok:
+                failed += 1
+                break
+            sent += 1
+            next_offset = offset + index + 1
+            await db.set_category_delivery_progress(user_id, share_key, next_offset)
+            index += 1
+            continue
+
+        end = index + 1
+        run_ids = [source_message_id]
+        while end < len(prepared):
+            next_item, next_record, next_chat_id, next_message_id = prepared[end]
+            if not next_record or next_chat_id != source_chat_id or next_message_id is None:
+                break
+            run_ids.append(next_message_id)
+            end += 1
+
+        try:
+            if len(run_ids) == 1:
+                copied = await telegram_bot_api(
+                    "copyMessage",
+                    {"chat_id": user_id, "from_chat_id": source_chat_id, "message_id": run_ids[0]},
+                )
+                copied_messages = [copied]
+            else:
+                copied_messages = await telegram_bot_api(
+                    "copyMessages",
+                    {"chat_id": user_id, "from_chat_id": source_chat_id, "message_ids": run_ids},
+                )
+            if not isinstance(copied_messages, list) or len(copied_messages) != len(run_ids):
+                raise RuntimeError("Telegram batch copy returned an unexpected message count")
+            for position in range(index, end):
+                current_item, current_record, _, _ = prepared[position]
+                await db.record_history(user_id, current_item["file_key"])
+                if str(current_record["source_fingerprint"] or "").startswith("cangku:"):
+                    backup_id = int(current_record["backup_message_id"] or 0)
+                    if backup_channel_id and backup_id <= 0:
+                        parts = str(current_record["source_fingerprint"]).split(":", 2)
+                        if len(parts) == 3 and current_item["file_key"] not in cangku_backup_in_progress:
+                            cangku_backup_in_progress.add(current_item["file_key"])
+                            asyncio.create_task(cache_cangku_backup(
+                                client, current_item["file_key"], int(parts[1]), int(parts[2])
+                            ))
+                sent += 1
+                next_offset = offset + position + 1
+                await db.set_category_delivery_progress(user_id, share_key, next_offset)
+            index = end
+        except Exception as exc:
+            log.warning(
+                "Batch copy failed; falling back to individual delivery: user=%s source=%s count=%s error=%s",
+                user_id, source_chat_id, len(run_ids), str(exc)[:300],
+            )
+            # Keep the reliable single-file fallback for unavailable source copies.
+            for position in range(index, end):
+                current_item = prepared[position][0]
+                ok, error_text = await send_catalog_file(client, user_id, current_item["file_key"])
+                if not ok:
+                    failed += 1
+                    log.warning(
+                        "Folder delivery paused: user=%s share_key=%s offset=%s file=%s reason=%s",
+                        user_id, share_key, offset + position, current_item["file_key"], error_text,
+                    )
+                    break
+                sent += 1
+                next_offset = offset + position + 1
+                await db.set_category_delivery_progress(user_id, share_key, next_offset)
+            if failed:
+                break
+            index = end
+
+    return sent, failed, next_offset
+
+
 @app.on_message(filters.private & filters.command("start"))
 async def start_handler(client, message):
     user = message.from_user
@@ -1756,34 +1867,21 @@ async def user_catalog_callback_handler(client, query):
         if not batch:
             await query.answer("这个目录的资源已经领取完毕", show_alert=True)
             return
-        await query.answer("开始发送，最多20个文件")
+        await query.answer("开始批量发送，最多20个文件")
         progress = await message.reply_text(
-            f"📥 正在获取「{category['name']}」第 {offset // 20 + 1} 批资源（最多20个）…"
+            f"📥 正在批量获取「{category['name']}」第 {offset // 20 + 1} 组资源（最多20个）…"
         )
-        sent = failed = 0
-        next_offset = offset
-        for index, item in enumerate(batch):
-            ok, error_text = await send_catalog_file(client, user.id, item["file_key"])
-            if ok:
-                sent += 1
-                next_offset = offset + index + 1
-                await db.set_category_delivery_progress(user.id, share_key, next_offset)
-            else:
-                failed += 1
-                log.warning(
-                    "Folder delivery paused: user=%s share_key=%s offset=%s file=%s reason=%s",
-                    user.id, share_key, offset + index, item["file_key"], error_text,
-                )
-                break
-            await asyncio.sleep(0.05)
+        sent, failed, next_offset = await send_catalog_batch(
+            client, user.id, share_key, offset, batch
+        )
         text_result = (
-            f"📦 本批发送完成\n\n成功：{sent} 个\n失败：{failed} 个\n"
+            f"📦 本组发送完成\n\n成功：{sent} 个\n失败：{failed} 个\n"
             f"已记录领取进度：{next_offset}/{total}"
         )
         buttons = []
         if next_offset < total:
             buttons.append([InlineKeyboardButton(
-                "📥 获取下一批（最多20个）" if failed == 0 else "🔄 重试未发送文件",
+                "📥 获取下一组（最多20个）" if failed == 0 else "🔄 重试未发送文件",
                 callback_data=f"uc:getfolder:{share_key}:{next_offset}",
             )])
         buttons.append([InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")])
