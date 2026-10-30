@@ -916,7 +916,7 @@ async def admin_callback_handler(client, query):
             "🔐 扫描账号设置\n\n"
             "使用普通 Telegram 用户账号读取主、备份频道历史。建议使用专用账号，并先将它加入两个私有频道。\n\n"
             "点击下方按钮后，机器人会引导你输入手机号、登录验证码及（如有）两步验证密码。敏感输入会尝试立即删除。\n"
-            "登录成功后会保存在部署平台的数据目录中；请确保该目录已启用持久化。",
+            "扫描进度保存在数据库中；登录会话保存在本地文件。若部署平台没有持久化文件存储，重新部署后可能需要重新登录扫描账号。",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔑 开始登录", callback_data="mc:scannerloginstart")],
                 [InlineKeyboardButton("⬅️ 返回", callback_data="mc:home")],
