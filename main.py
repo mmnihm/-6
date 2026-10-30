@@ -366,11 +366,11 @@ async def admin_handler(client, message):
     group_id = await get_member_group_id()
     primary, backup = await get_storage_channels()
     await message.reply_text(
-        "👑 超级管理员控制面板\\n\\n"
-        f"会员群：{'已绑定' if group_id else '未绑定'}\\n"
-        f"主存储：{'已绑定' if primary else '未绑定'}  |  备份：{'已绑定' if backup else '未绑定'}\\n\\n"
-        f"用户：{users}  |  文件：{files}\\n"
-        f"手动会员：{members}  |  封禁：{banned}\\n\\n"
+        "👑 超级管理员控制面板\n\n"
+        f"会员群：{'已绑定' if group_id else '未绑定'}\n"
+        f"主存储：{'已绑定' if primary else '未绑定'}  |  备份：{'已绑定' if backup else '未绑定'}\n\n"
+        f"用户：{users}  |  文件：{files}\n"
+        f"手动会员：{members}  |  封禁：{banned}\n\n"
         "请选择下方按钮管理机器人。",
         reply_markup=admin_keyboard(),
     )
@@ -390,18 +390,18 @@ async def admin_callback_handler(client, query):
         group_id = await get_member_group_id()
         primary, backup = await get_storage_channels()
         text = (
-            "👑 超级管理员控制面板\\n\\n"
-            f"会员群：{'已绑定' if group_id else '未绑定'}\\n"
-            f"主存储：{'已绑定' if primary else '未绑定'}  |  备份：{'已绑定' if backup else '未绑定'}\\n\\n"
-            f"用户：{users}  |  文件：{files}\\n手动会员：{members}  |  封禁：{banned}\\n\\n请选择下方按钮管理机器人。"
+            "👑 超级管理员控制面板\n\n"
+            f"会员群：{'已绑定' if group_id else '未绑定'}\n"
+            f"主存储：{'已绑定' if primary else '未绑定'}  |  备份：{'已绑定' if backup else '未绑定'}\n\n"
+            f"用户：{users}  |  文件：{files}\n手动会员：{members}  |  封禁：{banned}\n\n请选择下方按钮管理机器人。"
         )
         await message.edit_text(text, reply_markup=admin_keyboard())
     elif action == "storage":
         primary, backup = await get_storage_channels()
         group_id = await get_member_group_id()
         await message.edit_text(
-            "🗄 绑定设置\\n\\n"
-            f"会员群：{group_id or '未绑定'}\\n主存储频道：{primary or '未绑定'}\\n备份频道：{backup or '未绑定'}\\n\\n选择需要绑定或刷新状态：",
+            "🗄 绑定设置\n\n"
+            f"会员群：{group_id or '未绑定'}\n主存储频道：{primary or '未绑定'}\n备份频道：{backup or '未绑定'}\n\n选择需要绑定或刷新状态：",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("👥 绑定会员群", callback_data="mc:bindgroup")],
                 [InlineKeyboardButton("📥 绑定主频道", callback_data="mc:bindmain"), InlineKeyboardButton("📥 绑定备份频道", callback_data="mc:bindbackup")],
@@ -413,14 +413,14 @@ async def admin_callback_handler(client, query):
         pending_channel_bindings[user.id] = setting
         label = {"bindgroup": "会员群", "bindmain": "主存储私有频道", "bindbackup": "备份私有频道"}[action]
         await message.edit_text(
-            f"📨 请把{label}中的任意一条普通消息直接转发给机器人。\\n\\n"
+            f"📨 请把{label}中的任意一条普通消息直接转发给机器人。\n\n"
             "请勿复制粘贴消息。机器人需要先加入对应群/频道；两个存储频道还需要授予管理员及发消息权限。",
             reply_markup=back_keyboard(),
         )
     elif action == "members":
         rows = await db.list_manual_members()
         if not rows:
-            body = "暂无手动授权记录。\\n\\n授权：/grant 用户ID 天数|永久\\n取消：/revoke 用户ID\\n封禁：/ban 用户ID 原因\\n解封：/unban 用户ID"
+            body = "暂无手动授权记录。\n\n授权：/grant 用户ID 天数|永久\n取消：/revoke 用户ID\n封禁：/ban 用户ID 原因\n解封：/unban 用户ID"
         else:
             now = datetime.now(timezone.utc)
             lines = []
@@ -435,24 +435,24 @@ async def admin_callback_handler(client, query):
                     except ValueError:
                         label = "日期异常"
                 lines.append(f"{row['user_id']} — {label}")
-            body = "👥 手动会员列表\\n" + "\\n".join(lines) + "\\n\\n授权：/grant 用户ID 天数|永久\\n取消：/revoke 用户ID"
+            body = "👥 手动会员列表\n" + "\n".join(lines) + "\n\n授权：/grant 用户ID 天数|永久\n取消：/revoke 用户ID"
         await message.edit_text(body, reply_markup=back_keyboard())
     elif action == "files":
         rows = await db.list_files(15)
         lines = [f"{row['file_key']} | {row['category']} | {row['file_name'][:40]}" for row in rows]
-        body = "📂 最近文件（最多 15 个）\\n" + ("\\n".join(lines) if lines else "暂无文件记录") + "\\n\\n修改分类：/category 文件码 分类\\n批量分享：/share 文件码1 文件码2"
+        body = "📂 最近文件（最多 15 个）\n" + ("\n".join(lines) if lines else "暂无文件记录") + "\n\n修改分类：/category 文件码 分类\n批量分享：/share 文件码1 文件码2"
         await message.edit_text(body, reply_markup=back_keyboard())
     elif action == "broadcast":
-        await message.edit_text("📢 广播操作\\n\\n发送：/broadcast 广播内容\\n机器人会向已记录用户逐一发送，并返回成功/失败数量。", reply_markup=back_keyboard())
+        await message.edit_text("📢 广播操作\n\n发送：/broadcast 广播内容\n机器人会向已记录用户逐一发送，并返回成功/失败数量。", reply_markup=back_keyboard())
     elif action == "stats":
         users, files, members, banned = await db.stats()
-        await message.edit_text(f"📊 数据统计\\n\\n用户总数：{users}\\n文件总数：{files}\\n有效手动会员：{members}\\n封禁用户：{banned}", reply_markup=back_keyboard())
+        await message.edit_text(f"📊 数据统计\n\n用户总数：{users}\n文件总数：{files}\n有效手动会员：{members}\n封禁用户：{banned}", reply_markup=back_keyboard())
     elif action == "commands":
         await message.edit_text(
-            "📖 管理命令速查\\n\\n"
-            "/bindgroup — 绑定会员群\\n/bindmain — 绑定主存储频道\\n/bindbackup — 绑定备份频道\\n/storage — 查看绑定状态\\n"
-            "/grant 用户ID 天数|永久 — 授权会员\\n/revoke 用户ID — 取消授权\\n/ban 用户ID 原因 — 封禁\\n/unban 用户ID — 解封\\n"
-            "/members — 会员列表\\n/users — 用户列表\\n/files — 文件列表\\n/category 文件码 分类 — 修改分类\\n/share 文件码1 文件码2 — 批量分享\\n/broadcast 内容 — 广播",
+            "📖 管理命令速查\n\n"
+            "/bindgroup — 绑定会员群\n/bindmain — 绑定主存储频道\n/bindbackup — 绑定备份频道\n/storage — 查看绑定状态\n"
+            "/grant 用户ID 天数|永久 — 授权会员\n/revoke 用户ID — 取消授权\n/ban 用户ID 原因 — 封禁\n/unban 用户ID — 解封\n"
+            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
             reply_markup=back_keyboard(),
         )
 
