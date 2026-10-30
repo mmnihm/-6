@@ -1,4 +1,5 @@
 import asyncio
+import json
 import aiohttp
 import logging
 import os
@@ -28,6 +29,8 @@ BOT_USERNAME = None
 pending_channel_bindings = {}
 scanner_login_states = {}
 scanner_login_clients = {}
+pending_directory_imports = {}
+directory_import_running = False
 
 
 def admin_keyboard():
@@ -376,6 +379,218 @@ async def start_handler(client, message):
         await user_home_text(user.id),
         reply_markup=user_home_keyboard(),
     )
+
+
+@app.on_message(filters.private & filters.document & filters.user(config.ADMIN_ID))
+async def directory_export_upload_handler(client, message):
+    """Receive a Cangku JSON export and prepare a safe preview; no files are copied yet."""
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        return
+    document = message.document
+    if not document or not (document.file_name or "").lower().endswith(".json"):
+        await message.reply_text("⚠️ 请发送 Cangku 导出的 JSON 文件。")
+        return
+    local_path = None
+    try:
+        local_path = await message.download()
+        with open(local_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict) or payload.get("format") != "cangku-directory-export" or payload.get("version") != 1:
+            raise ValueError("文件格式或版本不正确，请从 Cangku 使用 /exportdirectories 重新导出。")
+        directories = payload.get("directories")
+        resources = payload.get("resources")
+        if not isinstance(directories, list) or not isinstance(resources, list):
+            raise ValueError("目录或资源清单缺失。")
+        clean_directories = []
+        for item in directories:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()[:120]
+            if name and name not in clean_directories:
+                clean_directories.append(name)
+        clean_resources = []
+        seen = set()
+        invalid = 0
+        for item in resources:
+            if not isinstance(item, dict):
+                invalid += 1
+                continue
+            chat_id = str(item.get("chatId") or "").strip()
+            try:
+                message_id = int(item.get("messageId") or 0)
+            except (TypeError, ValueError):
+                message_id = 0
+            if not chat_id or message_id <= 0:
+                invalid += 1
+                continue
+            source_key = f"cangku:{chat_id}:{message_id}"
+            if source_key in seen:
+                continue
+            seen.add(source_key)
+            clean_resources.append({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "file_name": str(item.get("title") or "未命名资源")[:200],
+                "media_type": str(item.get("fileType") or "document")[:32].lower(),
+                "category": str(item.get("category") or "未分类").strip()[:120] or "未分类",
+                "source_fingerprint": source_key,
+            })
+        if not clean_resources:
+            raise ValueError("文件中没有可迁移的媒体资源。")
+        primary, backup = await get_storage_channels()
+        if not primary or not backup:
+            raise ValueError("主频道或备份频道尚未绑定，请先完成 /bindmain 和 /bindbackup。")
+        existing = 0
+        for item in clean_resources:
+            if await db.get_file_by_fingerprint(item["source_fingerprint"]):
+                existing += 1
+        pending_directory_imports[user.id] = {
+            "directories": clean_directories,
+            "resources": clean_resources,
+            "source_exported_at": str(payload.get("exportedAt") or ""),
+            "invalid": invalid,
+        }
+        await message.reply_text(
+            "📦 Cangku 目录迁移预览\n\n"
+            f"📁 文件夹：{len(clean_directories)} 个\n"
+            f"📄 资源清单：{len(clean_resources)} 个\n"
+            f"⏭️ 已导入/重复：{existing} 个\n"
+            f"⚠️ 无效记录：{invalid} 个\n\n"
+            "当前只完成预览，尚未复制任何文件。\n"
+            "确认开始请发送：/importconfirm\n"
+            "取消本次预览请发送：/importcancel"
+        )
+    except Exception as exc:
+        log.exception("Could not prepare Cangku directory import")
+        await message.reply_text(f"❌ 无法读取迁移文件：{str(exc)[:500]}")
+    finally:
+        if local_path and os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+
+
+@app.on_message(filters.private & filters.command("importcancel"))
+async def directory_import_cancel_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    pending_directory_imports.pop(user.id, None)
+    await message.reply_text("↩️ 已取消本次迁移预览，没有复制或删除任何文件。")
+
+
+@app.on_message(filters.private & filters.command("importconfirm"))
+async def directory_import_confirm_handler(client, message):
+    global directory_import_running
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    if directory_import_running:
+        await message.reply_text("⏳ 当前已有迁移任务运行，请勿重复启动。")
+        return
+    pending = pending_directory_imports.get(user.id)
+    if not pending:
+        await message.reply_text("⚠️ 没有待确认的迁移清单。请先把 Cangku 导出的 JSON 文件发送给我。")
+        return
+    primary_channel_id, backup_channel_id = await get_storage_channels()
+    if not primary_channel_id or not backup_channel_id:
+        await message.reply_text("⚠️ 主频道或备份频道未绑定，已停止迁移。")
+        return
+    directory_import_running = True
+    status = await message.reply_text("⏳ 正在导入，请保持机器人运行。已完成的项目会自动去重，重新发送清单可续跑。")
+    success = skipped = failed = 0
+    try:
+        for category in pending["directories"]:
+            await db.save_category(category)
+        total = len(pending["resources"])
+        for index, item in enumerate(pending["resources"], 1):
+            fingerprint = item["source_fingerprint"]
+            if await db.get_file_by_fingerprint(fingerprint):
+                skipped += 1
+                continue
+            primary_copy = None
+            backup_copy = None
+            try:
+                primary_copy = await client.copy_message(
+                    chat_id=primary_channel_id,
+                    from_chat_id=int(item["chat_id"]),
+                    message_id=item["message_id"],
+                )
+                backup_copy = await client.copy_message(
+                    chat_id=backup_channel_id,
+                    from_chat_id=int(item["chat_id"]),
+                    message_id=item["message_id"],
+                )
+                file_key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
+                inserted = await db.add_file(
+                    file_key, user.id, item["file_name"], item["media_type"],
+                    primary_copy.id, backup_copy.id, item["category"], fingerprint
+                )
+                if inserted:
+                    await db.save_category(item["category"])
+                    success += 1
+                else:
+                    skipped += 1
+                    for channel_id, copied_id in (
+                        (primary_channel_id, primary_copy.id),
+                        (backup_channel_id, backup_copy.id),
+                    ):
+                        try:
+                            await client.delete_messages(channel_id, copied_id)
+                        except Exception:
+                            log.warning("Could not clean duplicate migration copy %s", copied_id)
+            except FloodWait as exc:
+                await asyncio.sleep(exc.value)
+                try:
+                    if primary_copy:
+                        await client.delete_messages(primary_channel_id, primary_copy.id)
+                except Exception:
+                    pass
+                failed += 1
+                log.warning("FloodWait while importing source %s", fingerprint)
+            except Exception:
+                failed += 1
+                log.exception("Directory migration item failed: %s", fingerprint)
+                if primary_copy:
+                    try:
+                        await client.delete_messages(primary_channel_id, primary_copy.id)
+                    except Exception:
+                        log.warning("Could not clean incomplete primary copy %s", primary_copy.id)
+                if backup_copy:
+                    try:
+                        await client.delete_messages(backup_channel_id, backup_copy.id)
+                    except Exception:
+                        log.warning("Could not clean incomplete backup copy %s", backup_copy.id)
+            if index % 20 == 0:
+                try:
+                    await status.edit_text(
+                        f"🔄 迁移进度：{index}/{total}\n"
+                        f"✅ 成功：{success}  ⏭️ 跳过：{skipped}  ❌ 失败：{failed}"
+                    )
+                except Exception:
+                    pass
+            await asyncio.sleep(0.15)
+        pending_directory_imports.pop(user.id, None)
+        await status.edit_text(
+            "✅ Cangku 目录迁移完成\n\n"
+            f"📁 文件夹：{len(pending['directories'])} 个\n"
+            f"✅ 成功复制：{success} 个\n"
+            f"⏭️ 重复跳过：{skipped} 个\n"
+            f"❌ 失败：{failed} 个\n\n"
+            "原 Cangku 资源未删除，会员网盘原有数据未覆盖。"
+        )
+    except Exception:
+        log.exception("Directory migration interrupted")
+        await status.edit_text(
+            f"⚠️ 迁移中断。成功：{success}，跳过：{skipped}，失败：{failed}。\n"
+            "重新发送同一份 JSON 文件并确认导入即可续跑，已成功导入的资源会自动跳过。"
+        )
+    finally:
+        directory_import_running = False
 
 
 @app.on_message(
@@ -1077,10 +1292,8 @@ async def import_help_handler(client, message):
         return
     await message.reply_text(
         "📥 历史文件批量导入\n\n"
-        "1. 打开原来的仓库群。\n"
-        "2. 选择需要导入的旧文件，批量转发给本机器人。\n"
-        "3. 机器人会逐个保存到主频道和备份频道，并加入网页目录。\n"
-        "4. 已导入过的相同文件会自动跳过。\n\n"
+        "Cangku 整体目录迁移：先在 Cangku 管理员私聊发送 /exportdirectories，收到 JSON 后把文件发送给本机器人，预览后发送 /importconfirm 开始；发送 /importcancel 可取消。\n\n"
+        "也可以继续使用原有方式，从其他仓库群批量转发文件。\n\n"
         "如果这些旧资源已经在本机器人的主、备份存储频道中，无需转发，可先登录普通扫描账号，再发送 /scan 自动建立目录。"
         "本命令仍适用于从其他仓库群导入资源；如果原群禁止转发，需由有权限的管理员发送文件副本。"
     )
