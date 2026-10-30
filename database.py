@@ -177,7 +177,7 @@ class Database:
                 first_seen TEXT NOT NULL,
                 last_seen TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS files (
+            CREATE TABLE IF NOT EXISTS categories (\n                name TEXT PRIMARY KEY,\n                created_at TEXT NOT NULL\n            );\n            CREATE TABLE IF NOT EXISTS files (
                 file_key TEXT PRIMARY KEY,
                 owner_id BIGINT NOT NULL,
                 file_name TEXT NOT NULL,
@@ -606,11 +606,30 @@ class Database:
                 "videos": int(row["videos"] or 0),
             }
 
+    async def save_category(self, name: str):
+        name = str(name or "").strip()[:120]
+        if not name:
+            return
+        async with self.connect() as db:
+            await db.execute(
+                "INSERT INTO categories(name, created_at) VALUES(?, ?) "
+                "ON CONFLICT(name) DO NOTHING",
+                (name, iso_now()),
+            )
+            await db.commit()
+
     async def list_categories(self):
         async with self.connect() as db:
             return await (await db.execute("""
-                SELECT category, COUNT(*) AS file_count
-                FROM files GROUP BY category ORDER BY lower(category)
+                SELECT all_categories.category, COUNT(files.file_key) AS file_count
+                FROM (
+                    SELECT category FROM files
+                    UNION
+                    SELECT name AS category FROM categories
+                ) AS all_categories
+                LEFT JOIN files ON files.category=all_categories.category
+                GROUP BY all_categories.category
+                ORDER BY lower(all_categories.category)
             """)).fetchall()
 
     async def list_category_files(self, category, limit=8, offset=0):
