@@ -702,6 +702,10 @@ class Database:
                     "VALUES(?, ?, '', ?, ?)",
                     (name, iso_now(), iso_now(), share_key),
                 )
+                await db.execute(
+                    "UPDATE categories SET share_key=? WHERE name=? AND (share_key IS NULL OR share_key='')",
+                    (share_key, name),
+                )
             if names:
                 await db.commit()
             return await (await db.execute("""
