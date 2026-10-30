@@ -212,6 +212,11 @@ def guess_category(message, media_type, file_name):
 async def run_history_scan(primary_channel_id, backup_channel_id):
     global scan_task
     try:
+        # Backfill files already scanned by the older dual-match-only version.
+        backfilled = await db.publish_primary_catalog(primary_channel_id, config.ADMIN_ID)
+        if backfilled:
+            log.info("Published %s existing primary-channel files to catalog", backfilled)
+
         for channel_id, other_channel_id in (
             (primary_channel_id, backup_channel_id),
             (backup_channel_id, primary_channel_id),
@@ -304,15 +309,21 @@ async def start_handler(client, message):
             )
         except Exception:
             log.warning("Primary copy failed for %s; trying backup", key, exc_info=True)
+            backup_message_id = int(record["backup_message_id"] or 0)
+            if backup_message_id <= 0:
+                await message.reply_text(
+                    "❌ 主存储文件暂时无法取回，而且该文件尚未建立备份副本。请联系管理员检查。"
+                )
+                return
             try:
                 await client.copy_message(
                     chat_id=user.id,
                     from_chat_id=backup_channel_id,
-                    message_id=record["backup_message_id"],
+                    message_id=backup_message_id,
                 )
             except Exception:
                 log.exception("Both storage copies failed for %s", key)
-                await message.reply_text("❌ 文件暂时无法取回，请联系管理员检查备份频道。")
+                await message.reply_text("❌ 文件暂时无法取回，请联系管理员检查主备份频道。")
         return
 
     if not await has_access(user.id):
