@@ -251,20 +251,22 @@ def folder_detail_text(category_row, files, page, member_group_id):
     return "\n".join(body)
 
 
-def folder_detail_keyboard(category_index, files, page, has_next):
-    rows = []
-    for row in files:
-        rows.append([InlineKeyboardButton(
-            f"📄 {row['file_name'][:28]}", callback_data=f"uc:open:{row['file_key']}"
-        )])
-        rows.append([InlineKeyboardButton(
-            "⭐ 收藏/取消收藏", callback_data=f"uc:star:{row['file_key']}:folder"
-        )])
+def folder_detail_keyboard(category_row, page, has_next, is_favorite):
+    share_key = str(category_row["share_key"] or "")
+    rows = [[InlineKeyboardButton(
+        "📥 获取本批资源（最多20个）",
+        callback_data=f"uc:getfolder:{share_key}:{page * 20}",
+    )]]
+    rows.append([InlineKeyboardButton(
+        "⭐ 取消收藏目录" if is_favorite else "⭐ 收藏目录",
+        callback_data=f"uc:folderstar:{share_key}",
+    )])
     nav = []
+    category_index = int(category_row["category_index"])
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"uc:folder:{category_index}:{max(0, page * 12 - 12)}"))
+        nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"uc:folder:{category_index}:{max(0, page * 20 - 20)}"))
     if has_next:
-        nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"uc:folder:{category_index}:{(page + 1) * 12}"))
+        nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"uc:folder:{category_index}:{(page + 1) * 20}"))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton("⬅️ 文件夹列表", callback_data="uc:folders")])
@@ -510,16 +512,6 @@ async def send_catalog_file(client, user_id, file_key):
                 return False, "文件暂时无法取回，请联系管理员检查存储频道。"
 
     await db.record_history(user_id, file_key)
-    try:
-        await client.edit_message_reply_markup(
-            chat_id=user_id,
-            message_id=copied_message_id,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⭐ 收藏/取消收藏", callback_data=f"uc:star:{file_key}")
-            ]]),
-        )
-    except Exception:
-        log.debug("Could not attach favorite button to delivered file %s", file_key, exc_info=True)
     return True, "文件已发送。"
 
 
@@ -548,11 +540,14 @@ async def start_handler(client, message):
             await message.reply_text("⚠️ 文件夹不存在或已被移除。")
             return
         category_row = categories[category_index]
-        files = await db.list_category_files(category_row["category"], limit=12, offset=0)
+        files = await db.list_category_files(category_row["category"], limit=20, offset=0)
+        category_row = dict(category_row)
+        category_row["category_index"] = category_index
         await message.reply_text(
             folder_detail_text(category_row, files, 0, await get_member_group_id()),
             reply_markup=folder_detail_keyboard(
-                category_index, files, 0, len(files) == 12
+                category_row, 0, len(files) == 20,
+                await db.is_category_favorite(user.id, category_row["share_key"])
             ),
             disable_web_page_preview=True,
         )
@@ -1602,13 +1597,16 @@ async def user_catalog_callback_handler(client, query):
             await query.answer("分类已更新，请重新打开列表", show_alert=True)
             return
         await query.answer()
-        files = await db.list_category_files(category, limit=12, offset=offset)
-        page = offset // 12
+        files = await db.list_category_files(category, limit=20, offset=offset)
+        page = offset // 20
         group_id = await get_member_group_id()
+        category_row = dict(category_row)
+        category_row["category_index"] = index
         await message.edit_text(
             folder_detail_text(category_row, files, page, group_id),
             reply_markup=folder_detail_keyboard(
-                index, files, page, len(files) == 12
+                category_row, page, len(files) == 20,
+                await db.is_category_favorite(user.id, category_row["share_key"])
             ),
             disable_web_page_preview=True,
         )
@@ -1616,28 +1614,116 @@ async def user_catalog_callback_handler(client, query):
 
     if action[1] in ("history", "favorites"):
         await query.answer()
-        is_history = action[1] == "history"
-        records = (
-            await db.list_user_history(user.id, 12)
-            if is_history else await db.list_favorites(user.id, 12)
-        )
-        title = "📜 历史访问" if is_history else "⭐ 收藏列表"
-        rows = []
-        for row in records:
-            rows.append([InlineKeyboardButton(
+        if action[1] == "history":
+            records = await db.list_user_history(user.id, 12)
+            title = "📜 历史访问"
+            rows = [[InlineKeyboardButton(
                 f"📄 {row['file_name'][:32]}",
                 callback_data=f"uc:open:{row['file_key']}",
-            )])
-            rows.append([InlineKeyboardButton(
-                "⭐ 收藏/取消收藏",
-                callback_data=f"uc:star:{row['file_key']}:{'history' if is_history else 'favorites'}",
-            )])
+            )] for row in records]
+            body = title + "\n\n" + (
+                "\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
+                if records else "这里暂时没有记录。"
+            )
+        else:
+            records = await db.list_favorite_categories(user.id, 30)
+            title = "⭐ 已收藏的文件夹"
+            rows = [[InlineKeyboardButton(
+                f"📁 {row['name'][:32]}",
+                callback_data=f"uc:folderlink:{row['share_key']}",
+            )] for row in records]
+            body = title + "\n\n" + (
+                "\n".join(f"• {row['name']}" for row in records)
+                if records else "你还没有收藏文件夹。"
+            )
         rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
-        body = title + "\n\n" + (
-            "\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
-            if records else "这里暂时没有记录。"
-        )
         await message.edit_text(body, reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if action[1] == "folderstar" and len(action) == 3:
+        share_key = action[2]
+        category = await db.get_category_by_share_key(share_key)
+        if not category:
+            await query.answer("文件夹不存在", show_alert=True)
+            return
+        added = await db.toggle_category_favorite(user.id, share_key)
+        await query.answer("⭐ 已收藏文件夹" if added else "已取消收藏")
+        categories = await db.list_categories()
+        index = next((i for i, row in enumerate(categories) if row["share_key"] == share_key), None)
+        if index is not None:
+            row = dict(categories[index])
+            row["category_index"] = index
+            files = await db.list_category_files(row["category"], limit=20, offset=0)
+            await message.edit_text(
+                folder_detail_text(row, files, 0, await get_member_group_id()),
+                reply_markup=folder_detail_keyboard(row, 0, len(files) == 20, added),
+                disable_web_page_preview=True,
+            )
+        return
+
+    if action[1] == "folderlink" and len(action) == 3:
+        category = await db.get_category_by_share_key(action[2])
+        if not category:
+            await query.answer("文件夹不存在", show_alert=True)
+            return
+        categories = await db.list_categories()
+        index = next((i for i, row in enumerate(categories) if row["share_key"] == action[2]), None)
+        if index is None:
+            await query.answer("文件夹不存在", show_alert=True)
+            return
+        row = dict(categories[index])
+        row["category_index"] = index
+        files = await db.list_category_files(row["category"], limit=20, offset=0)
+        await query.answer()
+        await message.edit_text(
+            folder_detail_text(row, files, 0, await get_member_group_id()),
+            reply_markup=folder_detail_keyboard(
+                row, 0, len(files) == 20,
+                await db.is_category_favorite(user.id, action[2])
+            ),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if action[1] == "getfolder" and len(action) == 4:
+        share_key = action[2]
+        try:
+            offset = max(0, int(action[3]))
+        except ValueError:
+            await query.answer("批次参数无效", show_alert=True)
+            return
+        category = await db.get_category_by_share_key(share_key)
+        if not category:
+            await query.answer("文件夹不存在", show_alert=True)
+            return
+        total = next((int(row["file_count"] or 0) for row in await db.list_categories()
+                      if row["share_key"] == share_key), 0)
+        batch = await db.list_category_files(category["name"], limit=20, offset=offset)
+        if not batch:
+            await query.answer("这一批没有可获取的资源", show_alert=True)
+            return
+        await query.answer("开始发送，最多20个文件")
+        progress = await message.reply_text(f"📥 正在获取「{category['name']}」第 {offset // 20 + 1} 批资源（最多20个）…")
+        sent = failed = 0
+        for item in batch:
+            ok, _ = await send_catalog_file(client, user.id, item["file_key"])
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+            await asyncio.sleep(0.05)
+        text_result = (
+            f"📦 本批发送完成\n\n成功：{sent} 个\n失败：{failed} 个"
+        )
+        next_offset = offset + len(batch)
+        buttons = []
+        if next_offset < total:
+            buttons.append([InlineKeyboardButton(
+                "📥 获取下一批（最多20个）",
+                callback_data=f"uc:getfolder:{share_key}:{next_offset}",
+            )])
+        buttons.append([InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")])
+        await progress.edit_text(text_result, reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     if action[1] == "open" and len(action) == 3:
