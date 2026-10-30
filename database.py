@@ -234,6 +234,12 @@ class Database:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY(user_id, file_key)
             );
+            CREATE TABLE IF NOT EXISTS category_favorites (
+                user_id BIGINT NOT NULL,
+                share_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, share_key)
+            );
         """
         async with self.connect() as db:
             if self.uses_postgres:
@@ -776,4 +782,43 @@ class Database:
                 SELECT f.file_key, f.file_name, f.category, v.created_at
                 FROM favorites v JOIN files f ON f.file_key=v.file_key
                 WHERE v.user_id=? ORDER BY v.created_at DESC LIMIT ?
+            """, (user_id, limit))).fetchall()
+
+    async def toggle_category_favorite(self, user_id, share_key):
+        async with self.connect() as db:
+            exists = await (await db.execute(
+                "SELECT 1 FROM category_favorites WHERE user_id=? AND share_key=?",
+                (user_id, share_key),
+            )).fetchone()
+            if exists:
+                await db.execute(
+                    "DELETE FROM category_favorites WHERE user_id=? AND share_key=?",
+                    (user_id, share_key),
+                )
+                added = False
+            else:
+                await db.execute(
+                    "INSERT INTO category_favorites(user_id, share_key, created_at) VALUES(?, ?, ?)",
+                    (user_id, share_key, iso_now()),
+                )
+                added = True
+            await db.commit()
+            return added
+
+    async def is_category_favorite(self, user_id, share_key):
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT 1 FROM category_favorites WHERE user_id=? AND share_key=?",
+                (user_id, share_key),
+            )).fetchone()
+            return row is not None
+
+    async def list_favorite_categories(self, user_id, limit=30):
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT c.name, c.share_key, f.created_at
+                FROM category_favorites f
+                JOIN categories c ON c.share_key=f.share_key
+                WHERE f.user_id=?
+                ORDER BY f.created_at DESC LIMIT ?
             """, (user_id, limit))).fetchall()
