@@ -335,10 +335,12 @@ async def bind_member_group_handler(client, message):
     if not user or not await is_admin(user.id):
         await reply_admin_only(message)
         return
-    pending_channel_bindings[user.id] = "member_group_id"
     await message.reply_text(
-        "👥 请把会员群中的任意一条消息直接转发到这里。\n"
-        "机器人必须已经加入会员群，建议设为管理员以确保成员状态查询正常。"
+        "👥 私密会员群请使用群内绑定方式：\n"
+        "1. 先把机器人添加到会员群并设为管理员。\n"
+        "2. 在会员群内发送 /bindgroup。\n"
+        "3. 机器人会自动读取当前群 ID 并完成绑定。\n\n"
+        "不需要公开群组，也不需要转发消息。"
     )
 
 
