@@ -240,6 +240,13 @@ class Database:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY(user_id, share_key)
             );
+            CREATE TABLE IF NOT EXISTS category_delivery_progress (
+                user_id BIGINT NOT NULL,
+                share_key TEXT NOT NULL,
+                next_offset BIGINT NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, share_key)
+            );
         """
         async with self.connect() as db:
             if self.uses_postgres:
@@ -573,6 +580,25 @@ class Database:
                 ON CONFLICT(channel_id) DO UPDATE SET
                     completed=1, updated_at=excluded.updated_at
             """, (channel_id, iso_now()))
+            await db.commit()
+
+    async def get_category_delivery_progress(self, user_id: int, share_key: str) -> int:
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT next_offset FROM category_delivery_progress WHERE user_id=? AND share_key=?",
+                (user_id, share_key),
+            )).fetchone()
+            return int(row["next_offset"] or 0) if row else 0
+
+    async def set_category_delivery_progress(self, user_id: int, share_key: str, next_offset: int):
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT INTO category_delivery_progress(user_id, share_key, next_offset, updated_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(user_id, share_key) DO UPDATE SET
+                    next_offset=MAX(category_delivery_progress.next_offset, excluded.next_offset),
+                    updated_at=excluded.updated_at
+            """, (user_id, share_key, max(0, int(next_offset)), iso_now()))
             await db.commit()
 
     async def get_file(self, key):
