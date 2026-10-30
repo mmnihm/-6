@@ -120,8 +120,14 @@ footer{{margin-top:25px;text-align:center;color:var(--muted);font-size:12px}}
 </main></body></html>"""
         return web.Response(text=document, content_type="text/html", charset="utf-8")
 
+    async def root_handler(request):
+        raise web.HTTPFound("/catalog")
+
+    async def health_handler(request):
+        return web.json_response({"ok": True})
+
     app = web.Application(client_max_size=1024 * 1024)
-    app.router.add_get("/", lambda request: web.HTTPFound("/catalog"))
+    app.router.add_get("/", root_handler)
     app.router.add_get("/catalog", catalog_handler)
-    app.router.add_get("/healthz", lambda request: web.json_response({"ok": True}))
+    app.router.add_get("/healthz", health_handler)
     return app
