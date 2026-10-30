@@ -672,8 +672,20 @@ async def scanner_login_input_handler(client, message):
         )
 
 
+async def resolve_scanner_chat(channel_id):
+    """Resolve a private channel from the user account's dialogs to populate its access hash."""
+    async for dialog in scanner.get_dialogs():
+        chat = getattr(dialog, "chat", None)
+        if chat and getattr(chat, "id", None) == channel_id:
+            return chat
+    raise LookupError(
+        "频道未出现在扫描账号的对话列表中。请确认登录的是已加入该频道的普通账号，"
+        "并在 Telegram 客户端打开该频道后重新运行 /scancheck。"
+    )
+
+
 async def inspect_scan_channel(channel_id):
-    """Check whether the logged-in user account can open a channel and read its history."""
+    """Resolve channel peer from dialogs, then verify membership and history access."""
     result = {
         "channel_id": channel_id,
         "title": str(channel_id),
@@ -685,27 +697,30 @@ async def inspect_scan_channel(channel_id):
         "member_warning": None,
     }
     try:
-        chat = await scanner.get_chat(channel_id)
+        # Numeric channel IDs alone are not enough for a fresh Pyrogram user session:
+        # the account must have the channel's access hash in its local peer database.
+        chat = await resolve_scanner_chat(channel_id)
         result["title"] = getattr(chat, "title", None) or getattr(chat, "first_name", None) or str(channel_id)
         result["chat_type"] = str(getattr(chat, "type", "未知"))
     except Exception as exc:
-        result["error"] = f"读取频道信息失败：{type(exc).__name__}: {exc}"
+        result["error"] = f"解析频道失败：{type(exc).__name__}: {exc}"
         return result
 
     try:
         me = await scanner.get_me()
-        member = await scanner.get_chat_member(channel_id, me.id)
+        member = await scanner.get_chat_member(chat.id, me.id)
         status = getattr(member, "status", None)
         result["member_status"] = getattr(status, "value", None) or str(status or "未知")
         if result["member_status"].lower() in ("left", "kicked", "banned"):
             result["error"] = f"扫描账号当前状态为 {result['member_status']}，不在频道内"
             return result
     except Exception as exc:
-        # History access below is the decisive permission check if member details are unavailable.
+        # Some channel configurations do not expose member details;
+        # the actual history read below is the decisive permission check.
         result["member_warning"] = f"{type(exc).__name__}: {exc}"
 
     try:
-        async for _ in scanner.get_chat_history(channel_id, limit=1):
+        async for _ in scanner.get_chat_history(chat.id, limit=1):
             break
         result["history_ok"] = True
         result["ok"] = True
