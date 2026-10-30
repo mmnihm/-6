@@ -256,18 +256,15 @@ class Database:
                 await db.execute("ALTER TABLE files ADD COLUMN source_fingerprint TEXT")
             if "file_size" not in column_names:
                 await db.execute("ALTER TABLE files ADD COLUMN file_size BIGINT NOT NULL DEFAULT 0")
-            if "description" not in {row["name"] for row in await (await db.execute(
-                "SELECT column_name AS name FROM information_schema.columns "
-                "WHERE table_schema=current_schema() AND table_name='categories'"
-            )).fetchall()} if self.uses_postgres else not any(
-                row["name"] == "description" for row in await (await db.execute("PRAGMA table_info(categories)")).fetchall()
-            ):
-                await db.execute("ALTER TABLE categories ADD COLUMN description TEXT NOT NULL DEFAULT ''")
             category_columns = await (await db.execute(
                 "SELECT column_name AS name FROM information_schema.columns "
                 "WHERE table_schema=current_schema() AND table_name='categories'"
-            )).fetchall() if self.uses_postgres else await (await db.execute("PRAGMA table_info(categories)")).fetchall()
+            )).fetchall() if self.uses_postgres else await (await db.execute(
+                "PRAGMA table_info(categories)"
+            )).fetchall()
             category_column_names = {row["name"] for row in category_columns}
+            if "description" not in category_column_names:
+                await db.execute("ALTER TABLE categories ADD COLUMN description TEXT NOT NULL DEFAULT ''")
             if "updated_at" not in category_column_names:
                 await db.execute("ALTER TABLE categories ADD COLUMN updated_at TEXT")
             if "share_key" not in category_column_names:
@@ -676,6 +673,9 @@ class Database:
                 "VALUES(?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET "
                 "description=CASE WHEN excluded.description<>'' THEN excluded.description "
                 "ELSE categories.description END, "
+                "created_at=CASE WHEN categories.created_at IS NULL OR "
+                "excluded.created_at<categories.created_at THEN excluded.created_at "
+                "ELSE categories.created_at END, "
                 "share_key=COALESCE(NULLIF(categories.share_key, ''), excluded.share_key)",
                 (name, created, str(description or "")[:1000], now, share_key),
             )
