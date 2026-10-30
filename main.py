@@ -102,8 +102,9 @@ def media_details(message):
         media = getattr(message, kind, None)
         if media:
             name = getattr(media, "file_name", None) or f"{kind}_{message.id}"
-            return kind, name
-    return None, None
+            unique_id = getattr(media, "file_unique_id", None)
+            return kind, name, unique_id
+    return None, None, None
 
 
 def share_url(key: str) -> str:
@@ -194,8 +195,14 @@ async def upload_handler(client, message):
         await message.reply_text("⛔ 仅限会员群成员上传文件。")
         return
 
-    media_type, file_name = media_details(message)
+    media_type, file_name, source_fingerprint = media_details(message)
     if not media_type:
+        return
+
+    if source_fingerprint and await db.get_file_by_fingerprint(source_fingerprint):
+        await message.reply_text(
+            f"⏭️ 已跳过重复文件：{file_name}\n这个文件此前已经导入网盘。"
+        )
         return
 
     primary_channel_id, backup_channel_id = await get_storage_channels()
@@ -222,10 +229,21 @@ async def upload_handler(client, message):
         backup_id = backup.id
 
         key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
-        await db.add_file(
+        inserted = await db.add_file(
             key, user.id, file_name, media_type,
-            primary.id, backup.id, category
+            primary.id, backup.id, category, source_fingerprint
         )
+        if not inserted:
+            for channel_id, message_id in (
+                (primary_channel_id, primary.id),
+                (backup_channel_id, backup.id),
+            ):
+                try:
+                    await client.delete_messages(channel_id, message_id)
+                except Exception:
+                    log.warning("Could not remove duplicate import copy %s", message_id)
+            await status.edit_text(f"⏭️ 已跳过重复文件：{file_name}")
+            return
         await status.edit_text(
             "✅ 双频道保存成功\n"
             f"📂 分类：{category}\n"
@@ -380,6 +398,23 @@ async def bind_member_group_in_chat_handler(client, message):
         f"群组：{message.chat.title or '未命名'}\n"
         f"群 ID：{message.chat.id}\n\n"
         "机器人已记录这个私密群组。可回到私聊发送 /storage 查看绑定状态。"
+    )
+
+
+@app.on_message(filters.private & filters.command("import"))
+async def import_help_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    await message.reply_text(
+        "📥 历史文件批量导入\n\n"
+        "1. 打开原来的仓库群。\n"
+        "2. 选择需要导入的旧文件，批量转发给本机器人。\n"
+        "3. 机器人会逐个保存到主频道和备份频道，并加入网页目录。\n"
+        "4. 已导入过的相同文件会自动跳过。\n\n"
+        "注意：受 Telegram Bot 账号权限限制，机器人不能自动遍历加入前的完整群历史；"
+        "如果群开启了禁止转发，需先在原群允许转发或由有权限的管理员发送文件副本。"
     )
 
 
