@@ -400,7 +400,9 @@ async def directory_export_upload_handler(client, message):
         return
     local_path = None
     try:
-        local_path = await message.download()
+        await status.edit_text("📥 正在从 Telegram 下载 JSON 文件…")
+        local_path = await asyncio.wait_for(message.download(), timeout=180)
+        await status.edit_text("📄 文件已下载，正在解析目录和资源清单…")
         with open(local_path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
         if not isinstance(payload, dict) or payload.get("format") != "cangku-directory-export" or payload.get("version") != 1:
@@ -448,10 +450,12 @@ async def directory_export_upload_handler(client, message):
         primary, backup = await get_storage_channels()
         if not primary or not backup:
             raise ValueError("主频道或备份频道尚未绑定，请先完成 /bindmain 和 /bindbackup。")
-        existing = 0
-        for item in clean_resources:
-            if await db.get_file_by_fingerprint(item["source_fingerprint"]):
-                existing += 1
+        await status.edit_text(
+            f"🔎 正在检查重复资源…共 {len(clean_resources)} 条，请稍候。"
+        )
+        fingerprints = [item["source_fingerprint"] for item in clean_resources]
+        existing_fingerprints = await db.get_existing_fingerprints(fingerprints)
+        existing = len(existing_fingerprints)
         pending_directory_imports[user.id] = {
             "directories": clean_directories,
             "resources": clean_resources,
@@ -468,6 +472,9 @@ async def directory_export_upload_handler(client, message):
             "确认开始请发送：/importconfirm\n"
             "取消本次预览请发送：/importcancel"
         )
+    except asyncio.TimeoutError:
+        log.error("Cangku directory export download timed out for admin %s", user.id)
+        await status.edit_text("❌ 下载 JSON 文件超过 180 秒，已超时。请重新发送文件；如果文件很大，请先压缩或分卷后再导入。")
     except Exception as exc:
         log.exception("Could not prepare Cangku directory import")
         await status.edit_text(f"❌ 无法读取迁移文件：{str(exc)[:500]}")
