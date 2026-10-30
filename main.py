@@ -4,7 +4,7 @@ import aiohttp
 import logging
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from aiohttp import web
 
@@ -31,6 +31,7 @@ scanner_login_states = {}
 scanner_login_clients = {}
 pending_directory_imports = {}
 directory_import_running = False
+cangku_backup_in_progress = set()
 
 
 def admin_keyboard():
@@ -185,6 +186,91 @@ def share_url(key: str) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=file_{key}"
 
 
+def folder_share_url(share_key: str) -> str:
+    if not BOT_USERNAME:
+        raise RuntimeError("Bot username is not initialized")
+    return f"https://t.me/{BOT_USERNAME}?start=folder_{share_key}"
+
+
+def format_folder_size(value):
+    size = max(0, int(value or 0))
+    if size <= 0:
+        return "领取资源后逐步统计"
+    units = ("B", "KB", "MB", "GB", "TB")
+    amount = float(size)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            return f"{amount:.2f} {unit}"
+        amount /= 1024
+    return f"{amount:.2f} TB"
+
+
+def format_folder_datetime(value):
+    if not value:
+        return "暂无记录"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OverflowError):
+        return str(value)[:32]
+
+
+def folder_detail_text(category_row, files, page, member_group_id):
+    name = str(category_row["category"])
+    body = [
+        f"📁 #{name}",
+        "",
+        f"🏷️ #{name}",
+    ]
+    description = str(category_row["description"] or "").strip()
+    if description:
+        body.extend(["", f"📝 {description}"])
+    body.extend([
+        "",
+        "📖 内容统计：",
+        f"　• 消息数：{int(category_row['file_count'] or 0)} 条",
+        f"　• 图片数：{int(category_row['image_count'] or 0)} 张",
+        f"　• 视频数：{int(category_row['video_count'] or 0)} 个",
+        f"　• 总大小：{format_folder_size(category_row['total_size'])}",
+        "",
+        f"📅 创建时间：{format_folder_datetime(category_row['created_at'])}",
+        f"✏️ 最后更新：{format_folder_datetime(category_row['updated_at'])}",
+        "",
+        "🔗 分享链接：",
+        folder_share_url(str(category_row["share_key"])) if category_row["share_key"] else "暂不可用",
+        "",
+        "🔒 需要满足以下条件之一才能访问：",
+    ])
+    if member_group_id:
+        body.append("👥 加入已绑定会员群/频道：1 个（系统自动验证）")
+    body.append("或由管理员授予有效会员权限")
+    body.extend(["", f"📄 资源列表（第 {page + 1} 页）："])
+    body.append("\n".join(f"• {row['file_name'][:48]}" for row in files) if files else "这个目录暂时没有资源。")
+    return "\n".join(body)
+
+
+def folder_detail_keyboard(category_index, files, page, has_next):
+    rows = []
+    for row in files:
+        rows.append([InlineKeyboardButton(
+            f"📄 {row['file_name'][:28]}", callback_data=f"uc:open:{row['file_key']}"
+        )])
+        rows.append([InlineKeyboardButton(
+            "⭐ 收藏/取消收藏", callback_data=f"uc:star:{row['file_key']}:folder"
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"uc:folder:{category_index}:{max(0, page * 12 - 12)}"))
+    if has_next:
+        nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"uc:folder:{category_index}:{(page + 1) * 12}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("⬅️ 文件夹列表", callback_data="uc:folders")])
+    return InlineKeyboardMarkup(rows)
+
+
 def parse_category(message) -> str:
     caption = (message.caption or "").strip()
     first = caption.splitlines()[0].strip() if caption else ""
@@ -314,6 +400,41 @@ async def user_home_text(user_id):
     )
 
 
+async def cache_cangku_backup(client, file_key, source_chat_id, source_message_id):
+    try:
+        _, backup_channel_id = await get_storage_channels()
+        if not backup_channel_id:
+            return
+        current = await db.get_file(file_key)
+        if not current or int(current["backup_message_id"] or 0) > 0:
+            return
+        copied = await telegram_bot_api(
+            "copyMessage",
+            {
+                "chat_id": backup_channel_id,
+                "from_chat_id": source_chat_id,
+                "message_id": source_message_id,
+            },
+        )
+        media_size = 0
+        for media_name in ("document", "video", "audio", "animation", "voice", "video_note"):
+            media = copied.get(media_name)
+            if isinstance(media, dict):
+                media_size = int(media.get("file_size") or 0)
+                break
+        if not media_size and isinstance(copied.get("photo"), list) and copied["photo"]:
+            media_size = int(copied["photo"][-1].get("file_size") or 0)
+        updated = await db.update_backup_message_id(
+            file_key, int(copied["message_id"]), media_size
+        )
+        if updated:
+            log.info("Cached Cangku resource %s into backup channel", file_key)
+    except Exception:
+        log.exception("Could not cache Cangku resource %s into backup channel", file_key)
+    finally:
+        cangku_backup_in_progress.discard(file_key)
+
+
 async def send_catalog_file(client, user_id, file_key):
     record = await db.get_file(file_key)
     if not record:
@@ -326,15 +447,38 @@ async def send_catalog_file(client, user_id, file_key):
             parts = fingerprint.split(":", 2)
             if len(parts) != 3:
                 raise ValueError("原始资源索引格式无效")
-            copied = await telegram_bot_api(
-                "copyMessage",
-                {
-                    "chat_id": user_id,
-                    "from_chat_id": int(parts[1]),
-                    "message_id": int(parts[2]),
-                },
-            )
-            copied_message_id = int(copied["message_id"])
+            source_chat_id = int(parts[1])
+            source_message_id = int(parts[2])
+            _, backup_channel_id = await get_storage_channels()
+            backup_message_id = int(record["backup_message_id"] or 0)
+            if backup_channel_id and backup_message_id > 0:
+                try:
+                    copied = await telegram_bot_api(
+                        "copyMessage",
+                        {
+                            "chat_id": user_id,
+                            "from_chat_id": backup_channel_id,
+                            "message_id": backup_message_id,
+                        },
+                    )
+                    copied_message_id = int(copied["message_id"])
+                except Exception:
+                    log.warning("Cached backup failed for %s; falling back to Cangku", file_key)
+            if copied_message_id is None:
+                copied = await telegram_bot_api(
+                    "copyMessage",
+                    {
+                        "chat_id": user_id,
+                        "from_chat_id": source_chat_id,
+                        "message_id": source_message_id,
+                    },
+                )
+                copied_message_id = int(copied["message_id"])
+                if file_key not in cangku_backup_in_progress:
+                    cangku_backup_in_progress.add(file_key)
+                    asyncio.create_task(cache_cangku_backup(
+                        client, file_key, source_chat_id, source_message_id
+                    ))
         except Exception as exc:
             log.warning("Cangku source delivery failed for %s: %s", file_key, str(exc)[:300])
             return False, "原频道资源暂时无法取回，请联系管理员检查机器人是否仍有原频道访问权限。"
