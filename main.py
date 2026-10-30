@@ -67,6 +67,7 @@ app = Client(
 )
 
 SCANNER_WORKDIR = os.path.dirname(config.DATABASE_PATH) or "."
+os.makedirs(SCANNER_WORKDIR, exist_ok=True)
 SCANNER_SESSION_PATH = os.path.join(SCANNER_WORKDIR, "member_cloud_scanner.session")
 scanner = (
     Client("member_cloud_scanner", api_id=config.API_ID,
