@@ -1,6 +1,11 @@
 import os
 import aiosqlite
+import os
+import re
 from contextlib import asynccontextmanager
+
+import psycopg
+from psycopg.rows import dict_row
 from datetime import datetime, timezone, timedelta
 
 
@@ -12,12 +17,66 @@ def iso_now():
     return utc_now().isoformat()
 
 
+class PostgresCompat:
+    """Small async adapter for the SQLite-style calls used by this project."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    @staticmethod
+    def adapt_sql(sql):
+        statement = sql.strip()
+        ignore_insert = statement.upper().startswith("INSERT OR IGNORE INTO")
+        if ignore_insert:
+            statement = re.sub(
+                r"^INSERT OR IGNORE INTO", "INSERT INTO", statement,
+                flags=re.IGNORECASE,
+            ).rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        statement = statement.replace("?", "%s")
+        statement = re.sub(r"^BEGIN IMMEDIATE$", "BEGIN", statement, flags=re.I)
+        statement = statement.replace(
+            "ORDER BY category COLLATE NOCASE", "ORDER BY lower(category)"
+        )
+        return statement
+
+    async def execute(self, sql, params=()):
+        return await self.connection.execute(self.adapt_sql(sql), params or ())
+
+    async def executemany(self, sql, params):
+        return await self.connection.executemany(self.adapt_sql(sql), params)
+
+    async def executescript(self, script):
+        for statement in script.split(";"):
+            if statement.strip():
+                await self.execute(statement)
+
+    async def commit(self):
+        await self.connection.commit()
+
+
 class Database:
-    def __init__(self, path: str):
+    def __init__(self, path: str, database_url: str = ""):
         self.path = path
+        self.database_url = (database_url or os.getenv("DATABASE_URL", "")).strip()
+        if self.database_url.startswith("postgres://"):
+            self.database_url = "postgresql://" + self.database_url[len("postgres://"):]
+
+    @property
+    def uses_postgres(self):
+        return bool(self.database_url)
 
     @asynccontextmanager
     async def connect(self):
+        if self.uses_postgres:
+            connection = await psycopg.AsyncConnection.connect(
+                self.database_url, row_factory=dict_row
+            )
+            try:
+                yield PostgresCompat(connection)
+            finally:
+                await connection.close()
+            return
+
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         db = await aiosqlite.connect(self.path)
         db.row_factory = aiosqlite.Row
@@ -29,77 +88,162 @@ class Database:
         finally:
             await db.close()
 
+    async def _import_legacy_sqlite(self):
+        """Import an existing local SQLite database once; never overwrite PG rows."""
+        if not self.uses_postgres or not os.path.isfile(self.path):
+            return
+
+        async with self.connect() as pg:
+            marker = await (await pg.execute(
+                "SELECT value FROM settings WHERE key='sqlite_import_v1'"
+            )).fetchone()
+            if marker:
+                return
+
+            legacy = await aiosqlite.connect(self.path)
+            legacy.row_factory = aiosqlite.Row
+            try:
+                present = {
+                    row["name"] for row in await (
+                        await legacy.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        )
+                    ).fetchall()
+                }
+                table_columns = {
+                    "settings": ["key", "value"],
+                    "users": ["user_id", "first_seen", "last_seen"],
+                    "files": [
+                        "file_key", "owner_id", "file_name", "media_type",
+                        "category", "primary_message_id", "backup_message_id",
+                        "created_at", "source_fingerprint",
+                    ],
+                    "manual_members": ["user_id", "expires_at", "granted_by", "granted_at"],
+                    "banned_users": ["user_id", "reason", "banned_by", "banned_at"],
+                    "scanner_messages": [
+                        "channel_id", "message_id", "fingerprint", "file_name",
+                        "media_type", "category", "created_at",
+                    ],
+                    "scanner_progress": [
+                        "channel_id", "last_message_id", "scanned_count",
+                        "completed", "updated_at",
+                    ],
+                }
+                for table, candidates in table_columns.items():
+                    if table not in present:
+                        continue
+                    old_columns = {
+                        row["name"] for row in await (
+                            await legacy.execute(f"PRAGMA table_info({table})")
+                        ).fetchall()
+                    }
+                    columns = [name for name in candidates if name in old_columns]
+                    if not columns:
+                        continue
+                    quoted = ", ".join(columns)
+                    rows = await (await legacy.execute(
+                        f"SELECT {quoted} FROM {table}"
+                    )).fetchall()
+                    if not rows:
+                        continue
+                    placeholders = ", ".join(["%s"] * len(columns))
+                    await pg.executemany(
+                        f"INSERT INTO {table} ({quoted}) VALUES ({placeholders}) "
+                        "ON CONFLICT DO NOTHING",
+                        [tuple(row[name] for name in columns) for row in rows],
+                    )
+                await pg.execute(
+                    "INSERT INTO settings(key, value) VALUES(%s, %s) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    ("sqlite_import_v1", "completed"),
+                )
+                await pg.commit()
+                log_message = "Legacy SQLite data imported into PostgreSQL without overwriting existing rows."
+                print(log_message)
+            finally:
+                await legacy.close()
+
     async def initialize(self):
+        schema = """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS files (
+                file_key TEXT PRIMARY KEY,
+                owner_id BIGINT NOT NULL,
+                file_name TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT '未分类',
+                primary_message_id BIGINT NOT NULL,
+                backup_message_id BIGINT NOT NULL,
+                created_at TEXT NOT NULL,
+                source_fingerprint TEXT
+            );
+            CREATE TABLE IF NOT EXISTS manual_members (
+                user_id BIGINT PRIMARY KEY,
+                expires_at TEXT,
+                granted_by BIGINT NOT NULL,
+                granted_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id BIGINT PRIMARY KEY,
+                reason TEXT NOT NULL DEFAULT '',
+                banned_by BIGINT NOT NULL,
+                banned_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scanner_messages (
+                channel_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT '未分类',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(channel_id, message_id),
+                UNIQUE(channel_id, fingerprint)
+            );
+            CREATE TABLE IF NOT EXISTS scanner_progress (
+                channel_id BIGINT PRIMARY KEY,
+                last_message_id BIGINT NOT NULL DEFAULT 0,
+                scanned_count BIGINT NOT NULL DEFAULT 0,
+                completed INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+        """
         async with self.connect() as db:
-            await db.executescript("""
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    first_seen TEXT NOT NULL,
-                    last_seen TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS files (
-                    file_key TEXT PRIMARY KEY,
-                    owner_id INTEGER NOT NULL,
-                    file_name TEXT NOT NULL,
-                    media_type TEXT NOT NULL,
-                    category TEXT NOT NULL DEFAULT '未分类',
-                    primary_message_id INTEGER NOT NULL,
-                    backup_message_id INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    source_fingerprint TEXT
-                );
-                CREATE TABLE IF NOT EXISTS manual_members (
-                    user_id INTEGER PRIMARY KEY,
-                    expires_at TEXT,
-                    granted_by INTEGER NOT NULL,
-                    granted_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS banned_users (
-                    user_id INTEGER PRIMARY KEY,
-                    reason TEXT NOT NULL DEFAULT '',
-                    banned_by INTEGER NOT NULL,
-                    banned_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS scanner_messages (
-                    channel_id INTEGER NOT NULL,
-                    message_id INTEGER NOT NULL,
-                    fingerprint TEXT NOT NULL,
-                    file_name TEXT NOT NULL,
-                    media_type TEXT NOT NULL,
-                    category TEXT NOT NULL DEFAULT '未分类',
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY(channel_id, message_id),
-                    UNIQUE(channel_id, fingerprint)
-                );
-                CREATE TABLE IF NOT EXISTS scanner_progress (
-                    channel_id INTEGER PRIMARY KEY,
-                    last_message_id INTEGER NOT NULL DEFAULT 0,
-                    scanned_count INTEGER NOT NULL DEFAULT 0,
-                    completed INTEGER NOT NULL DEFAULT 0,
-                    updated_at TEXT NOT NULL
-                );
-            """)
-            # Upgrade databases created by the first project revision.
-            columns = await (await db.execute("PRAGMA table_info(files)")).fetchall()
-            column_names = {row["name"] for row in columns}
+            if self.uses_postgres:
+                await db.executescript(schema)
+                columns = await (await db.execute(
+                    "SELECT column_name AS name FROM information_schema.columns "
+                    "WHERE table_schema=current_schema() AND table_name='files'"
+                )).fetchall()
+                column_names = {row["name"] for row in columns}
+            else:
+                await db.executescript(schema.replace("BIGINT", "INTEGER"))
+                columns = await (await db.execute("PRAGMA table_info(files)")).fetchall()
+                column_names = {row["name"] for row in columns}
+
             if "category" not in column_names:
                 await db.execute(
                     "ALTER TABLE files ADD COLUMN category TEXT NOT NULL DEFAULT '未分类'"
                 )
             if "source_fingerprint" not in column_names:
-                await db.execute(
-                    "ALTER TABLE files ADD COLUMN source_fingerprint TEXT"
-                )
+                await db.execute("ALTER TABLE files ADD COLUMN source_fingerprint TEXT")
             await db.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_files_source_fingerprint
                 ON files(source_fingerprint)
                 WHERE source_fingerprint IS NOT NULL
             """)
             await db.commit()
+
+        if self.uses_postgres:
+            await self._import_legacy_sqlite()
 
     async def get_setting(self, key: str):
         async with self.connect() as db:
@@ -350,7 +494,7 @@ class Database:
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
         async with self.connect() as db:
             categories = await (await db.execute(
-                "SELECT DISTINCT category FROM files ORDER BY category COLLATE NOCASE"
+                "SELECT DISTINCT category FROM files ORDER BY lower(category)"
             )).fetchall()
             total = (await (await db.execute(
                 "SELECT COUNT(*) AS n FROM files" + where, params
