@@ -254,6 +254,22 @@ class Database:
                 )
             if "source_fingerprint" not in column_names:
                 await db.execute("ALTER TABLE files ADD COLUMN source_fingerprint TEXT")
+            if "file_size" not in column_names:
+                await db.execute("ALTER TABLE files ADD COLUMN file_size BIGINT NOT NULL DEFAULT 0")
+            if "description" not in {row["name"] for row in await (await db.execute(
+                "SELECT column_name AS name FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='categories'"
+            )).fetchall()} if self.uses_postgres else not any(
+                row["name"] == "description" for row in await (await db.execute("PRAGMA table_info(categories)")).fetchall()
+            ):
+                await db.execute("ALTER TABLE categories ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+            category_columns = await (await db.execute(
+                "SELECT column_name AS name FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='categories'"
+            )).fetchall() if self.uses_postgres else await (await db.execute("PRAGMA table_info(categories)")).fetchall()
+            category_column_names = {row["name"] for row in category_columns}
+            if "updated_at" not in category_column_names:
+                await db.execute("ALTER TABLE categories ADD COLUMN updated_at TEXT")
             await db.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_files_source_fingerprint
                 ON files(source_fingerprint)
@@ -396,17 +412,29 @@ class Database:
 
     async def add_file(self, key, owner_id, file_name, media_type,
                        primary_id, backup_id, category="未分类",
-                       source_fingerprint=None):
+                       source_fingerprint=None, file_size=0, created_at=None):
         async with self.connect() as db:
             cur = await db.execute("""
                 INSERT OR IGNORE INTO files(
                     file_key, owner_id, file_name, media_type, category,
                     primary_message_id, backup_message_id, created_at,
-                    source_fingerprint
+                    source_fingerprint, file_size
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (key, owner_id, file_name, media_type, category,
-                  primary_id, backup_id, iso_now(), source_fingerprint))
+                  primary_id, backup_id, created_at or iso_now(),
+                  source_fingerprint, max(0, int(file_size or 0))))
+            await db.commit()
+            return cur.rowcount == 1
+
+    async def update_backup_message_id(self, key, backup_id, file_size=0):
+        async with self.connect() as db:
+            cur = await db.execute("""
+                UPDATE files
+                SET backup_message_id=?, file_size=CASE
+                    WHEN ? > 0 THEN ? ELSE file_size END
+                WHERE file_key=? AND (backup_message_id IS NULL OR backup_message_id=0)
+            """, (int(backup_id), int(file_size or 0), int(file_size or 0), key))
             await db.commit()
             return cur.rowcount == 1
 
@@ -629,29 +657,43 @@ class Database:
                 "videos": int(row["videos"] or 0),
             }
 
-    async def save_category(self, name: str):
+    async def save_category(self, name: str, description="", created_at=None):
         name = str(name or "").strip()[:120]
         if not name:
             return
+        now = iso_now()
+        created = str(created_at or now)
         async with self.connect() as db:
             await db.execute(
-                "INSERT INTO categories(name, created_at) VALUES(?, ?) "
-                "ON CONFLICT(name) DO NOTHING",
-                (name, iso_now()),
+                "INSERT INTO categories(name, created_at, description, updated_at) "
+                "VALUES(?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET "
+                "description=CASE WHEN excluded.description<>'' THEN excluded.description "
+                "ELSE categories.description END",
+                (name, created, str(description or "")[:1000], now),
             )
             await db.commit()
 
     async def list_categories(self):
         async with self.connect() as db:
             return await (await db.execute("""
-                SELECT all_categories.category, COUNT(files.file_key) AS file_count
+                SELECT all_categories.category,
+                       COUNT(files.file_key) AS file_count,
+                       SUM(CASE WHEN lower(files.media_type) IN ('photo', 'image') THEN 1 ELSE 0 END) AS image_count,
+                       SUM(CASE WHEN lower(files.media_type) = 'video' THEN 1 ELSE 0 END) AS video_count,
+                       SUM(COALESCE(files.file_size, 0)) AS total_size,
+                       COALESCE(categories.description, '') AS description,
+                       COALESCE(categories.created_at, MIN(files.created_at)) AS created_at,
+                       COALESCE(categories.updated_at, MAX(files.created_at),
+                                categories.created_at) AS updated_at
                 FROM (
                     SELECT category FROM files
                     UNION
                     SELECT name AS category FROM categories
                 ) AS all_categories
                 LEFT JOIN files ON files.category=all_categories.category
-                GROUP BY all_categories.category
+                LEFT JOIN categories ON categories.name=all_categories.category
+                GROUP BY all_categories.category, categories.description,
+                         categories.created_at, categories.updated_at
                 ORDER BY lower(all_categories.category)
             """)).fetchall()
 
