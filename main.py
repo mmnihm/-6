@@ -1167,6 +1167,7 @@ async def broadcast_handler(client, message):
 async def main():
     global BOT_USERNAME
     await db.initialize()
+    log.info("Database backend: %s", "PostgreSQL" if db.uses_postgres else "SQLite (local fallback)")
     await app.start()
     scanner_started = False
     runner = None
