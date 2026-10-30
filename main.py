@@ -1134,32 +1134,43 @@ async def user_catalog_callback_handler(client, query):
 
     if action[1] == "folders":
         await query.answer()
+        page = int(action[2]) if len(action) > 2 else 0
         categories = await db.list_categories()
+        start_at = max(0, page) * 20
+        selected = categories[start_at:start_at + 20]
         rows = [
             [InlineKeyboardButton(
                 f"🗂 {row['category']}（{row['file_count']}）",
-                callback_data=f"uc:folder:{index}",
+                callback_data=f"uc:folder:{start_at + index}:0",
             )]
-            for index, row in enumerate(categories)
+            for index, row in enumerate(selected)
         ]
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"uc:folders:{page - 1}"))
+        if start_at + 20 < len(categories):
+            nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"uc:folders:{page + 1}"))
+        if nav:
+            rows.append(nav)
         rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
         await message.edit_text(
-            "🗂️ 文件夹列表\n\n选择分类查看文件："
+            f"🗂️ 文件夹列表（{len(categories)} 个， 第 {page + 1} 页）\n\n选择分类查看文件："
             if categories else "🗂️ 暂无文件夹分类。",
             reply_markup=InlineKeyboardMarkup(rows),
         )
         return
 
-    if action[1] == "folder" and len(action) == 3:
+    if action[1] == "folder" and len(action) >= 3:
         try:
             index = int(action[2])
+            offset = int(action[3]) if len(action) > 3 else 0
             categories = await db.list_categories()
             category = categories[index]["category"]
         except (ValueError, IndexError):
             await query.answer("分类已更新，请重新打开列表", show_alert=True)
             return
         await query.answer()
-        files = await db.list_category_files(category, limit=12)
+        files = await db.list_category_files(category, limit=12, offset=offset)
         rows = []
         for row in files:
             name = row["file_name"][:28]
@@ -1169,9 +1180,16 @@ async def user_catalog_callback_handler(client, query):
             rows.append([InlineKeyboardButton(
                 "⭐ 收藏/取消收藏", callback_data=f"uc:star:{row['file_key']}:folder"
             )])
+        nav = []
+        if offset > 0:
+            nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"uc:folder:{index}:{max(0, offset - 12)}"))
+        if len(files) == 12:
+            nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"uc:folder:{index}:{offset + 12}"))
+        if nav:
+            rows.append(nav)
         rows.append([InlineKeyboardButton("⬅️ 文件夹列表", callback_data="uc:folders")])
         await message.edit_text(
-            f"🗂️ {category}\n\n"
+            f"🗂️ {category}（第 {offset // 12 + 1} 页）\n\n"
             + ("\n".join(f"• {row['file_name'][:45]}" for row in files)
                if files else "这个分类暂时没有文件。"),
             reply_markup=InlineKeyboardMarkup(rows),
