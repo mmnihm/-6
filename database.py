@@ -218,6 +218,18 @@ class Database:
                 completed INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS user_history (
+                user_id BIGINT NOT NULL,
+                file_key TEXT NOT NULL,
+                accessed_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, file_key)
+            );
+            CREATE TABLE IF NOT EXISTS favorites (
+                user_id BIGINT NOT NULL,
+                file_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, file_key)
+            );
         """
         async with self.connect() as db:
             if self.uses_postgres:
@@ -577,3 +589,90 @@ class Database:
                 "SELECT COUNT(*) n FROM banned_users"
             )).fetchone())["n"]
             return users, files, members, banned
+
+    async def catalog_stats(self):
+        async with self.connect() as db:
+            row = await (await db.execute("""
+                SELECT COUNT(*) AS messages,
+                       COUNT(DISTINCT category) AS folders,
+                       SUM(CASE WHEN media_type IN ('photo', 'image') THEN 1 ELSE 0 END) AS images,
+                       SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END) AS videos
+                FROM files
+            """)).fetchone()
+            return {
+                "folders": int(row["folders"] or 0),
+                "messages": int(row["messages"] or 0),
+                "images": int(row["images"] or 0),
+                "videos": int(row["videos"] or 0),
+            }
+
+    async def list_categories(self):
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT category, COUNT(*) AS file_count
+                FROM files GROUP BY category ORDER BY lower(category)
+            """)).fetchall()
+
+    async def list_category_files(self, category, limit=8, offset=0):
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT file_key, file_name, media_type, category
+                FROM files WHERE category=?
+                ORDER BY created_at DESC LIMIT ? OFFSET ?
+            """, (category, limit, offset))).fetchall()
+
+    async def record_history(self, user_id, file_key):
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT INTO user_history(user_id, file_key, accessed_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(user_id, file_key) DO UPDATE SET
+                    accessed_at=excluded.accessed_at
+            """, (user_id, file_key, iso_now()))
+            await db.commit()
+
+    async def list_user_history(self, user_id, limit=10):
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT f.file_key, f.file_name, f.category, h.accessed_at
+                FROM user_history h JOIN files f ON f.file_key=h.file_key
+                WHERE h.user_id=? ORDER BY h.accessed_at DESC LIMIT ?
+            """, (user_id, limit))).fetchall()
+
+    async def toggle_favorite(self, user_id, file_key):
+        async with self.connect() as db:
+            exists = await (await db.execute(
+                "SELECT 1 FROM favorites WHERE user_id=? AND file_key=?",
+                (user_id, file_key),
+            )).fetchone()
+            if exists:
+                await db.execute(
+                    "DELETE FROM favorites WHERE user_id=? AND file_key=?",
+                    (user_id, file_key),
+                )
+                result = False
+            else:
+                await db.execute("""
+                    INSERT INTO favorites(user_id, file_key, created_at)
+                    VALUES(?, ?, ?)
+                    ON CONFLICT(user_id, file_key) DO NOTHING
+                """, (user_id, file_key, iso_now()))
+                result = True
+            await db.commit()
+            return result
+
+    async def is_favorite(self, user_id, file_key):
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT 1 FROM favorites WHERE user_id=? AND file_key=?",
+                (user_id, file_key),
+            )).fetchone()
+            return row is not None
+
+    async def list_favorites(self, user_id, limit=10):
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT f.file_key, f.file_name, f.category, v.created_at
+                FROM favorites v JOIN files f ON f.file_key=v.file_key
+                WHERE v.user_id=? ORDER BY v.created_at DESC LIMIT ?
+            """, (user_id, limit))).fetchall()
