@@ -318,34 +318,58 @@ async def send_catalog_file(client, user_id, file_key):
     record = await db.get_file(file_key)
     if not record:
         return False, "文件不存在或已被移除。"
-    primary_channel_id, backup_channel_id = await get_storage_channels()
-    if not primary_channel_id:
-        return False, "管理员尚未绑定主存储频道。"
-    try:
-        copied = await client.copy_message(
-            chat_id=user_id,
-            from_chat_id=primary_channel_id,
-            message_id=record["primary_message_id"],
-        )
-    except Exception:
-        log.warning("Primary copy failed for %s; trying backup", file_key, exc_info=True)
-        backup_message_id = int(record["backup_message_id"] or 0)
-        if not backup_channel_id or backup_message_id <= 0:
-            return False, "主存储文件暂时无法取回，而且尚未建立备份副本。"
+
+    fingerprint = str(record["source_fingerprint"] or "")
+    copied_message_id = None
+    if fingerprint.startswith("cangku:"):
+        try:
+            parts = fingerprint.split(":", 2)
+            if len(parts) != 3:
+                raise ValueError("原始资源索引格式无效")
+            copied = await telegram_bot_api(
+                "copyMessage",
+                {
+                    "chat_id": user_id,
+                    "from_chat_id": int(parts[1]),
+                    "message_id": int(parts[2]),
+                },
+            )
+            copied_message_id = int(copied["message_id"])
+        except Exception as exc:
+            log.warning("Cangku source delivery failed for %s: %s", file_key, str(exc)[:300])
+            return False, "原频道资源暂时无法取回，请联系管理员检查机器人是否仍有原频道访问权限。"
+    else:
+        primary_channel_id, backup_channel_id = await get_storage_channels()
+        if not primary_channel_id:
+            return False, "管理员尚未绑定主存储频道。"
         try:
             copied = await client.copy_message(
                 chat_id=user_id,
-                from_chat_id=backup_channel_id,
-                message_id=backup_message_id,
+                from_chat_id=primary_channel_id,
+                message_id=record["primary_message_id"],
             )
+            copied_message_id = copied.id
         except Exception:
-            log.exception("Both storage copies failed for %s", file_key)
-            return False, "文件暂时无法取回，请联系管理员检查存储频道。"
+            log.warning("Primary copy failed for %s; trying backup", file_key, exc_info=True)
+            backup_message_id = int(record["backup_message_id"] or 0)
+            if not backup_channel_id or backup_message_id <= 0:
+                return False, "主存储文件暂时无法取回，而且尚未建立备份副本。"
+            try:
+                copied = await client.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=backup_channel_id,
+                    message_id=backup_message_id,
+                )
+                copied_message_id = copied.id
+            except Exception:
+                log.exception("Both storage copies failed for %s", file_key)
+                return False, "文件暂时无法取回，请联系管理员检查存储频道。"
+
     await db.record_history(user_id, file_key)
     try:
         await client.edit_message_reply_markup(
             chat_id=user_id,
-            message_id=copied.id,
+            message_id=copied_message_id,
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("⭐ 收藏/取消收藏", callback_data=f"uc:star:{file_key}")
             ]]),
@@ -510,98 +534,65 @@ async def directory_import_confirm_handler(client, message):
     if not pending:
         await message.reply_text("⚠️ 没有待确认的迁移清单。请先把 Cangku 导出的 JSON 文件发送给我。")
         return
-    primary_channel_id, backup_channel_id = await get_storage_channels()
-    if not primary_channel_id or not backup_channel_id:
-        await message.reply_text("⚠️ 主频道或备份频道未绑定，已停止迁移。")
-        return
+    # Directory-only import stores source references and needs no destination channels.
     directory_import_running = True
-    status = await message.reply_text("⏳ 正在导入，请保持机器人运行。已完成的项目会自动去重，重新发送清单可续跑。")
+    status = await message.reply_text("⏳ 正在导入目录和资源索引，不会复制或移动原文件…")
     success = skipped = failed = 0
     try:
         for category in pending["directories"]:
             await db.save_category(category)
+
         total = len(pending["resources"])
         for index, item in enumerate(pending["resources"], 1):
             fingerprint = item["source_fingerprint"]
-            if await db.get_file_by_fingerprint(fingerprint):
-                skipped += 1
-                continue
-            primary_copy = None
-            backup_copy = None
             try:
-                primary_copy = await client.copy_message(
-                    chat_id=primary_channel_id,
-                    from_chat_id=int(item["chat_id"]),
-                    message_id=item["message_id"],
-                )
-                backup_copy = await client.copy_message(
-                    chat_id=backup_channel_id,
-                    from_chat_id=int(item["chat_id"]),
-                    message_id=item["message_id"],
-                )
-                file_key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
-                inserted = await db.add_file(
-                    file_key, user.id, item["file_name"], item["media_type"],
-                    primary_copy.id, backup_copy.id, item["category"], fingerprint
-                )
-                if inserted:
-                    await db.save_category(item["category"])
-                    success += 1
-                else:
+                if await db.get_file_by_fingerprint(fingerprint):
                     skipped += 1
-                    for channel_id, copied_id in (
-                        (primary_channel_id, primary_copy.id),
-                        (backup_channel_id, backup_copy.id),
-                    ):
-                        try:
-                            await client.delete_messages(channel_id, copied_id)
-                        except Exception:
-                            log.warning("Could not clean duplicate migration copy %s", copied_id)
-            except FloodWait as exc:
-                await asyncio.sleep(exc.value)
-                try:
-                    if primary_copy:
-                        await client.delete_messages(primary_channel_id, primary_copy.id)
-                except Exception:
-                    pass
-                failed += 1
-                log.warning("FloodWait while importing source %s", fingerprint)
+                else:
+                    file_key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
+                    inserted = await db.add_file(
+                        file_key, user.id, item["file_name"], item["media_type"],
+                        item["message_id"], 0, item["category"], fingerprint
+                    )
+                    if inserted:
+                        await db.save_category(item["category"])
+                        success += 1
+                    else:
+                        skipped += 1
             except Exception:
                 failed += 1
-                log.exception("Directory migration item failed: %s", fingerprint)
-                if primary_copy:
-                    try:
-                        await client.delete_messages(primary_channel_id, primary_copy.id)
-                    except Exception:
-                        log.warning("Could not clean incomplete primary copy %s", primary_copy.id)
-                if backup_copy:
-                    try:
-                        await client.delete_messages(backup_channel_id, backup_copy.id)
-                    except Exception:
-                        log.warning("Could not clean incomplete backup copy %s", backup_copy.id)
-            if index % 20 == 0:
+                log.exception("Directory index import failed: %s", fingerprint)
+
+            if index % 100 == 0 or index == total:
                 try:
                     await status.edit_text(
-                        f"🔄 迁移进度：{index}/{total}\n"
-                        f"✅ 成功：{success}  ⏭️ 跳过：{skipped}  ❌ 失败：{failed}"
+                        f"🔄 索引导入进度：{index}/{total}\n"
+                        f"📁 目录：{len(pending['directories'])}\n"
+                        f"✅ 已建立索引：{success}  ⏭️ 重复跳过：{skipped}  ❌ 失败：{failed}\n"
+                        "原频道文件没有复制、移动或删除。"
                     )
                 except Exception:
                     pass
-            await asyncio.sleep(0.15)
-        pending_directory_imports.pop(user.id, None)
+            if index % 100 == 0:
+                await asyncio.sleep(0.05)
+
+        if failed == 0:
+            pending_directory_imports.pop(user.id, None)
         await status.edit_text(
-            "✅ Cangku 目录迁移完成\n\n"
+            "✅ Cangku 目录和资源索引导入完成\n\n"
             f"📁 文件夹：{len(pending['directories'])} 个\n"
-            f"✅ 成功复制：{success} 个\n"
+            f"✅ 已建立索引：{success} 个\n"
             f"⏭️ 重复跳过：{skipped} 个\n"
             f"❌ 失败：{failed} 个\n\n"
-            "原 Cangku 资源未删除，会员网盘原有数据未覆盖。"
+            "会员点击目录即可查看资源，点击资源后从 Cangku 原频道直接取回。\n"
+            "原文件未复制、移动或删除。"
+            + ("\n失败记录已保留待处理，请重新发送 JSON 后续跑。" if failed else "")
         )
     except Exception:
-        log.exception("Directory migration interrupted")
+        log.exception("Directory index import interrupted")
         await status.edit_text(
-            f"⚠️ 迁移中断。成功：{success}，跳过：{skipped}，失败：{failed}。\n"
-            "重新发送同一份 JSON 文件并确认导入即可续跑，已成功导入的资源会自动跳过。"
+            f"⚠️ 索引导入中断。已建立：{success}，跳过：{skipped}，失败：{failed}。\n"
+            "重新发送同一份 JSON 文件并确认导入即可续跑，已建立的索引会自动跳过。"
         )
     finally:
         directory_import_running = False
