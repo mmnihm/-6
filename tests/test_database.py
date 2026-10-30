@@ -127,6 +127,17 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         row = await self.db.get_file_by_fingerprint("legacy-primary-id")
         self.assertEqual(row["primary_message_id"], 601)
         self.assertEqual(row["backup_message_id"], 0)
+    async def test_catalog_stats_and_member_history(self):
+        await self.db.add_file('history001', 101, 'movie.mp4', 'video', 11, 22, '电影')
+        stats = await self.db.catalog_stats()
+        self.assertEqual(stats['messages'], 1)
+        self.assertEqual(stats['videos'], 1)
+        await self.db.record_history(303, 'history001')
+        rows = await self.db.list_user_history(303)
+        self.assertEqual(rows[0]['file_key'], 'history001')
+        self.assertTrue(await self.db.toggle_favorite(303, 'history001'))
+        self.assertTrue(await self.db.is_favorite(303, 'history001'))
+
     async def test_public_catalog_search_and_category_filter(self):
         await self.db.add_file("key001", 101, "movie-one.mp4", "video", 11, 22, "电影")
         await self.db.add_file("key002", 101, "lesson.pdf", "document", 12, 23, "教程")
