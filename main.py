@@ -923,6 +923,12 @@ async def main():
                 log.info("History scanner ready: user %s", scanner_me.id)
             except Exception:
                 log.exception("History scanner is unavailable; bot will continue without history scanning")
+                if scanner_started:
+                    try:
+                        await scanner.stop()
+                    except Exception:
+                        log.exception("Could not stop failed history scanner session")
+                    scanner_started = False
                 scanner = None
 
         me = await app.get_me()
