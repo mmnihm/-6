@@ -180,7 +180,8 @@ class Database:
             CREATE TABLE IF NOT EXISTS categories (
                 name TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL
-            );\n            CREATE TABLE IF NOT EXISTS files (
+            );
+            CREATE TABLE IF NOT EXISTS files (
                 file_key TEXT PRIMARY KEY,
                 owner_id BIGINT NOT NULL,
                 file_name TEXT NOT NULL,
