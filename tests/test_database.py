@@ -51,6 +51,33 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         row = await self.db.get_file_by_fingerprint("telegram-file-unique-id")
         self.assertEqual(row["file_key"], "firstkey")
 
+    async def test_history_scan_pairs_primary_and_backup_messages(self):
+        created = "2026-10-30T10:00:00+00:00"
+        matched, inserted = await self.db.save_scanned_message(
+            100, 200, 100, 501, "same-file-unique-id",
+            "movie.mp4", "video", "电影", created, 101, "scan-key-1"
+        )
+        self.assertFalse(matched)
+        self.assertFalse(inserted)
+
+        matched, inserted = await self.db.save_scanned_message(
+            200, 100, 100, 801, "same-file-unique-id",
+            "movie-copy.mp4", "video", "视频", created, 101, "scan-key-2"
+        )
+        self.assertTrue(matched)
+        self.assertTrue(inserted)
+
+        row = await self.db.get_file_by_fingerprint("same-file-unique-id")
+        self.assertEqual(row["primary_message_id"], 501)
+        self.assertEqual(row["backup_message_id"], 801)
+        self.assertEqual(row["file_name"], "movie.mp4")
+        self.assertEqual(row["category"], "电影")
+
+        progress = await self.db.get_scan_progress(100)
+        self.assertEqual(progress["last_message_id"], 501)
+        await self.db.mark_scan_completed(100)
+        self.assertEqual((await self.db.get_scan_progress(100))["completed"], 1)
+
     async def test_public_catalog_search_and_category_filter(self):
         await self.db.add_file("key001", 101, "movie-one.mp4", "video", 11, 22, "电影")
         await self.db.add_file("key002", 101, "lesson.pdf", "document", 12, 23, "教程")
