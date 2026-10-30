@@ -740,6 +740,38 @@ async def scan_status_handler(client, message):
     )
 
 
+@app.on_message(filters.private & filters.command("scanlogout"))
+async def scanner_logout_handler(client, message):
+    global scanner
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    if scan_task and not scan_task.done():
+        await message.reply_text("⚠️ 扫描正在运行，请先发送 /scanstop，暂停后再退出账号。")
+        return
+    pending = scanner_login_clients.pop(user.id, None)
+    scanner_login_states.pop(user.id, None)
+    if pending:
+        try:
+            await pending.disconnect()
+        except Exception:
+            log.exception("Could not disconnect pending scanner login")
+    try:
+        if scanner is not None and scanner.is_connected:
+            await scanner.log_out()
+        elif os.path.exists(SCANNER_SESSION_PATH):
+            os.remove(SCANNER_SESSION_PATH)
+            journal = SCANNER_SESSION_PATH + "-journal"
+            if os.path.exists(journal):
+                os.remove(journal)
+        scanner = None
+        await message.reply_text("✅ 扫描账号已退出并清除本地登录会话。需要更换账号时，再打开 /admin → 扫描账号登录。")
+    except Exception:
+        log.exception("Could not log out scanner account")
+        await message.reply_text("❌ 退出扫描账号失败，请稍后重试。")
+
+
 @app.on_message(filters.private & filters.command("scanstop"))
 async def scan_stop_handler(client, message):
     user = message.from_user
@@ -924,7 +956,7 @@ async def admin_callback_handler(client, query):
             "📖 管理命令速查\n\n"
             "/bindgroup — 绑定会员群\n/bindmain — 绑定主存储频道\n/bindbackup — 绑定备份频道\n/storage — 查看绑定状态\n"
             "/grant 用户ID 天数|永久 — 授权会员\n/revoke 用户ID — 取消授权\n/ban 用户ID 原因 — 封禁\n/unban 用户ID — 解封\n"
-            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scan — 自动扫描主备份频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
+            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scan — 自动扫描主备份频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
             reply_markup=back_keyboard(),
         )
 
