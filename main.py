@@ -672,6 +672,95 @@ async def scanner_login_input_handler(client, message):
         )
 
 
+async def inspect_scan_channel(channel_id):
+    """Check whether the logged-in user account can open a channel and read its history."""
+    result = {
+        "channel_id": channel_id,
+        "title": str(channel_id),
+        "chat_type": "未知",
+        "member_status": "无法确认",
+        "history_ok": False,
+        "ok": False,
+        "error": None,
+        "member_warning": None,
+    }
+    try:
+        chat = await scanner.get_chat(channel_id)
+        result["title"] = getattr(chat, "title", None) or getattr(chat, "first_name", None) or str(channel_id)
+        result["chat_type"] = str(getattr(chat, "type", "未知"))
+    except Exception as exc:
+        result["error"] = f"读取频道信息失败：{type(exc).__name__}: {exc}"
+        return result
+
+    try:
+        me = await scanner.get_me()
+        member = await scanner.get_chat_member(channel_id, me.id)
+        status = getattr(member, "status", None)
+        result["member_status"] = getattr(status, "value", None) or str(status or "未知")
+        if result["member_status"].lower() in ("left", "kicked", "banned"):
+            result["error"] = f"扫描账号当前状态为 {result['member_status']}，不在频道内"
+            return result
+    except Exception as exc:
+        # History access below is the decisive permission check if member details are unavailable.
+        result["member_warning"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        async for _ in scanner.get_chat_history(channel_id, limit=1):
+            break
+        result["history_ok"] = True
+        result["ok"] = True
+    except Exception as exc:
+        result["error"] = f"读取历史消息失败：{type(exc).__name__}: {exc}"
+    return result
+
+
+def format_scan_check(result, label):
+    status = "✅ 可扫描" if result["ok"] else "❌ 不可扫描"
+    lines = [
+        f"{label}：{status}",
+        f"频道：{result['title']}",
+        f"ID：{result['channel_id']}",
+        f"类型：{result['chat_type']}",
+        f"扫描账号状态：{result['member_status']}",
+    ]
+    if result["error"]:
+        lines.append(f"原因：{result['error']}")
+    if result["member_warning"]:
+        lines.append(f"成员状态查询提示：{result['member_warning']}")
+    return "\n".join(lines)
+
+
+@app.on_message(filters.private & filters.command("scancheck"))
+async def scan_check_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    if scanner is None or not scanner.is_connected:
+        await message.reply_text("⚠️ 扫描账号尚未登录或连接已断开。请先发送 /scanlogin 登录。")
+        return
+
+    primary, backup = await get_storage_channels()
+    if not primary or not backup:
+        await message.reply_text("❌ 主频道或备份频道尚未绑定，请先检查 /storage。")
+        return
+
+    await message.reply_text("🔎 正在分别检查主频道、备份频道及历史读取权限……")
+    primary_result = await inspect_scan_channel(primary)
+    backup_result = await inspect_scan_channel(backup)
+    body = (
+        "🔎 扫描账号频道检查结果\n\n"
+        + format_scan_check(primary_result, "主存储频道")
+        + "\n\n"
+        + format_scan_check(backup_result, "备份存储频道")
+    )
+    if primary_result["ok"] and backup_result["ok"]:
+        body += "\n\n✅ 两个频道均可读取历史消息，可以发送 /scan 开始扫描。"
+    else:
+        body += "\n\n⚠️ 请根据上面的具体错误修复频道权限后，再运行 /scan。"
+    await message.reply_text(body)
+
+
 @app.on_message(filters.private & filters.command("scan"))
 async def scan_history_handler(client, message):
     global scan_task
@@ -692,14 +781,20 @@ async def scan_history_handler(client, message):
     if not primary or not backup:
         await message.reply_text("❌ 请先绑定主存储频道和备份频道。")
         return
-    try:
-        await scanner.get_chat(primary)
-        await scanner.get_chat(backup)
-    except Exception:
-        log.exception("Scanner account cannot access both storage channels")
+    if not scanner.is_connected:
+        await message.reply_text("⚠️ 扫描账号连接已断开。请发送 /scanlogin 重新登录。")
+        return
+    checks = [
+        ("主存储频道", await inspect_scan_channel(primary)),
+        ("备份存储频道", await inspect_scan_channel(backup)),
+    ]
+    failed = [format_scan_check(result, label) for label, result in checks if not result["ok"]]
+    if failed:
+        log.error("Scanner channel check failed: %s", " | ".join(failed))
         await message.reply_text(
-            "❌ 扫描账号无法访问主频道或备份频道。\n"
-            "请先用普通 Telegram 账号加入这两个私有频道，再重新运行 /scan。"
+            "❌ 扫描未启动，以下频道检查未通过：\n\n"
+            + "\n\n".join(failed)
+            + "\n\n修复对应频道权限后，先运行 /scancheck 确认，再发送 /scan。"
         )
         return
     p = await db.get_scan_progress(primary)
@@ -957,7 +1052,7 @@ async def admin_callback_handler(client, query):
             "📖 管理命令速查\n\n"
             "/bindgroup — 绑定会员群\n/bindmain — 绑定主存储频道\n/bindbackup — 绑定备份频道\n/storage — 查看绑定状态\n"
             "/grant 用户ID 天数|永久 — 授权会员\n/revoke 用户ID — 取消授权\n/ban 用户ID 原因 — 封禁\n/unban 用户ID — 解封\n"
-            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scan — 自动扫描主备份频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
+            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scancheck — 分别检查主备份频道访问和历史读取权限\n/scan — 自动扫描主备份频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
             reply_markup=back_keyboard(),
         )
 
