@@ -187,7 +187,7 @@ async def run_history_scan(primary_channel_id, backup_channel_id):
                         channel_id, other_channel_id, primary_channel_id,
                         item.id, fingerprint, file_name, media_type, category,
                         created_at, config.ADMIN_ID,
-                        secrets.token_urlsafe(9).replace("-", "").replace("_"),
+                        secrets.token_urlsafe(9).replace("-", "").replace("_", ""),
                     )
                 else:
                     await db.advance_scan_cursor(channel_id, item.id)
