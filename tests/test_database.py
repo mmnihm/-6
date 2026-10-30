@@ -127,6 +127,32 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         row = await self.db.get_file_by_fingerprint("legacy-primary-id")
         self.assertEqual(row["primary_message_id"], 601)
         self.assertEqual(row["backup_message_id"], 0)
+    async def test_folder_delivery_progress_is_persistent_and_monotonic(self):
+        self.assertEqual(
+            await self.db.get_category_delivery_progress(303, "folder-key"),
+            0,
+        )
+        await self.db.set_category_delivery_progress(303, "folder-key", 20)
+        self.assertEqual(
+            await self.db.get_category_delivery_progress(303, "folder-key"),
+            20,
+        )
+        # A stale callback must not move the saved cursor backwards.
+        await self.db.set_category_delivery_progress(303, "folder-key", 10)
+        self.assertEqual(
+            await self.db.get_category_delivery_progress(303, "folder-key"),
+            20,
+        )
+        # Progress is isolated per user and folder.
+        self.assertEqual(
+            await self.db.get_category_delivery_progress(404, "folder-key"),
+            0,
+        )
+        self.assertEqual(
+            await self.db.get_category_delivery_progress(303, "other-folder"),
+            0,
+        )
+
     async def test_catalog_stats_and_member_history(self):
         await self.db.add_file('history001', 101, 'movie.mp4', 'video', 11, 22, '电影')
         stats = await self.db.catalog_stats()
