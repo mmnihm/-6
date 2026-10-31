@@ -247,6 +247,17 @@ class Database:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(user_id, share_key)
             );
+            CREATE TABLE IF NOT EXISTS backup_retry_jobs (
+                file_key TEXT PRIMARY KEY,
+                primary_channel_id BIGINT NOT NULL,
+                primary_message_id BIGINT NOT NULL,
+                backup_channel_id BIGINT NOT NULL,
+                attempts BIGINT NOT NULL DEFAULT 0,
+                next_retry_at TEXT NOT NULL,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
         """
         async with self.connect() as db:
             if self.uses_postgres:
@@ -602,6 +613,65 @@ class Database:
                     END,
                     updated_at=excluded.updated_at
             """, (user_id, share_key, max(0, int(next_offset)), iso_now()))
+            await db.commit()
+
+    async def enqueue_backup_retry(
+        self, file_key, primary_channel_id, primary_message_id,
+        backup_channel_id, error=""
+    ):
+        now = iso_now()
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT INTO backup_retry_jobs(
+                    file_key, primary_channel_id, primary_message_id,
+                    backup_channel_id, attempts, next_retry_at,
+                    last_error, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, 0, ?, ?, ?, ?)
+                ON CONFLICT(file_key) DO UPDATE SET
+                    primary_channel_id=excluded.primary_channel_id,
+                    primary_message_id=excluded.primary_message_id,
+                    backup_channel_id=excluded.backup_channel_id,
+                    next_retry_at=excluded.next_retry_at,
+                    last_error=excluded.last_error,
+                    updated_at=excluded.updated_at
+            """, (
+                file_key, int(primary_channel_id), int(primary_message_id),
+                int(backup_channel_id), now, str(error or "")[:500], now, now,
+            ))
+            await db.commit()
+
+    async def list_due_backup_retries(self, limit=10):
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT * FROM backup_retry_jobs
+                WHERE next_retry_at<=?
+                ORDER BY next_retry_at, created_at
+                LIMIT ?
+            """, (iso_now(), max(1, min(50, int(limit)))))).fetchall()
+
+    async def fail_backup_retry(self, file_key, error=""):
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT attempts FROM backup_retry_jobs WHERE file_key=?",
+                (file_key,),
+            )).fetchone()
+            if not row:
+                return
+            attempts = int(row["attempts"] or 0) + 1
+            delay = min(3600, 30 * (2 ** min(attempts - 1, 7)))
+            next_retry = (utc_now() + timedelta(seconds=delay)).isoformat()
+            await db.execute("""
+                UPDATE backup_retry_jobs
+                SET attempts=?, next_retry_at=?, last_error=?, updated_at=?
+                WHERE file_key=?
+            """, (attempts, next_retry, str(error or "")[:500], iso_now(), file_key))
+            await db.commit()
+
+    async def complete_backup_retry(self, file_key):
+        async with self.connect() as db:
+            await db.execute(
+                "DELETE FROM backup_retry_jobs WHERE file_key=?", (file_key,)
+            )
             await db.commit()
 
     async def get_file(self, key):
