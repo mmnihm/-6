@@ -9,7 +9,10 @@ from datetime import datetime, timezone, timedelta
 from aiohttp import web
 
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio,
+)
 from pyrogram.enums import ChatMemberStatus, ChatType
 from pyrogram.errors import (
     FloodWait, PeerIdInvalid, UserNotParticipant, SessionPasswordNeeded,
@@ -613,8 +616,61 @@ async def send_catalog_file(client, user_id, file_key):
     return True, "文件已发送。"
 
 
+async def try_send_catalog_album(client, user_id, source_chat_id, group):
+    """Send compatible source media as one Telegram album; return False when unsupported."""
+    if len(group) < 2 or len(group) > 10:
+        return False
+
+    media_kind = []
+    for item, record, message_id in group:
+        kind = str(record["media_type"] or "").lower()
+        if kind in ("photo", "video"):
+            media_kind.append("visual")
+        elif kind == "document":
+            media_kind.append("document")
+        elif kind == "audio":
+            media_kind.append("audio")
+        else:
+            return False
+    if len(set(media_kind)) != 1:
+        return False
+
+    messages = await client.get_messages(
+        source_chat_id, message_ids=[entry[2] for entry in group]
+    )
+    if not isinstance(messages, (list, tuple)):
+        messages = [messages]
+    by_id = {int(message.id): message for message in messages if message}
+    if len(by_id) != len(group):
+        return False
+
+    media = []
+    for item, record, message_id in group:
+        message = by_id.get(int(message_id))
+        if not message:
+            return False
+        kind = str(record["media_type"] or "").lower()
+        source_media = getattr(message, kind, None)
+        if not source_media or not getattr(source_media, "file_id", None):
+            return False
+        caption = (getattr(message, "caption", None) or "")[:1024] or None
+        if kind == "photo":
+            media.append(InputMediaPhoto(source_media.file_id, caption=caption))
+        elif kind == "video":
+            media.append(InputMediaVideo(source_media.file_id, caption=caption))
+        elif kind == "document":
+            media.append(InputMediaDocument(source_media.file_id, caption=caption))
+        elif kind == "audio":
+            media.append(InputMediaAudio(source_media.file_id, caption=caption))
+        else:
+            return False
+
+    await client.send_media_group(chat_id=user_id, media=media)
+    return True
+
+
 async def send_catalog_batch(client, user_id, share_key, offset, batch):
-    """Copy each contiguous run of files from one source with Telegram copyMessages."""
+    """Deliver up to 20 files in albums where possible; skip failed files and continue."""
     sent = failed = 0
     next_offset = offset
     primary_channel_id, backup_channel_id = await get_storage_channels()
@@ -647,47 +703,97 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch):
             )
         prepared.append((item, record, source[0] if source else None, source[1] if source else None))
 
+    def album_kind(record):
+        if not record:
+            return None
+        kind = str(record["media_type"] or "").lower()
+        if kind in ("photo", "video"):
+            return "visual"
+        if kind in ("document", "audio"):
+            return kind
+        return None
+
     index = 0
     while index < len(prepared):
         item, record, source_chat_id, source_message_id = prepared[index]
         if not record or source_chat_id is None or source_message_id is None:
-            ok, _ = await send_catalog_file(client, user_id, item["file_key"])
-            if not ok:
+            ok, error_text = await send_catalog_file(client, user_id, item["file_key"])
+            if ok:
+                sent += 1
+                await db.record_history(user_id, item["file_key"])
+            else:
                 failed += 1
-                break
-            sent += 1
+                log.warning(
+                    "Skipping unavailable file: user=%s file=%s reason=%s",
+                    user_id, item["file_key"], error_text,
+                )
             next_offset = offset + index + 1
             await db.set_category_delivery_progress(user_id, share_key, next_offset)
             index += 1
             continue
 
+        kind = album_kind(record)
         end = index + 1
-        run_ids = [source_message_id]
+        group = [(item, record, source_message_id)]
         while end < len(prepared):
             next_item, next_record, next_chat_id, next_message_id = prepared[end]
-            if not next_record or next_chat_id != source_chat_id or next_message_id is None:
+            if (not next_record or next_chat_id != source_chat_id
+                    or next_message_id is None or not kind
+                    or album_kind(next_record) != kind or len(group) >= 10):
                 break
-            run_ids.append(next_message_id)
+            group.append((next_item, next_record, next_message_id))
             end += 1
 
-        try:
-            if len(run_ids) == 1:
+        album_sent = False
+        if len(group) >= 2:
+            try:
+                album_sent = await try_send_catalog_album(
+                    client, user_id, source_chat_id, group
+                )
+            except Exception as exc:
+                log.warning(
+                    "Album delivery unavailable; falling back to Telegram copy: "
+                    "user=%s source=%s count=%s error=%s",
+                    user_id, source_chat_id, len(group), str(exc)[:250],
+                )
+
+        if album_sent:
+            successful_keys = [entry[0]["file_key"] for entry in group]
+            await db.record_history_batch(user_id, successful_keys)
+            sent += len(successful_keys)
+            next_offset = offset + end
+            await db.set_category_delivery_progress(user_id, share_key, next_offset)
+            index = end
+            continue
+
+        # Keep Telegram's server-side copy path as the compatibility fallback.
+        run_end = end
+        run_ids = [entry[2] for entry in group]
+        if len(run_ids) == 1:
+            try:
                 copied = await telegram_bot_api(
                     "copyMessage",
                     {"chat_id": user_id, "from_chat_id": source_chat_id, "message_id": run_ids[0]},
                 )
                 copied_messages = [copied]
-            else:
+            except Exception:
+                copied_messages = None
+        else:
+            try:
                 copied_messages = await telegram_bot_api(
                     "copyMessages",
                     {"chat_id": user_id, "from_chat_id": source_chat_id, "message_ids": run_ids},
                 )
-            if not isinstance(copied_messages, list) or len(copied_messages) != len(run_ids):
-                raise RuntimeError("Telegram batch copy returned an unexpected message count")
-            successful_keys = []
-            for position in range(index, end):
-                current_item, current_record, _, _ = prepared[position]
-                successful_keys.append(current_item["file_key"])
+            except Exception:
+                copied_messages = None
+
+        if isinstance(copied_messages, list) and len(copied_messages) == len(run_ids):
+            successful_keys = [entry[0]["file_key"] for entry in group]
+            await db.record_history_batch(user_id, successful_keys)
+            sent += len(successful_keys)
+            next_offset = offset + run_end
+            await db.set_category_delivery_progress(user_id, share_key, next_offset)
+            for current_item, current_record, _ in group:
                 if str(current_record["source_fingerprint"] or "").startswith("cangku:"):
                     backup_id = int(current_record["backup_message_id"] or 0)
                     if backup_channel_id and backup_id <= 0:
@@ -697,33 +803,28 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch):
                             asyncio.create_task(cache_cangku_backup(
                                 client, current_item["file_key"], int(parts[1]), int(parts[2])
                             ))
-            await db.record_history_batch(user_id, successful_keys)
-            sent += len(successful_keys)
-            next_offset = offset + end
-            await db.set_category_delivery_progress(user_id, share_key, next_offset)
-            index = end
-        except Exception as exc:
-            log.warning(
-                "Batch copy failed; falling back to individual delivery: user=%s source=%s count=%s error=%s",
-                user_id, source_chat_id, len(run_ids), str(exc)[:300],
+            index = run_end
+            continue
+
+        # If album and copyMessages both fail, try files individually.
+        # A failed file is skipped; later files in this batch are still attempted.
+        for position in range(index, run_end):
+            current_item = prepared[position][0]
+            ok, error_text = await send_catalog_file(
+                client, user_id, current_item["file_key"]
             )
-            # Keep the reliable single-file fallback for unavailable source copies.
-            for position in range(index, end):
-                current_item = prepared[position][0]
-                ok, error_text = await send_catalog_file(client, user_id, current_item["file_key"])
-                if not ok:
-                    failed += 1
-                    log.warning(
-                        "Folder delivery paused: user=%s share_key=%s offset=%s file=%s reason=%s",
-                        user_id, share_key, offset + position, current_item["file_key"], error_text,
-                    )
-                    break
+            if ok:
                 sent += 1
-                next_offset = offset + position + 1
-                await db.set_category_delivery_progress(user_id, share_key, next_offset)
-            if failed:
-                break
-            index = end
+            else:
+                failed += 1
+                log.warning(
+                    "Skipping failed file: user=%s share_key=%s offset=%s file=%s reason=%s",
+                    user_id, share_key, offset + position,
+                    current_item["file_key"], error_text,
+                )
+            next_offset = offset + position + 1
+            await db.set_category_delivery_progress(user_id, share_key, next_offset)
+        index = run_end
 
     return sent, failed, next_offset
 
@@ -2282,7 +2383,7 @@ async def user_catalog_callback_handler(client, query):
             buttons = []
             if next_offset < total:
                 buttons.append([InlineKeyboardButton(
-                    "📥 获取下一组（最多20个）" if failed == 0 else "🔄 重试未发送文件",
+                    "📥 获取下一组（最多20个）",
                     callback_data=f"uc:getfolder:{share_key}:{next_offset}",
                 )])
             buttons.append([InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")])
