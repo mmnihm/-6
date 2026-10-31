@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 from datetime import datetime, timezone, timedelta
 
 
@@ -63,21 +64,35 @@ class Database:
         self.database_url = (database_url or os.getenv("DATABASE_URL", "")).strip()
         if self.database_url.startswith("postgres://"):
             self.database_url = "postgresql://" + self.database_url[len("postgres://"):]
+        self.pool = None
 
     @property
     def uses_postgres(self):
         return bool(self.database_url)
 
+    async def open_pool(self):
+        if self.uses_postgres and self.pool is None:
+            self.pool = AsyncConnectionPool(
+                self.database_url,
+                min_size=1,
+                max_size=5,
+                timeout=10,
+                kwargs={"row_factory": dict_row},
+                open=False,
+            )
+            await self.pool.open(wait=True)
+
+    async def close(self):
+        if self.pool is not None:
+            await self.pool.close()
+            self.pool = None
+
     @asynccontextmanager
     async def connect(self):
         if self.uses_postgres:
-            connection = await psycopg.AsyncConnection.connect(
-                self.database_url, row_factory=dict_row
-            )
-            try:
+            await self.open_pool()
+            async with self.pool.connection() as connection:
                 yield PostgresCompat(connection)
-            finally:
-                await connection.close()
             return
 
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
@@ -698,6 +713,17 @@ class Database:
                 "SELECT * FROM files WHERE file_key=?", (key,)
             )).fetchone()
 
+    async def get_files_by_keys(self, file_keys):
+        keys = list(dict.fromkeys(str(key) for key in file_keys))
+        if not keys:
+            return []
+        placeholders = ",".join("?" for _ in keys)
+        async with self.connect() as db:
+            return await (await db.execute(
+                f"SELECT * FROM files WHERE file_key IN ({placeholders})",
+                keys,
+            )).fetchall()
+
     async def list_files(self, limit=20):
         async with self.connect() as db:
             return await (await db.execute(
@@ -938,6 +964,20 @@ class Database:
                 ON CONFLICT(user_id, file_key) DO UPDATE SET
                     accessed_at=excluded.accessed_at
             """, (user_id, file_key, iso_now()))
+            await db.commit()
+
+    async def record_history_batch(self, user_id, file_keys):
+        keys = list(dict.fromkeys(str(key) for key in file_keys))
+        if not keys:
+            return
+        accessed_at = iso_now()
+        async with self.connect() as db:
+            await db.executemany("""
+                INSERT INTO user_history(user_id, file_key, accessed_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(user_id, file_key) DO UPDATE SET
+                    accessed_at=excluded.accessed_at
+            """, [(user_id, key, accessed_at) for key in keys])
             await db.commit()
 
     async def list_user_history(self, user_id, limit=10):
