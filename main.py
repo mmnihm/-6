@@ -30,6 +30,7 @@ pending_channel_bindings = {}
 scanner_login_states = {}
 scanner_login_clients = {}
 pending_directory_imports = {}
+pending_category_actions = {}
 directory_import_running = False
 cangku_backup_in_progress = set()
 
@@ -39,6 +40,7 @@ def admin_keyboard():
         [InlineKeyboardButton("🗄 双频道存储", callback_data="mc:storage")],
         [InlineKeyboardButton("👥 绑定会员群", callback_data="mc:bindgroup")],
         [InlineKeyboardButton("👤 会员管理", callback_data="mc:members"), InlineKeyboardButton("📂 文件管理", callback_data="mc:files")],
+        [InlineKeyboardButton("📁 目录管理", callback_data="mc:directories")],
         [InlineKeyboardButton("📢 群发广播", callback_data="mc:broadcast"), InlineKeyboardButton("📊 数据统计", callback_data="mc:stats")],
         [InlineKeyboardButton("🔐 扫描账号登录", callback_data="mc:scannerlogin")],
         [InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
@@ -1256,6 +1258,23 @@ async def scanner_login_input_handler(client, message):
     if not value:
         return
 
+    pending_category = pending_category_actions.get(user.id)
+    if pending_category:
+        if pending_category["action"] == "create":
+            await db.save_category(value[:120])
+            pending_category_actions.pop(user.id, None)
+            await message.reply_text(
+                f"✅ 已创建目录：{value[:120]}\n空目录会立即显示在会员文件夹列表中。"
+            )
+        elif pending_category["action"] == "rename":
+            old_name = pending_category["name"]
+            if await db.rename_category(old_name, value[:120]):
+                pending_category_actions.pop(user.id, None)
+                await message.reply_text(f"✅ 目录已重命名：{old_name} → {value[:120]}")
+            else:
+                await message.reply_text("❌ 重命名失败：新名称可能已存在，或名称无效。请重新发送新名称，或发送 /cancel 取消。")
+        return
+
     if state["step"] == "phone":
         phone = value.replace(" ", "").replace("-", "")
         try:
@@ -2001,6 +2020,75 @@ async def admin_callback_handler(client, query):
                 lines.append(f"{row['user_id']} — {label}")
             body = "👥 手动会员列表\n" + "\n".join(lines) + "\n\n授权：/grant 用户ID 天数|永久\n取消：/revoke 用户ID"
         await message.edit_text(body, reply_markup=back_keyboard())
+    elif action == "directories":
+        categories = await db.list_categories()
+        rows = [[InlineKeyboardButton("➕ 新建目录", callback_data="mc:dirnew")]]
+        for index, row in enumerate(categories):
+            rows.append([InlineKeyboardButton(
+                f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
+                callback_data=f"mc:directory:{index}",
+            )])
+        rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
+        await message.edit_text(
+            f"📁 目录管理（{len(categories)} 个）\n\n"
+            "空目录也会立即显示给会员。选择目录可修改名称；只有空目录可以删除。",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    elif action == "dirnew":
+        pending_category_actions[user.id] = {"action": "create"}
+        await message.edit_text(
+            "➕ 新建目录\n\n请直接发送目录名称（最多 120 个字符）。\n"
+            "创建后空目录会立即显示给会员。",
+            reply_markup=back_keyboard(),
+        )
+    elif action.startswith("directory:"):
+        try:
+            index = int(action.split(":", 1)[1])
+            categories = await db.list_categories()
+            row = categories[index]
+        except (ValueError, IndexError):
+            await message.edit_text("⚠️ 目录列表已更新，请重新打开目录管理。", reply_markup=back_keyboard())
+            return
+        count = int(row["file_count"] or 0)
+        buttons = [
+            [InlineKeyboardButton("✏️ 修改目录名称", callback_data=f"mc:dirrename:{index}")],
+        ]
+        if count == 0:
+            buttons.append([InlineKeyboardButton("🗑 删除空目录", callback_data=f"mc:dirdelete:{index}")])
+        buttons.append([InlineKeyboardButton("⬅️ 返回目录管理", callback_data="mc:directories")])
+        await message.edit_text(
+            f"📁 目录：{row['category']}\n📦 文件数：{count}\n"
+            f"🔗 分享链接：{folder_share_url(str(row['share_key'])) if row['share_key'] else '暂不可用'}\n\n"
+            + ("这是空目录，可以删除。" if count == 0 else "目录含有资源，只能修改名称，不能删除资源。"),
+            reply_markup=InlineKeyboardMarkup(buttons),
+            disable_web_page_preview=True,
+        )
+    elif action.startswith("dirrename:"):
+        try:
+            index = int(action.split(":", 1)[1])
+            row = (await db.list_categories())[index]
+        except (ValueError, IndexError):
+            await message.edit_text("⚠️ 目录列表已更新，请重新打开目录管理。", reply_markup=back_keyboard())
+            return
+        pending_category_actions[user.id] = {"action": "rename", "name": row["category"]}
+        await message.edit_text(
+            f"✏️ 修改目录名称\n\n当前名称：{row['category']}\n请发送新的目录名称。\n"
+            "目录内的资源会同步更名，不会删除或移动文件。",
+            reply_markup=back_keyboard(),
+        )
+    elif action.startswith("dirdelete:"):
+        try:
+            index = int(action.split(":", 1)[1])
+            row = (await db.list_categories())[index]
+        except (ValueError, IndexError):
+            await message.edit_text("⚠️ 目录列表已更新，请重新打开目录管理。", reply_markup=back_keyboard())
+            return
+        if await db.delete_empty_category(row["category"]):
+            await message.edit_text(f"✅ 已删除空目录：{row['category']}", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ 返回目录管理", callback_data="mc:directories")]
+            ]))
+        else:
+            await message.edit_text("❌ 删除失败：目录可能已有文件，系统不会删除或影响其中资源。", reply_markup=back_keyboard())
     elif action == "files":
         rows = await db.list_files(15)
         lines = [f"{row['file_key']} | {row['category']} | {row['file_name'][:40]}" for row in rows]
