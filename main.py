@@ -1032,6 +1032,7 @@ async def backup_retry_worker(client):
 
 
 async def upload_handler(client, message):
+    global BOT_USERNAME, BOT_ID
     user = message.from_user
     if not user:
         return
@@ -1064,9 +1065,17 @@ async def upload_handler(client, message):
     backup_id = 0
     step = "检查主频道权限"
     try:
-        me = await client.get_me()
+        # Startup already caches the bot identity. Reuse it for every upload
+        # instead of calling users.GetFullUser repeatedly and triggering FloodWait.
+        if not BOT_ID or not BOT_USERNAME:
+            me = await client.get_me()
+            BOT_ID = BOT_ID or me.id
+            BOT_USERNAME = BOT_USERNAME or me.username
+        bot_id = BOT_ID
+        if not bot_id:
+            raise RuntimeError("机器人身份尚未初始化，请稍后重试")
         for label, channel_id in (("主频道", primary_channel_id), ("备份频道", backup_channel_id)):
-            member = await client.get_chat_member(channel_id, me.id)
+            member = await client.get_chat_member(channel_id, bot_id)
             if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
                 raise RuntimeError(f"{label}中机器人不是管理员（当前状态：{member.status}）")
             if member.status == ChatMemberStatus.ADMINISTRATOR:
@@ -1109,9 +1118,6 @@ async def upload_handler(client, message):
             return
 
         step = "生成分享链接"
-        global BOT_USERNAME
-        if not BOT_USERNAME:
-            BOT_USERNAME = (await client.get_me()).username
         link = share_url(key)
         if backup_error:
             await db.enqueue_backup_retry(
