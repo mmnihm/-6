@@ -31,6 +31,7 @@ scanner_login_states = {}
 scanner_login_clients = {}
 pending_directory_imports = {}
 pending_category_actions = {}
+pending_home_button_actions = {}
 directory_import_running = False
 cangku_backup_in_progress = set()
 
@@ -41,6 +42,7 @@ def admin_keyboard():
         [InlineKeyboardButton("👥 绑定会员群", callback_data="mc:bindgroup")],
         [InlineKeyboardButton("👤 会员管理", callback_data="mc:members"), InlineKeyboardButton("📂 文件管理", callback_data="mc:files")],
         [InlineKeyboardButton("📁 目录管理", callback_data="mc:directories")],
+        [InlineKeyboardButton("🔘 首页按钮设置", callback_data="mc:homebuttons")],
         [InlineKeyboardButton("📢 群发广播", callback_data="mc:broadcast"), InlineKeyboardButton("📊 数据统计", callback_data="mc:stats")],
         [InlineKeyboardButton("🔐 扫描账号登录", callback_data="mc:scannerlogin")],
         [InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
@@ -112,7 +114,14 @@ WELCOME = (
 
 
 async def is_admin(user_id: int) -> bool:
-    return config.ADMIN_ID == user_id
+    if config.ADMIN_ID == user_id:
+        return True
+    try:
+        stored_admin_id = await db.get_admin_id()
+        return stored_admin_id is not None and int(stored_admin_id) == int(user_id)
+    except Exception:
+        log.exception("Could not read stored superadmin ID")
+        return False
 
 
 async def get_membership_tier(user_id: int):
@@ -383,12 +392,61 @@ async def reply_admin_only(message):
     await message.reply_text("⛔ 仅超级管理员可使用此命令。")
 
 
-def user_home_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📜 历史访问", callback_data="uc:history"),
-         InlineKeyboardButton("🗂️ 文件夹列表", callback_data="uc:folders")],
-        [InlineKeyboardButton("⭐ 收藏列表", callback_data="uc:favorites"),
-         InlineKeyboardButton("🎲 随机探索", callback_data="uc:random")],
+DEFAULT_HOME_BUTTONS = [
+    {"key": "history", "text": "📜 历史访问", "type": "action", "enabled": True},
+    {"key": "folders", "text": "🗂️ 文件夹列表", "type": "action", "enabled": True},
+    {"key": "favorites", "text": "⭐ 收藏列表", "type": "action", "enabled": True},
+    {"key": "random", "text": "🎲 随机探索", "type": "action", "enabled": True},
+]
+
+
+async def get_home_buttons():
+    raw = await db.get_setting("home_buttons")
+    buttons = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                buttons = [
+                    item for item in parsed
+                    if isinstance(item, dict) and item.get("key") and item.get("text")
+                ]
+        except (TypeError, ValueError):
+            log.warning("Invalid home_buttons setting; restoring default buttons")
+    if buttons is None:
+        buttons = [dict(item) for item in DEFAULT_HOME_BUTTONS]
+    # Keep built-in actions available after upgrades, including random exploration.
+    known = {str(item.get("key")) for item in buttons}
+    for item in DEFAULT_HOME_BUTTONS:
+        if item["key"] not in known:
+            buttons.append(dict(item))
+    return buttons
+
+
+async def save_home_buttons(buttons):
+    await db.set_setting("home_buttons", json.dumps(buttons, ensure_ascii=False))
+
+
+async def user_home_keyboard():
+    buttons = await get_home_buttons()
+    rows, current = [], []
+    for item in buttons:
+        if not item.get("enabled", True):
+            continue
+        if item.get("type") == "url":
+            button = InlineKeyboardButton(str(item["text"])[:60], url=str(item["url"]))
+        else:
+            button = InlineKeyboardButton(
+                str(item["text"])[:60], callback_data=f"uc:{item['key']}"
+            )
+        current.append(button)
+        if len(current) == 2:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+    return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 刷新首页", callback_data="uc:home")]
     ])
 
 
@@ -682,7 +740,7 @@ async def start_handler(client, message):
         return
     await message.reply_text(
         await user_home_text(user.id),
-        reply_markup=user_home_keyboard(),
+        reply_markup=await user_home_keyboard(),
     )
 
 
@@ -1258,6 +1316,41 @@ async def scanner_login_input_handler(client, message):
     if not value:
         return
 
+    pending_home_action = pending_home_button_actions.get(user.id)
+    if pending_home_action:
+        if pending_home_action["action"] == "add":
+            parts = value.split("|", 1)
+            if len(parts) != 2:
+                await message.reply_text("格式不正确，请按：按钮名称|https://网址 发送。")
+                return
+            label, url = parts[0].strip()[:60], parts[1].strip()
+            if not label or not (url.startswith("https://") or url.startswith("http://")):
+                await message.reply_text("按钮名称不能为空，链接必须以 http:// 或 https:// 开头，请重新发送。")
+                return
+            buttons = await get_home_buttons()
+            buttons.append({
+                "key": "link_" + secrets.token_hex(4),
+                "text": label,
+                "type": "url",
+                "url": url,
+                "enabled": True,
+            })
+            await save_home_buttons(buttons)
+            pending_home_button_actions.pop(user.id, None)
+            await message.reply_text("✅ 首页链接按钮已添加。发送 /admin 可继续管理。")
+        elif pending_home_action["action"] == "rename":
+            buttons = await get_home_buttons()
+            target = next((item for item in buttons if item.get("key") == pending_home_action["key"]), None)
+            if not target:
+                pending_home_button_actions.pop(user.id, None)
+                await message.reply_text("⚠️ 按钮不存在，请重新打开首页按钮设置。")
+                return
+            target["text"] = value[:60]
+            await save_home_buttons(buttons)
+            pending_home_button_actions.pop(user.id, None)
+            await message.reply_text("✅ 首页按钮名称已修改。发送 /admin 可继续管理。")
+        return
+
     pending_category = pending_category_actions.get(user.id)
     if pending_category:
         if pending_category["action"] == "create":
@@ -1739,7 +1832,7 @@ async def user_catalog_callback_handler(client, query):
         await query.answer()
         await message.edit_text(
             await user_home_text(user.id),
-            reply_markup=user_home_keyboard(),
+            reply_markup=await user_home_keyboard(),
         )
         return
 
@@ -2103,6 +2196,80 @@ async def admin_callback_handler(client, query):
             ]))
         else:
             await message.edit_text("❌ 删除失败：目录可能已有文件，系统不会删除或影响其中资源。", reply_markup=back_keyboard())
+    elif action == "homebuttons":
+        buttons = await get_home_buttons()
+        rows = []
+        for item in buttons:
+            enabled = item.get("enabled", True)
+            status = "✅" if enabled else "⏸"
+            rows.append([
+                InlineKeyboardButton(
+                    f"{status} {str(item['text'])[:32]}",
+                    callback_data=f"mc:homebutton:toggle:{item['key']}",
+                ),
+                InlineKeyboardButton(
+                    "✏️ 改名" if item.get("type") == "action" else "🗑 删除",
+                    callback_data=(
+                        f"mc:homebutton:rename:{item['key']}"
+                        if item.get("type") == "action"
+                        else f"mc:homebutton:delete:{item['key']}"
+                    ),
+                ),
+            ])
+        rows.append([InlineKeyboardButton("➕ 添加网址按钮", callback_data="mc:homebutton:add")])
+        rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
+        await message.edit_text(
+            "🔘 用户首页按钮设置\n\n"
+            "这里控制用户发送 /start 后看到的内联按钮。\n"
+            "点击左侧可启用/停用；右侧可修改内置按钮名称或删除自定义网址按钮。\n"
+            "随机探索等原有功能保留，停用只会隐藏按钮，不会删除功能。",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    elif action.startswith("homebutton:"):
+        parts = action.split(":")
+        if len(parts) < 3:
+            return
+        operation, key = parts[1], parts[2]
+        buttons = await get_home_buttons()
+        target = next((item for item in buttons if str(item.get("key")) == key), None)
+        if operation == "toggle" and target:
+            target["enabled"] = not target.get("enabled", True)
+            await save_home_buttons(buttons)
+            rows = []
+            for item in buttons:
+                status = "✅" if item.get("enabled", True) else "⏸"
+                rows.append([
+                    InlineKeyboardButton(f"{status} {str(item['text'])[:32]}", callback_data=f"mc:homebutton:toggle:{item['key']}"),
+                    InlineKeyboardButton(
+                        "✏️ 改名" if item.get("type") == "action" else "🗑 删除",
+                        callback_data=f"mc:homebutton:{'rename' if item.get('type') == 'action' else 'delete'}:{item['key']}",
+                    ),
+                ])
+            rows.append([InlineKeyboardButton("➕ 添加网址按钮", callback_data="mc:homebutton:add")])
+            rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
+            await message.edit_text("🔘 用户首页按钮设置\n\n点击左侧切换显示状态，右侧修改名称或删除网址按钮。", reply_markup=InlineKeyboardMarkup(rows))
+        elif operation == "rename" and target:
+            pending_home_button_actions[user.id] = {"action": "rename", "key": key}
+            await message.edit_text(f"✏️ 修改按钮名称\n\n当前名称：{target['text']}\n请直接发送新的按钮名称。", reply_markup=back_keyboard())
+        elif operation == "add":
+            pending_home_button_actions[user.id] = {"action": "add"}
+            await message.edit_text("➕ 添加首页网址按钮\n\n请按以下格式发送：\n按钮名称|https://网址\n\n例如：联系客服|https://t.me/example", reply_markup=back_keyboard())
+        elif operation == "delete" and target and target.get("type") == "url":
+            buttons = [item for item in buttons if item.get("key") != key]
+            await save_home_buttons(buttons)
+            rows = []
+            for item in buttons:
+                status = "✅" if item.get("enabled", True) else "⏸"
+                rows.append([
+                    InlineKeyboardButton(f"{status} {str(item['text'])[:32]}", callback_data=f"mc:homebutton:toggle:{item['key']}"),
+                    InlineKeyboardButton(
+                        "✏️ 改名" if item.get("type") == "action" else "🗑 删除",
+                        callback_data=f"mc:homebutton:{'rename' if item.get('type') == 'action' else 'delete'}:{item['key']}",
+                    ),
+                ])
+            rows.append([InlineKeyboardButton("➕ 添加网址按钮", callback_data="mc:homebutton:add")])
+            rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
+            await message.edit_text("✅ 已删除网址按钮。\n\n🔘 用户首页按钮设置", reply_markup=InlineKeyboardMarkup(rows))
     elif action == "files":
         rows = await db.list_files(15)
         lines = [f"{row['file_key']} | {row['category']} | {row['file_name'][:40]}" for row in rows]
