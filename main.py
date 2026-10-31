@@ -269,6 +269,25 @@ def folder_detail_text(category_row, files, page, member_group_id):
     return "\n".join(body)
 
 
+async def get_saved_folder_offset(user_id, share_key, file_count):
+    key = f"folder_view:{int(user_id)}:{share_key}"
+    try:
+        offset = max(0, int(await db.get_setting(key) or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    total = max(0, int(file_count or 0))
+    if total <= 0:
+        return 0
+    return min((offset // 20) * 20, ((total - 1) // 20) * 20)
+
+
+async def save_folder_offset(user_id, share_key, offset):
+    await db.set_setting(
+        f"folder_view:{int(user_id)}:{share_key}",
+        str(max(0, (int(offset) // 20) * 20)),
+    )
+
+
 def folder_detail_keyboard(category_row, page, has_next, is_favorite):
     share_key = str(category_row["share_key"] or "")
     rows = []
@@ -2101,7 +2120,7 @@ async def user_catalog_callback_handler(client, query):
         rows = [
             [InlineKeyboardButton(
                 f"🗂 {row['category']}（{row['file_count']}）",
-                callback_data=f"uc:folder:{start_at + index}:0",
+                callback_data=f"uc:folderresume:{start_at + index}",
             )]
             for index, row in enumerate(selected)
         ]
@@ -2120,16 +2139,26 @@ async def user_catalog_callback_handler(client, query):
         )
         return
 
-    if action[1] == "folder" and len(action) >= 3:
+    if action[1] in ("folder", "folderresume") and len(action) >= 3:
         try:
             index = int(action[2])
-            offset = max(0, int(action[3])) if len(action) > 3 else 0
             categories = await db.list_categories()
             category_row = categories[index]
             category = category_row["category"]
+            if action[1] == "folderresume":
+                offset = await get_saved_folder_offset(
+                    user.id, category_row["share_key"], category_row["file_count"]
+                )
+            else:
+                offset = max(0, int(action[3])) if len(action) > 3 else 0
+                offset = min(
+                    (offset // 20) * 20,
+                    max(0, ((int(category_row["file_count"] or 0) - 1) // 20) * 20),
+                )
         except (ValueError, IndexError):
             await query.answer("分类已更新，请重新打开列表", show_alert=True)
             return
+        await save_folder_offset(user.id, category_row["share_key"], offset)
         await query.answer()
         files = await db.list_category_files(category, limit=20, offset=offset)
         page = offset // 20
@@ -2178,10 +2207,13 @@ async def user_catalog_callback_handler(client, query):
         if index is not None:
             row = dict(categories[index])
             row["category_index"] = index
-            files = await db.list_category_files(row["category"], limit=20, offset=0)
+            offset = await get_saved_folder_offset(user.id, share_key, row["file_count"])
+            await save_folder_offset(user.id, share_key, offset)
+            files = await db.list_category_files(row["category"], limit=20, offset=offset)
+            page = offset // 20
             await message.edit_text(
-                folder_detail_text(row, files, 0, await get_member_group_id()),
-                reply_markup=folder_detail_keyboard(row, 0, len(files) == 20, added),
+                folder_detail_text(row, files, page, await get_member_group_id()),
+                reply_markup=folder_detail_keyboard(row, page, len(files) == 20, added),
                 disable_web_page_preview=True,
             )
         return
@@ -2198,12 +2230,15 @@ async def user_catalog_callback_handler(client, query):
             return
         row = dict(categories[index])
         row["category_index"] = index
-        files = await db.list_category_files(row["category"], limit=20, offset=0)
+        offset = await get_saved_folder_offset(user.id, action[2], row["file_count"])
+        await save_folder_offset(user.id, action[2], offset)
+        files = await db.list_category_files(row["category"], limit=20, offset=offset)
+        page = offset // 20
         await query.answer()
         await message.edit_text(
-            folder_detail_text(row, files, 0, await get_member_group_id()),
+            folder_detail_text(row, files, page, await get_member_group_id()),
             reply_markup=folder_detail_keyboard(
-                row, 0, len(files) == 20,
+                row, page, len(files) == 20,
                 await db.is_category_favorite(user.id, action[2])
             ),
             disable_web_page_preview=True,
