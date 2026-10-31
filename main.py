@@ -1252,8 +1252,6 @@ async def scanner_login_input_handler(client, message):
         return
     state = scanner_login_states.get(user.id)
     login_client = scanner_login_clients.get(user.id)
-    if not state or not login_client:
-        return
     value = (message.text or "").strip()
     if not value:
         return
@@ -1273,6 +1271,9 @@ async def scanner_login_input_handler(client, message):
                 await message.reply_text(f"✅ 目录已重命名：{old_name} → {value[:120]}")
             else:
                 await message.reply_text("❌ 重命名失败：新名称可能已存在，或名称无效。请重新发送新名称，或发送 /cancel 取消。")
+        return
+
+    if not state or not login_client:
         return
 
     if state["step"] == "phone":
