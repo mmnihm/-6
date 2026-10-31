@@ -384,6 +384,7 @@ def user_home_keyboard():
         [InlineKeyboardButton("📜 历史访问", callback_data="uc:history"),
          InlineKeyboardButton("🗂️ 文件夹列表", callback_data="uc:folders")],
         [InlineKeyboardButton("⭐ 收藏列表", callback_data="uc:favorites")],
+        [InlineKeyboardButton("🎲 随机探索", callback_data="uc:random")],
     ])
 
 
@@ -1718,6 +1719,21 @@ async def user_catalog_callback_handler(client, query):
             await user_home_text(user.id),
             reply_markup=user_home_keyboard(),
         )
+        return
+
+    if action[1] == "random":
+        _, _, total = await db.public_catalog(limit=1)
+        if not total:
+            await query.answer("资源库暂时没有可随机推荐的文件", show_alert=True)
+            return
+        rows, _, _ = await db.public_catalog(limit=1, offset=secrets.randbelow(total))
+        if not rows:
+            await query.answer("暂时没有找到可推荐的资源，请稍后重试", show_alert=True)
+            return
+        await query.answer("🎲 已为你随机挑选一份资源")
+        ok, result = await send_catalog_file(client, user.id, rows[0]["file_key"])
+        if not ok:
+            await message.reply_text(f"❌ 随机获取失败：{result}")
         return
 
     if action[1] == "folders":
