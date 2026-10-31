@@ -684,7 +684,11 @@ class Database:
         async with self.connect() as db:
             row = await (await db.execute("""
                 SELECT COUNT(*) AS messages,
-                       COUNT(DISTINCT category) AS folders,
+                       (SELECT COUNT(*) FROM (
+                           SELECT category FROM files
+                           UNION
+                           SELECT name AS category FROM categories
+                       )) AS folders,
                        SUM(CASE WHEN media_type IN ('photo', 'image') THEN 1 ELSE 0 END) AS images,
                        SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END) AS videos
                 FROM files
@@ -759,9 +763,70 @@ class Database:
                 LEFT JOIN categories ON categories.name=all_categories.category
                 GROUP BY all_categories.category, categories.description,
                          categories.created_at, categories.updated_at, categories.share_key
-                HAVING COUNT(files.file_key) > 0
                 ORDER BY lower(all_categories.category)
             """)).fetchall()
+
+    async def rename_category(self, old_name: str, new_name: str) -> bool:
+        old_name = str(old_name or "").strip()[:120]
+        new_name = str(new_name or "").strip()[:120]
+        if not old_name or not new_name or old_name == new_name:
+            return False
+        async with self.connect() as db:
+            exists = await (await db.execute(
+                "SELECT 1 FROM categories WHERE name=?", (new_name,)
+            )).fetchone()
+            file_exists = await (await db.execute(
+                "SELECT 1 FROM files WHERE category=? LIMIT 1", (new_name,)
+            )).fetchone()
+            if exists or file_exists:
+                return False
+            await db.execute(
+                "UPDATE files SET category=? WHERE category=?", (new_name, old_name)
+            )
+            current = await (await db.execute(
+                "SELECT name FROM categories WHERE name=?", (old_name,)
+            )).fetchone()
+            if current:
+                await db.execute(
+                    "UPDATE categories SET name=?, updated_at=? WHERE name=?",
+                    (new_name, iso_now(), old_name),
+                )
+            else:
+                await db.execute(
+                    "INSERT INTO categories(name, created_at, description, updated_at, share_key) "
+                    "VALUES(?, ?, '', ?, ?)",
+                    (new_name, iso_now(), iso_now(),
+                     secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
+                )
+            await db.commit()
+            return True
+
+    async def delete_empty_category(self, name: str) -> bool:
+        name = str(name or "").strip()
+        if not name:
+            return False
+        async with self.connect() as db:
+            has_files = await (await db.execute(
+                "SELECT 1 FROM files WHERE category=? LIMIT 1", (name,)
+            )).fetchone()
+            if has_files:
+                return False
+            row = await (await db.execute(
+                "SELECT share_key FROM categories WHERE name=?", (name,)
+            )).fetchone()
+            if not row:
+                return False
+            share_key = row["share_key"]
+            if share_key:
+                await db.execute(
+                    "DELETE FROM category_favorites WHERE share_key=?", (share_key,)
+                )
+                await db.execute(
+                    "DELETE FROM category_delivery_progress WHERE share_key=?", (share_key,)
+                )
+            await db.execute("DELETE FROM categories WHERE name=?", (name,))
+            await db.commit()
+            return True
 
     async def get_category_by_share_key(self, share_key):
         async with self.connect() as db:
