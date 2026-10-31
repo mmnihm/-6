@@ -771,7 +771,10 @@ async def directory_export_upload_handler(client, message):
     status = await message.reply_text("⏳ 已收到文件，正在检查是否为 Cangku 目录迁移 JSON…")
     document = message.document
     if not document or not (document.file_name or "").lower().endswith(".json"):
-        await status.delete()
+        try:
+            await status.delete()
+        except Exception:
+            pass
         await upload_handler(client, message)
         return
     local_path = None
