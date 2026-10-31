@@ -27,6 +27,7 @@ log = logging.getLogger("member-cloud")
 db = Database(config.DATABASE_PATH, database_url=config.DATABASE_URL)
 BOT_USERNAME = None
 BOT_ID = None
+telegram_http_session = None
 pending_channel_bindings = {}
 scanner_login_states = {}
 scanner_login_clients = {}
@@ -36,6 +37,7 @@ pending_home_button_actions = {}
 directory_import_running = False
 cangku_backup_in_progress = set()
 category_delivery_in_progress = set()
+search_sessions = {}
 
 
 def admin_keyboard():
@@ -73,11 +75,12 @@ async def get_member_group_id():
 async def telegram_bot_api(method: str, payload: dict):
     """Call Telegram Bot API directly, avoiding Pyrogram user-peer cache lookups."""
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/{method}"
-    timeout = aiohttp.ClientTimeout(total=12)
+    session = telegram_http_session
+    if session is None or session.closed:
+        raise RuntimeError("Telegram HTTP session is not initialized")
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload) as response:
-                data = await response.json(content_type=None)
+        async with session.post(url, json=payload) as response:
+            data = await response.json(content_type=None)
     except Exception as exc:
         # Do not include the request URL: it contains the bot token.
         raise RuntimeError(
@@ -266,6 +269,25 @@ def folder_detail_text(category_row, files, page, member_group_id):
     return "\n".join(body)
 
 
+async def get_saved_folder_offset(user_id, share_key, file_count):
+    key = f"folder_view:{int(user_id)}:{share_key}"
+    try:
+        offset = max(0, int(await db.get_setting(key) or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    total = max(0, int(file_count or 0))
+    if total <= 0:
+        return 0
+    return min((offset // 20) * 20, ((total - 1) // 20) * 20)
+
+
+async def save_folder_offset(user_id, share_key, offset):
+    await db.set_setting(
+        f"folder_view:{int(user_id)}:{share_key}",
+        str(max(0, (int(offset) // 20) * 20)),
+    )
+
+
 def folder_detail_keyboard(category_row, page, has_next, is_favorite):
     share_key = str(category_row["share_key"] or "")
     rows = []
@@ -397,7 +419,8 @@ async def reply_admin_only(message):
 
 
 DEFAULT_HOME_BUTTONS = [
-    {"key": "history", "text": "📜 历史访问", "type": "action", "enabled": True},
+    {"key": "search", "text": "🔎 搜索资源", "type": "action", "enabled": True},
+    {"key": "history", "text": "🕘 最近获取", "type": "action", "enabled": True},
     {"key": "folders", "text": "🗂️ 文件夹列表", "type": "action", "enabled": True},
     {"key": "favorites", "text": "⭐ 收藏列表", "type": "action", "enabled": True},
     {"key": "random", "text": "🎲 随机探索", "type": "action", "enabled": True},
@@ -596,9 +619,11 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch):
     next_offset = offset
     primary_channel_id, backup_channel_id = await get_storage_channels()
     prepared = []
+    records = await db.get_files_by_keys(item["file_key"] for item in batch)
+    records_by_key = {row["file_key"]: row for row in records}
 
     for item in batch:
-        record = await db.get_file(item["file_key"])
+        record = records_by_key.get(item["file_key"])
         if not record:
             prepared.append((item, None, None, None))
             continue
@@ -659,9 +684,10 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch):
                 )
             if not isinstance(copied_messages, list) or len(copied_messages) != len(run_ids):
                 raise RuntimeError("Telegram batch copy returned an unexpected message count")
+            successful_keys = []
             for position in range(index, end):
                 current_item, current_record, _, _ = prepared[position]
-                await db.record_history(user_id, current_item["file_key"])
+                successful_keys.append(current_item["file_key"])
                 if str(current_record["source_fingerprint"] or "").startswith("cangku:"):
                     backup_id = int(current_record["backup_message_id"] or 0)
                     if backup_channel_id and backup_id <= 0:
@@ -671,9 +697,10 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch):
                             asyncio.create_task(cache_cangku_backup(
                                 client, current_item["file_key"], int(parts[1]), int(parts[2])
                             ))
-                sent += 1
-                next_offset = offset + position + 1
-                await db.set_category_delivery_progress(user_id, share_key, next_offset)
+            await db.record_history_batch(user_id, successful_keys)
+            sent += len(successful_keys)
+            next_offset = offset + end
+            await db.set_category_delivery_progress(user_id, share_key, next_offset)
             index = end
         except Exception as exc:
             log.warning(
@@ -1891,6 +1918,70 @@ async def admin_handler(client, message):
     )
 
 
+async def build_favorites_view(user_id):
+    files = await db.list_favorites(user_id, 12)
+    folders = await db.list_favorite_categories(user_id, 20)
+    rows = []
+    sections = ["⭐ 我的收藏"]
+    if files:
+        sections.extend(["", "📄 收藏的文件"])
+        for item in files:
+            rows.append([
+                InlineKeyboardButton(
+                    f"📄 {item['file_name'][:30]}",
+                    callback_data=f"uc:open:{item['file_key']}",
+                ),
+                InlineKeyboardButton(
+                    "取消⭐",
+                    callback_data=f"uc:star:{item['file_key']}:favorites",
+                ),
+            ])
+    if folders:
+        sections.extend(["", "📁 收藏的文件夹"])
+        for item in folders:
+            rows.append([InlineKeyboardButton(
+                f"📁 {item['name'][:32]}",
+                callback_data=f"uc:folderlink:{item['share_key']}",
+            )])
+    if not files and not folders:
+        sections.extend(["", "你还没有收藏文件或文件夹。"])
+    rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
+    return "\n".join(sections), InlineKeyboardMarkup(rows)
+
+
+@app.on_message(filters.private & filters.command("search"))
+async def catalog_search_handler(client, message):
+    user = message.from_user
+    if not user or not await has_access(user.id):
+        await message.reply_text("⛔ 仅限会员群成员使用。")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply_text("请输入搜索关键词，例如：/search 电影")
+        return
+    query_text = parts[1].strip()[:80]
+    token = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]
+    if len(search_sessions) >= 500:
+        search_sessions.pop(next(iter(search_sessions)))
+    search_sessions[token] = {"user_id": int(user.id), "query": query_text}
+    records, _, total = await db.public_catalog(query=query_text, limit=12, offset=0)
+    buttons = [[InlineKeyboardButton(
+        f"📄 {row['file_name'][:32]}",
+        callback_data=f"uc:open:{row['file_key']}",
+    )] for row in records]
+    if total > 12:
+        buttons.append([InlineKeyboardButton(
+            "下一页 ➡️", callback_data=f"uc:searchpage:{token}:12"
+        )])
+    buttons.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
+    await message.reply_text(
+        f"🔎 搜索：{query_text}\n共找到 {total} 个资源（最多每页12个）\n\n"
+        + ("\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
+           if records else "没有找到匹配资源。"),
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
 @app.on_callback_query(filters.regex(r"^uc:"))
 async def user_catalog_callback_handler(client, query):
     user = query.from_user
@@ -1970,6 +2061,53 @@ async def user_catalog_callback_handler(client, query):
             )
         return
 
+    if action[1] == "search":
+        await query.answer()
+        await message.reply_text(
+            "🔎 资源搜索\\n\\n请发送：/search 关键词\\n例如：/search 电影"
+        )
+        return
+
+    if action[1] == "searchpage" and len(action) == 4:
+        token = action[2]
+        try:
+            offset = max(0, int(action[3]))
+        except ValueError:
+            await query.answer("页码无效", show_alert=True)
+            return
+        session = search_sessions.get(token)
+        if not session or int(session["user_id"]) != int(user.id):
+            await query.answer("搜索已过期，请重新发送 /search 关键词", show_alert=True)
+            return
+        search_query = session["query"]
+        records, _, total = await db.public_catalog(
+            query=search_query, limit=12, offset=offset
+        )
+        buttons = [[InlineKeyboardButton(
+            f"📄 {row['file_name'][:32]}",
+            callback_data=f"uc:open:{row['file_key']}",
+        )] for row in records]
+        nav = []
+        if offset > 0:
+            nav.append(InlineKeyboardButton(
+                "⬅️ 上一页", callback_data=f"uc:searchpage:{token}:{max(0, offset - 12)}"
+            ))
+        if offset + 12 < total:
+            nav.append(InlineKeyboardButton(
+                "下一页 ➡️", callback_data=f"uc:searchpage:{token}:{offset + 12}"
+            ))
+        if nav:
+            buttons.append(nav)
+        buttons.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
+        await query.answer()
+        await message.edit_text(
+            f"🔎 搜索：{search_query}\n共找到 {total} 个资源（第 {offset // 12 + 1} 页）\n\n"
+            + ("\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
+               if records else "没有找到匹配资源。"),
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
     if action[1] == "folders":
         await query.answer()
         page = int(action[2]) if len(action) > 2 else 0
@@ -1979,7 +2117,7 @@ async def user_catalog_callback_handler(client, query):
         rows = [
             [InlineKeyboardButton(
                 f"🗂 {row['category']}（{row['file_count']}）",
-                callback_data=f"uc:folder:{start_at + index}:0",
+                callback_data=f"uc:folderresume:{start_at + index}",
             )]
             for index, row in enumerate(selected)
         ]
@@ -1998,16 +2136,26 @@ async def user_catalog_callback_handler(client, query):
         )
         return
 
-    if action[1] == "folder" and len(action) >= 3:
+    if action[1] in ("folder", "folderresume") and len(action) >= 3:
         try:
             index = int(action[2])
-            offset = max(0, int(action[3])) if len(action) > 3 else 0
             categories = await db.list_categories()
             category_row = categories[index]
             category = category_row["category"]
+            if action[1] == "folderresume":
+                offset = await get_saved_folder_offset(
+                    user.id, category_row["share_key"], category_row["file_count"]
+                )
+            else:
+                offset = max(0, int(action[3])) if len(action) > 3 else 0
+                offset = min(
+                    (offset // 20) * 20,
+                    max(0, ((int(category_row["file_count"] or 0) - 1) // 20) * 20),
+                )
         except (ValueError, IndexError):
             await query.answer("分类已更新，请重新打开列表", show_alert=True)
             return
+        await save_folder_offset(user.id, category_row["share_key"], offset)
         await query.answer()
         files = await db.list_category_files(category, limit=20, offset=offset)
         page = offset // 20
@@ -2028,28 +2176,19 @@ async def user_catalog_callback_handler(client, query):
         await query.answer()
         if action[1] == "history":
             records = await db.list_user_history(user.id, 12)
-            title = "📜 历史访问"
             rows = [[InlineKeyboardButton(
                 f"📄 {row['file_name'][:32]}",
                 callback_data=f"uc:open:{row['file_key']}",
             )] for row in records]
-            body = title + "\n\n" + (
+            body = "🕘 最近获取\n\n" + (
                 "\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
-                if records else "这里暂时没有记录。"
+                if records else "你还没有获取过资源。"
             )
+            rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
+            await message.edit_text(body, reply_markup=InlineKeyboardMarkup(rows))
         else:
-            records = await db.list_favorite_categories(user.id, 30)
-            title = "⭐ 已收藏的文件夹"
-            rows = [[InlineKeyboardButton(
-                f"📁 {row['name'][:32]}",
-                callback_data=f"uc:folderlink:{row['share_key']}",
-            )] for row in records]
-            body = title + "\n\n" + (
-                "\n".join(f"• {row['name']}" for row in records)
-                if records else "你还没有收藏文件夹。"
-            )
-        rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
-        await message.edit_text(body, reply_markup=InlineKeyboardMarkup(rows))
+            body, markup = await build_favorites_view(user.id)
+            await message.edit_text(body, reply_markup=markup)
         return
 
     if action[1] == "folderstar" and len(action) == 3:
@@ -2065,10 +2204,13 @@ async def user_catalog_callback_handler(client, query):
         if index is not None:
             row = dict(categories[index])
             row["category_index"] = index
-            files = await db.list_category_files(row["category"], limit=20, offset=0)
+            offset = await get_saved_folder_offset(user.id, share_key, row["file_count"])
+            await save_folder_offset(user.id, share_key, offset)
+            files = await db.list_category_files(row["category"], limit=20, offset=offset)
+            page = offset // 20
             await message.edit_text(
-                folder_detail_text(row, files, 0, await get_member_group_id()),
-                reply_markup=folder_detail_keyboard(row, 0, len(files) == 20, added),
+                folder_detail_text(row, files, page, await get_member_group_id()),
+                reply_markup=folder_detail_keyboard(row, page, len(files) == 20, added),
                 disable_web_page_preview=True,
             )
         return
@@ -2085,12 +2227,15 @@ async def user_catalog_callback_handler(client, query):
             return
         row = dict(categories[index])
         row["category_index"] = index
-        files = await db.list_category_files(row["category"], limit=20, offset=0)
+        offset = await get_saved_folder_offset(user.id, action[2], row["file_count"])
+        await save_folder_offset(user.id, action[2], offset)
+        files = await db.list_category_files(row["category"], limit=20, offset=offset)
+        page = offset // 20
         await query.answer()
         await message.edit_text(
-            folder_detail_text(row, files, 0, await get_member_group_id()),
+            folder_detail_text(row, files, page, await get_member_group_id()),
             reply_markup=folder_detail_keyboard(
-                row, 0, len(files) == 20,
+                row, page, len(files) == 20,
                 await db.is_category_favorite(user.id, action[2])
             ),
             disable_web_page_preview=True,
@@ -2159,25 +2304,8 @@ async def user_catalog_callback_handler(client, query):
         added = await db.toggle_favorite(user.id, action[2])
         await query.answer("⭐ 已加入收藏" if added else "已取消收藏")
         if len(action) > 3 and action[3] == "favorites":
-            records = await db.list_favorites(user.id, 12)
-            rows = []
-            for row in records:
-                rows.append([InlineKeyboardButton(
-                    f"📄 {row['file_name'][:32]}",
-                    callback_data=f"uc:open:{row['file_key']}",
-                )])
-                rows.append([InlineKeyboardButton(
-                    "⭐ 取消收藏",
-                    callback_data=f"uc:star:{row['file_key']}:favorites",
-                )])
-            rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
-            await message.edit_text(
-                "⭐ 收藏列表\n\n" + (
-                    "\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
-                    if records else "这里暂时没有收藏。"
-                ),
-                reply_markup=InlineKeyboardMarkup(rows),
-            )
+            body, markup = await build_favorites_view(user.id)
+            await message.edit_text(body, reply_markup=markup)
         return
 
 
@@ -2726,10 +2854,13 @@ async def broadcast_handler(client, message):
 
 
 async def main():
-    global BOT_USERNAME, BOT_ID
+    global BOT_USERNAME, BOT_ID, telegram_http_session
     await db.initialize()
     log.info("Database backend: %s", "PostgreSQL" if db.uses_postgres else "SQLite (local fallback)")
     await app.start()
+    telegram_http_session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=12, connect=5, sock_read=10)
+    )
     scanner_started = False
     runner = None
     backup_retry_task = None
@@ -2780,6 +2911,9 @@ async def main():
         if scanner is not None and scanner.is_connected:
             await scanner.stop()
         await app.stop()
+        if telegram_http_session is not None and not telegram_http_session.closed:
+            await telegram_http_session.close()
+        await db.close()
 
 
 if __name__ == "__main__":
