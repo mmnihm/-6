@@ -616,40 +616,19 @@ async def send_catalog_file(client, user_id, file_key):
     return True, "文件已发送。"
 
 
-async def try_send_catalog_album(client, user_id, source_chat_id, group):
-    """Send compatible source media as one Telegram album; return False when unsupported."""
+async def try_send_catalog_album(client, user_id, group):
+    """Build one album from compatible media, even when source files are in different channels."""
     if len(group) < 2 or len(group) > 10:
         return False
 
-    media_kind = []
-    for item, record, message_id in group:
-        kind = str(record["media_type"] or "").lower()
-        if kind in ("photo", "video"):
-            media_kind.append("visual")
-        elif kind == "document":
-            media_kind.append("document")
-        elif kind == "audio":
-            media_kind.append("audio")
-        else:
-            return False
-    if len(set(media_kind)) != 1:
-        return False
-
-    messages = await client.get_messages(
-        source_chat_id, message_ids=[entry[2] for entry in group]
-    )
-    if not isinstance(messages, (list, tuple)):
-        messages = [messages]
-    by_id = {int(message.id): message for message in messages if message}
-    if len(by_id) != len(group):
-        return False
-
     media = []
-    for item, record, message_id in group:
-        message = by_id.get(int(message_id))
-        if not message:
-            return False
+    for item, record, source_chat_id, source_message_id in group:
         kind = str(record["media_type"] or "").lower()
+        message = await client.get_messages(
+            source_chat_id, message_ids=source_message_id
+        )
+        if not message or getattr(message, "empty", False):
+            return False
         source_media = getattr(message, kind, None)
         if not source_media or not getattr(source_media, "file_id", None):
             return False
@@ -670,38 +649,32 @@ async def try_send_catalog_album(client, user_id, source_chat_id, group):
 
 
 async def send_catalog_batch(client, user_id, share_key, offset, batch):
-    """Deliver up to 20 files in albums where possible; skip failed files and continue."""
+    """Group compatible media across the whole batch; skip failures and keep going."""
     sent = failed = 0
     next_offset = offset
     primary_channel_id, backup_channel_id = await get_storage_channels()
-    prepared = []
     records = await db.get_files_by_keys(item["file_key"] for item in batch)
     records_by_key = {row["file_key"]: row for row in records}
 
-    for item in batch:
+    prepared = []
+    for index, item in enumerate(batch):
         record = records_by_key.get(item["file_key"])
-        if not record:
-            prepared.append((item, None, None, None))
-            continue
-        fingerprint = str(record["source_fingerprint"] or "")
-        if fingerprint.startswith("cangku:"):
-            parts = fingerprint.split(":", 2)
-            if len(parts) != 3:
-                prepared.append((item, record, None, None))
-                continue
-            source_chat_id = int(parts[1])
-            source_message_id = int(parts[2])
-            backup_message_id = int(record["backup_message_id"] or 0)
-            if backup_channel_id and backup_message_id > 0:
-                source = (int(backup_channel_id), backup_message_id)
-            else:
-                source = (source_chat_id, source_message_id)
-        else:
-            source = (
-                (int(primary_channel_id), int(record["primary_message_id"]))
-                if primary_channel_id and record["primary_message_id"] else None
-            )
-        prepared.append((item, record, source[0] if source else None, source[1] if source else None))
+        source_chat_id = source_message_id = None
+        if record:
+            fingerprint = str(record["source_fingerprint"] or "")
+            if fingerprint.startswith("cangku:"):
+                parts = fingerprint.split(":", 2)
+                if len(parts) == 3:
+                    source_chat_id = int(parts[1])
+                    source_message_id = int(parts[2])
+                    backup_id = int(record["backup_message_id"] or 0)
+                    if backup_channel_id and backup_id > 0:
+                        source_chat_id = int(backup_channel_id)
+                        source_message_id = backup_id
+            elif primary_channel_id and record["primary_message_id"]:
+                source_chat_id = int(primary_channel_id)
+                source_message_id = int(record["primary_message_id"])
+        prepared.append((index, item, record, source_chat_id, source_message_id))
 
     def album_kind(record):
         if not record:
@@ -713,105 +686,64 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch):
             return kind
         return None
 
-    index = 0
-    while index < len(prepared):
-        item, record, source_chat_id, source_message_id = prepared[index]
-        if not record or source_chat_id is None or source_message_id is None:
-            ok, error_text = await send_catalog_file(client, user_id, item["file_key"])
-            if ok:
-                sent += 1
-                await db.record_history(user_id, item["file_key"])
+    # Collect by Telegram-compatible media type, not by adjacency or source channel.
+    buckets = {"visual": [], "document": [], "audio": []}
+    units = []
+    for entry in prepared:
+        kind = album_kind(entry[2])
+        if kind and entry[3] is not None and entry[4] is not None:
+            buckets[kind].append(entry)
+        else:
+            units.append([entry])
+
+    for entries in buckets.values():
+        for position in range(0, len(entries), 10):
+            chunk = entries[position:position + 10]
+            if len(chunk) >= 2:
+                units.append(chunk)
             else:
-                failed += 1
-                log.warning(
-                    "Skipping unavailable file: user=%s file=%s reason=%s",
-                    user_id, item["file_key"], error_text,
-                )
-            next_offset = offset + index + 1
-            await db.set_category_delivery_progress(user_id, share_key, next_offset)
-            index += 1
-            continue
+                units.extend([[entry] for entry in chunk])
 
-        kind = album_kind(record)
-        end = index + 1
-        group = [(item, record, source_message_id)]
-        while end < len(prepared):
-            next_item, next_record, next_chat_id, next_message_id = prepared[end]
-            if (not next_record or next_chat_id != source_chat_id
-                    or next_message_id is None or not kind
-                    or album_kind(next_record) != kind or len(group) >= 10):
-                break
-            group.append((next_item, next_record, next_message_id))
-            end += 1
+    units.sort(key=lambda unit: unit[0][0])
+    completed = set()
 
-        album_sent = False
-        if len(group) >= 2:
+    async def advance_progress():
+        nonlocal next_offset
+        while next_offset - offset in completed:
+            next_offset += 1
+        await db.set_category_delivery_progress(user_id, share_key, next_offset)
+
+    for unit in units:
+        is_album = len(unit) >= 2
+        delivered = False
+        if is_album:
+            album_entries = [
+                (entry[1], entry[2], entry[3], entry[4]) for entry in unit
+            ]
             try:
-                album_sent = await try_send_catalog_album(
-                    client, user_id, source_chat_id, group
+                delivered = await try_send_catalog_album(
+                    client, user_id, album_entries
                 )
             except Exception as exc:
                 log.warning(
-                    "Album delivery unavailable; falling back to Telegram copy: "
-                    "user=%s source=%s count=%s error=%s",
-                    user_id, source_chat_id, len(group), str(exc)[:250],
+                    "Grouped media send failed; falling back to individual files: "
+                    "user=%s count=%s error=%s",
+                    user_id, len(unit), str(exc)[:250],
                 )
 
-        if album_sent:
-            successful_keys = [entry[0]["file_key"] for entry in group]
-            await db.record_history_batch(user_id, successful_keys)
-            sent += len(successful_keys)
-            next_offset = offset + end
-            await db.set_category_delivery_progress(user_id, share_key, next_offset)
-            index = end
+        if delivered:
+            keys = [entry[1]["file_key"] for entry in unit]
+            await db.record_history_batch(user_id, keys)
+            sent += len(unit)
+            completed.update(entry[0] for entry in unit)
+            await advance_progress()
             continue
 
-        # Keep Telegram's server-side copy path as the compatibility fallback.
-        run_end = end
-        run_ids = [entry[2] for entry in group]
-        if len(run_ids) == 1:
-            try:
-                copied = await telegram_bot_api(
-                    "copyMessage",
-                    {"chat_id": user_id, "from_chat_id": source_chat_id, "message_id": run_ids[0]},
-                )
-                copied_messages = [copied]
-            except Exception:
-                copied_messages = None
-        else:
-            try:
-                copied_messages = await telegram_bot_api(
-                    "copyMessages",
-                    {"chat_id": user_id, "from_chat_id": source_chat_id, "message_ids": run_ids},
-                )
-            except Exception:
-                copied_messages = None
-
-        if isinstance(copied_messages, list) and len(copied_messages) == len(run_ids):
-            successful_keys = [entry[0]["file_key"] for entry in group]
-            await db.record_history_batch(user_id, successful_keys)
-            sent += len(successful_keys)
-            next_offset = offset + run_end
-            await db.set_category_delivery_progress(user_id, share_key, next_offset)
-            for current_item, current_record, _ in group:
-                if str(current_record["source_fingerprint"] or "").startswith("cangku:"):
-                    backup_id = int(current_record["backup_message_id"] or 0)
-                    if backup_channel_id and backup_id <= 0:
-                        parts = str(current_record["source_fingerprint"]).split(":", 2)
-                        if len(parts) == 3 and current_item["file_key"] not in cangku_backup_in_progress:
-                            cangku_backup_in_progress.add(current_item["file_key"])
-                            asyncio.create_task(cache_cangku_backup(
-                                client, current_item["file_key"], int(parts[1]), int(parts[2])
-                            ))
-            index = run_end
-            continue
-
-        # If album and copyMessages both fail, try files individually.
-        # A failed file is skipped; later files in this batch are still attempted.
-        for position in range(index, run_end):
-            current_item = prepared[position][0]
+        # Single files and failed albums use the existing reliable copy path.
+        for entry in unit:
+            position, item = entry[0], entry[1]
             ok, error_text = await send_catalog_file(
-                client, user_id, current_item["file_key"]
+                client, user_id, item["file_key"]
             )
             if ok:
                 sent += 1
@@ -820,11 +752,10 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch):
                 log.warning(
                     "Skipping failed file: user=%s share_key=%s offset=%s file=%s reason=%s",
                     user_id, share_key, offset + position,
-                    current_item["file_key"], error_text,
+                    item["file_key"], error_text,
                 )
-            next_offset = offset + position + 1
-            await db.set_category_delivery_progress(user_id, share_key, next_offset)
-        index = run_end
+            completed.add(position)
+            await advance_progress()
 
     return sent, failed, next_offset
 
