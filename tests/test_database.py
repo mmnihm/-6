@@ -153,11 +153,17 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             0,
         )
 
-    async def test_empty_categories_are_hidden_until_they_contain_files(self):
+    async def test_empty_categories_are_visible_to_members(self):
         await self.db.save_category("空目录")
         await self.db.save_category("有资源的目录")
         categories = await self.db.list_categories()
-        self.assertEqual([row["category"] for row in categories], [])
+        self.assertEqual(
+            [row["category"] for row in categories],
+            ["有资源的目录", "空目录"],
+        )
+        empty = next(row for row in categories if row["category"] == "空目录")
+        self.assertEqual(empty["file_count"], 0)
+        self.assertTrue(empty["share_key"])
 
         await self.db.add_file(
             "visible-folder-file", 101, "sample.mp4", "video", 11, 22,
@@ -166,8 +172,23 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         categories = await self.db.list_categories()
         self.assertEqual(
             [row["category"] for row in categories],
-            ["有资源的目录"],
+            ["有资源的目录", "空目录"],
         )
+
+    async def test_rename_category_keeps_files_and_empty_delete_is_safe(self):
+        await self.db.save_category("待改名")
+        await self.db.add_file(
+            "rename-folder-file", 101, "sample.mp4", "video", 11, 22,
+            "待改名"
+        )
+        self.assertTrue(await self.db.rename_category("待改名", "新目录"))
+        record = await self.db.get_file("rename-folder-file")
+        self.assertEqual(record["category"], "新目录")
+        self.assertFalse(await self.db.delete_empty_category("新目录"))
+
+        await self.db.save_category("待删除空目录")
+        self.assertTrue(await self.db.delete_empty_category("待删除空目录"))
+        self.assertFalse(await self.db.delete_empty_category("待删除空目录"))
 
     async def test_catalog_stats_and_member_history(self):
         await self.db.add_file('history001', 101, 'movie.mp4', 'video', 11, 22, '电影')
