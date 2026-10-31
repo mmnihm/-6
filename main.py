@@ -322,6 +322,12 @@ def folder_detail_keyboard(category_row, page, has_next, is_favorite):
 
 def parse_category(message) -> str:
     caption = (message.caption or "").strip()
+    # Prefer the first hashtag as the directory name (for example, #动漫).
+    for token in caption.split():
+        if token.startswith("#"):
+            category = token[1:].strip("，,。.!！?？:：;；()（）[]【】{}")
+            if category:
+                return category[:40]
     first = caption.splitlines()[0].strip() if caption else ""
     if first.startswith("分类:") or first.startswith("分类："):
         return first[3:].strip()[:40] or "未分类"
@@ -394,6 +400,10 @@ async def run_history_scan(primary_channel_id, backup_channel_id):
                 else:
                     await db.advance_scan_cursor(channel_id, item.id)
             await db.mark_scan_completed(channel_id)
+
+        cleaned_categories = await db.cleanup_empty_categories()
+        if cleaned_categories:
+            log.info("Removed %s empty categories after history scan", cleaned_categories)
 
         primary_progress = await db.get_scan_progress(primary_channel_id)
         backup_progress = await db.get_scan_progress(backup_channel_id)
@@ -1031,6 +1041,10 @@ async def directory_import_confirm_handler(client, message):
                     pass
             if index % 100 == 0:
                 await asyncio.sleep(0.05)
+
+        cleaned_categories = await db.cleanup_empty_categories()
+        if cleaned_categories:
+            log.info("Removed %s empty categories after directory import", cleaned_categories)
 
         if failed == 0:
             pending_directory_imports.pop(user.id, None)
