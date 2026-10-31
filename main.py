@@ -2064,10 +2064,7 @@ async def user_catalog_callback_handler(client, query):
     if action[1] == "search":
         await query.answer()
         await message.reply_text(
-            "🔎 资源搜索
-
-请发送：/search 关键词
-例如：/search 电影"
+            "🔎 资源搜索\\n\\n请发送：/search 关键词\\n例如：/search 电影"
         )
         return
 
