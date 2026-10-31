@@ -42,7 +42,13 @@ class PostgresCompat:
         return statement
 
     async def execute(self, sql, params=()):
-        return await self.connection.execute(self.adapt_sql(sql), params or ())
+        statement = self.adapt_sql(sql)
+        # psycopg treats every percent sign as placeholder syntax when even
+        # an empty parameter tuple is supplied. Queries without parameters
+        # may legitimately contain LIKE patterns such as '%.jpg'.
+        if params:
+            return await self.connection.execute(statement, params)
+        return await self.connection.execute(statement)
 
     async def executemany(self, sql, params):
         async with self.connection.cursor() as cursor:
