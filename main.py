@@ -387,8 +387,8 @@ def user_home_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📜 历史访问", callback_data="uc:history"),
          InlineKeyboardButton("🗂️ 文件夹列表", callback_data="uc:folders")],
-        [InlineKeyboardButton("⭐ 收藏列表", callback_data="uc:favorites")],
-        [InlineKeyboardButton("🎲 随机探索", callback_data="uc:random")],
+        [InlineKeyboardButton("⭐ 收藏列表", callback_data="uc:favorites"),
+         InlineKeyboardButton("🎲 随机探索", callback_data="uc:random")],
     ])
 
 
