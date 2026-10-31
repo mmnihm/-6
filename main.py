@@ -1110,17 +1110,16 @@ async def upload_handler(client, message):
         if not BOT_USERNAME:
             BOT_USERNAME = (await client.get_me()).username
         link = share_url(key)
-        if backup_error:
+            await db.enqueue_backup_retry(
+                key, primary_channel_id, primary_id, backup_channel_id,
+                f"{type(backup_error).__name__}: {str(backup_error)[:400]}",
+            )
             await status.edit_text(
                 "⚠️ 文件已保存到主频道，分享链接已生成；备份频道暂未成功，系统会保留主副本。\n"
                 f"📂 分类：{category}\n📄 文件：{file_name}\n\n"
                 f"🔗 分享链接：\n{link}\n\n"
                 f"备份原因：{type(backup_error).__name__}: {str(backup_error)[:250]}",
                 disable_web_page_preview=True,
-            )
-            await db.enqueue_backup_retry(
-                key, primary_channel_id, primary_id, backup_channel_id,
-                f"{type(backup_error).__name__}: {str(backup_error)[:400]}",
             )
         else:
             await status.edit_text(
