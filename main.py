@@ -995,8 +995,11 @@ async def backup_retry_worker(client):
     while True:
         try:
             jobs = await db.list_due_backup_retries(limit=10)
-            for job in jobs:
-                file_key = str(job["file_key"])
+            for pending_job in jobs:
+                file_key = str(pending_job["file_key"])
+                job = await db.claim_backup_retry(file_key, lease_seconds=300)
+                if not job:
+                    continue
                 try:
                     record = await db.get_file(file_key)
                     if not record or int(record["backup_message_id"] or 0) > 0:
