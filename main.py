@@ -415,11 +415,19 @@ async def get_home_buttons():
             log.warning("Invalid home_buttons setting; restoring default buttons")
     if buttons is None:
         buttons = [dict(item) for item in DEFAULT_HOME_BUTTONS]
-    # Keep built-in actions available after upgrades, including random exploration.
-    known = {str(item.get("key")) for item in buttons}
-    for item in DEFAULT_HOME_BUTTONS:
-        if item["key"] not in known:
-            buttons.append(dict(item))
+    # Keep every built-in action available after upgrades.
+    by_key = {str(item.get("key")): item for item in buttons}
+    for default in DEFAULT_HOME_BUTTONS:
+        current = by_key.get(default["key"])
+        if current is None:
+            buttons.append(dict(default))
+            continue
+        # Random exploration must remain visible and usable; old saved settings
+        # may contain a stale disabled entry from an earlier broken menu.
+        if default["key"] == "random":
+            current["text"] = default["text"]
+            current["type"] = "action"
+            current["enabled"] = True
     return buttons
 
 
@@ -1794,6 +1802,29 @@ async def storage_status_handler(client, message):
         f"主存储频道：{primary or '未绑定'}\n"
         f"备份存储频道：{backup or '未绑定'}\n\n"
         "绑定命令：/bindgroup、/bindmain、/bindbackup"
+    )
+
+
+@app.on_message(filters.private & filters.command("directories"))
+async def admin_directories_command(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    categories = await db.list_categories()
+    rows = [[InlineKeyboardButton("➕ 新建目录", callback_data="mc:dirnew")]]
+    for index, row in enumerate(categories[:20]):
+        rows.append([InlineKeyboardButton(
+            f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
+            callback_data=f"mc:directory:{index}",
+        )])
+    if len(categories) > 20:
+        rows.append([InlineKeyboardButton("下一页 ➡️", callback_data="mc:directories:1")])
+    rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
+    await message.reply_text(
+        f"📁 目录管理（共 {len(categories)} 个）\\n\\n"
+        "可以新建空目录、修改目录名称；只有空目录可以删除。",
+        reply_markup=InlineKeyboardMarkup(rows),
     )
 
 
