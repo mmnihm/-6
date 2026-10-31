@@ -196,6 +196,44 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             ["有资源的目录", "空目录"],
         )
 
+    async def test_cleanup_empty_categories_removes_related_user_state(self):
+        await self.db.save_category("待清理空目录")
+        folder = next(
+            row for row in await self.db.list_categories()
+            if row["category"] == "待清理空目录"
+        )
+        share_key = folder["share_key"]
+        async with self.db.connect() as connection:
+            await connection.execute(
+                "INSERT INTO category_favorites(user_id, share_key, created_at) "
+                "VALUES(303, ?, ?)",
+                (share_key, "2026-10-31T00:00:00+00:00"),
+            )
+            await connection.execute(
+                "INSERT INTO category_delivery_progress(user_id, share_key, next_offset, updated_at) "
+                "VALUES(303, ?, 20, ?)",
+                (share_key, "2026-10-31T00:00:00+00:00"),
+            )
+            await connection.commit()
+
+        self.assertEqual(await self.db.cleanup_empty_categories(), 1)
+        self.assertEqual(await self.db.cleanup_empty_categories(), 0)
+        async with self.db.connect() as connection:
+            favorites = await (await connection.execute(
+                "SELECT COUNT(*) AS count FROM category_favorites WHERE share_key=?",
+                (share_key,),
+            )).fetchone()
+            progress = await (await connection.execute(
+                "SELECT COUNT(*) AS count FROM category_delivery_progress WHERE share_key=?",
+                (share_key,),
+            )).fetchone()
+        self.assertEqual(favorites["count"], 0)
+        self.assertEqual(progress["count"], 0)
+        self.assertNotIn(
+            "待清理空目录",
+            [row["category"] for row in await self.db.list_categories()],
+        )
+
     async def test_folder_media_stats_include_document_backed_media(self):
         samples = [
             ("stat-photo", "photo.jpg", "document"),
