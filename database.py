@@ -802,8 +802,34 @@ class Database:
                            UNION
                            SELECT name AS category FROM categories
                        )) AS folders,
-                       SUM(CASE WHEN media_type IN ('photo', 'image') THEN 1 ELSE 0 END) AS images,
-                       SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END) AS videos
+                       SUM(CASE WHEN lower(media_type) IN ('photo', 'image')
+                           OR (lower(media_type)='document' AND (
+                               lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
+                               OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
+                               OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
+                               OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
+                               OR lower(file_name) LIKE '%.tiff'
+                           )) THEN 1 ELSE 0 END) AS images,
+                       SUM(CASE WHEN lower(media_type)='video'
+                           OR (lower(media_type)='document' AND (
+                               lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
+                               OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
+                               OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
+                               OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
+                               OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
+                               OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
+                           )) THEN 1 ELSE 0 END) AS videos,
+                       SUM(CASE WHEN lower(media_type)='animation'
+                           OR (lower(media_type)='document' AND (
+                               lower(file_name) LIKE '%.gif' OR lower(file_name) LIKE '%.apng'
+                           )) THEN 1 ELSE 0 END) AS animations,
+                       SUM(CASE WHEN lower(media_type) IN ('audio', 'voice')
+                           OR (lower(media_type)='document' AND (
+                               lower(file_name) LIKE '%.mp3' OR lower(file_name) LIKE '%.m4a'
+                               OR lower(file_name) LIKE '%.aac' OR lower(file_name) LIKE '%.flac'
+                               OR lower(file_name) LIKE '%.wav' OR lower(file_name) LIKE '%.ogg'
+                               OR lower(file_name) LIKE '%.opus' OR lower(file_name) LIKE '%.wma'
+                           )) THEN 1 ELSE 0 END) AS audios
                 FROM files
             """)).fetchone()
             return {
@@ -811,6 +837,8 @@ class Database:
                 "messages": int(row["messages"] or 0),
                 "images": int(row["images"] or 0),
                 "videos": int(row["videos"] or 0),
+                "animations": int(row["animations"] or 0),
+                "audios": int(row["audios"] or 0),
             }
 
     async def save_category(self, name: str, description="", created_at=None):
@@ -858,8 +886,53 @@ class Database:
             return await (await db.execute("""
                 SELECT all_categories.category,
                        COUNT(files.file_key) AS file_count,
-                       SUM(CASE WHEN lower(files.media_type) IN ('photo', 'image') THEN 1 ELSE 0 END) AS image_count,
-                       SUM(CASE WHEN lower(files.media_type) = 'video' THEN 1 ELSE 0 END) AS video_count,
+                       SUM(CASE WHEN lower(files.media_type) IN ('photo', 'image')
+                           OR (lower(files.media_type)='document' AND (
+                               lower(files.file_name) LIKE '%.jpg' OR lower(files.file_name) LIKE '%.jpeg'
+                               OR lower(files.file_name) LIKE '%.png' OR lower(files.file_name) LIKE '%.webp'
+                               OR lower(files.file_name) LIKE '%.bmp' OR lower(files.file_name) LIKE '%.heic'
+                               OR lower(files.file_name) LIKE '%.heif' OR lower(files.file_name) LIKE '%.tif'
+                               OR lower(files.file_name) LIKE '%.tiff'
+                           )) THEN 1 ELSE 0 END) AS image_count,
+                       SUM(CASE WHEN lower(files.media_type)='video'
+                           OR (lower(files.media_type)='document' AND (
+                               lower(files.file_name) LIKE '%.mp4' OR lower(files.file_name) LIKE '%.mkv'
+                               OR lower(files.file_name) LIKE '%.mov' OR lower(files.file_name) LIKE '%.avi'
+                               OR lower(files.file_name) LIKE '%.webm' OR lower(files.file_name) LIKE '%.m4v'
+                               OR lower(files.file_name) LIKE '%.mpeg' OR lower(files.file_name) LIKE '%.mpg'
+                               OR lower(files.file_name) LIKE '%.3gp' OR lower(files.file_name) LIKE '%.ts'
+                               OR lower(files.file_name) LIKE '%.wmv' OR lower(files.file_name) LIKE '%.flv'
+                           )) THEN 1 ELSE 0 END) AS video_count,
+                       SUM(CASE WHEN lower(files.media_type)='animation'
+                           OR (lower(files.media_type)='document' AND (
+                               lower(files.file_name) LIKE '%.gif' OR lower(files.file_name) LIKE '%.apng'
+                           )) THEN 1 ELSE 0 END) AS animation_count,
+                       SUM(CASE WHEN lower(files.media_type) IN ('audio', 'voice')
+                           OR (lower(files.media_type)='document' AND (
+                               lower(files.file_name) LIKE '%.mp3' OR lower(files.file_name) LIKE '%.m4a'
+                               OR lower(files.file_name) LIKE '%.aac' OR lower(files.file_name) LIKE '%.flac'
+                               OR lower(files.file_name) LIKE '%.wav' OR lower(files.file_name) LIKE '%.ogg'
+                               OR lower(files.file_name) LIKE '%.opus' OR lower(files.file_name) LIKE '%.wma'
+                           )) THEN 1 ELSE 0 END) AS audio_count,
+                       SUM(CASE WHEN lower(files.media_type)='document'
+                           AND NOT (
+                               lower(files.file_name) LIKE '%.jpg' OR lower(files.file_name) LIKE '%.jpeg'
+                               OR lower(files.file_name) LIKE '%.png' OR lower(files.file_name) LIKE '%.webp'
+                               OR lower(files.file_name) LIKE '%.bmp' OR lower(files.file_name) LIKE '%.heic'
+                               OR lower(files.file_name) LIKE '%.heif' OR lower(files.file_name) LIKE '%.tif'
+                               OR lower(files.file_name) LIKE '%.tiff'
+                               OR lower(files.file_name) LIKE '%.mp4' OR lower(files.file_name) LIKE '%.mkv'
+                               OR lower(files.file_name) LIKE '%.mov' OR lower(files.file_name) LIKE '%.avi'
+                               OR lower(files.file_name) LIKE '%.webm' OR lower(files.file_name) LIKE '%.m4v'
+                               OR lower(files.file_name) LIKE '%.mpeg' OR lower(files.file_name) LIKE '%.mpg'
+                               OR lower(files.file_name) LIKE '%.3gp' OR lower(files.file_name) LIKE '%.ts'
+                               OR lower(files.file_name) LIKE '%.wmv' OR lower(files.file_name) LIKE '%.flv'
+                               OR lower(files.file_name) LIKE '%.gif' OR lower(files.file_name) LIKE '%.apng'
+                               OR lower(files.file_name) LIKE '%.mp3' OR lower(files.file_name) LIKE '%.m4a'
+                               OR lower(files.file_name) LIKE '%.aac' OR lower(files.file_name) LIKE '%.flac'
+                               OR lower(files.file_name) LIKE '%.wav' OR lower(files.file_name) LIKE '%.ogg'
+                               OR lower(files.file_name) LIKE '%.opus' OR lower(files.file_name) LIKE '%.wma'
+                           ) THEN 1 ELSE 0 END) AS document_count,
                        SUM(COALESCE(files.file_size, 0)) AS total_size,
                        SUM(CASE WHEN COALESCE(files.file_size, 0) > 0 THEN 1 ELSE 0 END) AS sized_count,
                        COALESCE(categories.description, '') AS description,
