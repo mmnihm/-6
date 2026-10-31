@@ -1909,7 +1909,7 @@ async def user_catalog_callback_handler(client, query):
                 except Exception as exc:
                     log.exception(
                         "Random delivery failed: user=%s file=%s",
-                        user.id, item.get("file_key"),
+                        user.id, item["file_key"],
                     )
                     failed.append(
                         f"{item['file_name'][:40]}：{type(exc).__name__}"
@@ -1917,8 +1917,8 @@ async def user_catalog_callback_handler(client, query):
 
             summary = f"🎲 随机发送完成：成功 {sent}/{len(rows)} 个文件。"
             if failed:
-                summary += "\\n\\n失败 " + str(len(failed)) + " 个：\\n"
-                summary += "\\n".join(failed[:5])
+                summary += "\n\n失败 " + str(len(failed)) + " 个：\n"
+                summary += "\n".join(failed[:5])
             await message.reply_text(summary)
         except Exception:
             log.exception("Random exploration failed for user %s", user.id)
