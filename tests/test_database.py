@@ -190,6 +190,15 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.db.delete_empty_category("待删除空目录"))
         self.assertFalse(await self.db.delete_empty_category("待删除空目录"))
 
+    async def test_bulk_file_lookup_and_history(self):
+        await self.db.add_file("bulk001", 101, "one.mp4", "video", 11, 22, "电影")
+        await self.db.add_file("bulk002", 101, "two.mp4", "video", 12, 23, "电影")
+        rows = await self.db.get_files_by_keys(["bulk001", "bulk002", "bulk001", "missing"])
+        self.assertEqual({row["file_key"] for row in rows}, {"bulk001", "bulk002"})
+        await self.db.record_history_batch(303, ["bulk001", "bulk002", "bulk001"])
+        history = await self.db.list_user_history(303, 10)
+        self.assertEqual({row["file_key"] for row in history}, {"bulk001", "bulk002"})
+
     async def test_catalog_stats_and_member_history(self):
         await self.db.add_file('history001', 101, 'movie.mp4', 'video', 11, 22, '电影')
         stats = await self.db.catalog_stats()
