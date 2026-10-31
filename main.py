@@ -752,7 +752,11 @@ async def start_handler(client, message):
     )
 
 
-@app.on_message(filters.private & filters.document)
+@app.on_message(
+    filters.private
+    & (filters.document | filters.video | filters.audio | filters.photo |
+       filters.animation | filters.voice)
+)
 async def directory_export_upload_handler(client, message):
     """Receive an admin's Cangku JSON export and prepare a safe preview."""
     user = message.from_user
@@ -767,7 +771,8 @@ async def directory_export_upload_handler(client, message):
     status = await message.reply_text("⏳ 已收到文件，正在检查是否为 Cangku 目录迁移 JSON…")
     document = message.document
     if not document or not (document.file_name or "").lower().endswith(".json"):
-        await status.edit_text("⚠️ 已收到文件，但文件名不是 .json。请发送 Cangku 导出的原始 JSON 文件。")
+        await status.delete()
+        await upload_handler(client, message)
         return
     local_path = None
     try:
@@ -978,11 +983,6 @@ async def directory_import_confirm_handler(client, message):
         directory_import_running = False
 
 
-@app.on_message(
-    filters.private
-    & (filters.document | filters.video | filters.audio | filters.photo |
-       filters.animation | filters.voice)
-)
 async def retry_missing_backup(client, file_key, primary_channel_id, primary_message_id, backup_channel_id):
     """Retry a missing backup without risking the already-published primary copy."""
     try:
@@ -1066,9 +1066,12 @@ async def upload_handler(client, message):
 
         step = "写入文件数据库"
         key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
+        media_object = getattr(message, media_type, None)
+        file_size = int(getattr(media_object, "file_size", 0) or 0)
         inserted = await db.add_file(
             key, user.id, file_name, media_type,
-            primary_id, backup_id, category, source_fingerprint
+            primary_id, backup_id, category, source_fingerprint,
+            file_size=file_size,
         )
         if not inserted:
             await status.edit_text(f"⏭️ 已跳过重复文件：{file_name}\n数据库中已存在相同文件记录。")
