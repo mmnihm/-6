@@ -255,10 +255,12 @@ def folder_detail_text(category_row, files, page, member_group_id):
 
 def folder_detail_keyboard(category_row, page, has_next, is_favorite):
     share_key = str(category_row["share_key"] or "")
-    rows = [[InlineKeyboardButton(
-        "📥 获取本批资源（最多20个）",
-        callback_data=f"uc:getfolder:{share_key}:{page * 20}",
-    )]]
+    rows = []
+    if int(category_row["file_count"] or 0) > 0:
+        rows.append([InlineKeyboardButton(
+            "📥 获取本批资源（最多20个）",
+            callback_data=f"uc:getfolder:{share_key}:{page * 20}",
+        )])
     rows.append([InlineKeyboardButton(
         "⭐ 取消收藏目录" if is_favorite else "⭐ 收藏目录",
         callback_data=f"uc:folderstar:{share_key}",
@@ -1270,7 +1272,7 @@ async def scanner_login_input_handler(client, message):
                 pending_category_actions.pop(user.id, None)
                 await message.reply_text(f"✅ 目录已重命名：{old_name} → {value[:120]}")
             else:
-                await message.reply_text("❌ 重命名失败：新名称可能已存在，或名称无效。请重新发送新名称，或发送 /cancel 取消。")
+                await message.reply_text("❌ 重命名失败：新名称可能已存在，或名称无效。请重新发送新的名称。")
         return
 
     if not state or not login_client:
@@ -2021,17 +2023,28 @@ async def admin_callback_handler(client, query):
                 lines.append(f"{row['user_id']} — {label}")
             body = "👥 手动会员列表\n" + "\n".join(lines) + "\n\n授权：/grant 用户ID 天数|永久\n取消：/revoke 用户ID"
         await message.edit_text(body, reply_markup=back_keyboard())
-    elif action == "directories":
+    elif action == "directories" or action.startswith("directories:"):
         categories = await db.list_categories()
+        page = int(action.split(":", 1)[1]) if ":" in action else 0
+        page = max(0, page)
+        start_at = page * 20
+        selected = categories[start_at:start_at + 20]
         rows = [[InlineKeyboardButton("➕ 新建目录", callback_data="mc:dirnew")]]
-        for index, row in enumerate(categories):
+        for index, row in enumerate(selected, start_at):
             rows.append([InlineKeyboardButton(
                 f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
                 callback_data=f"mc:directory:{index}",
             )])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"mc:directories:{page - 1}"))
+        if start_at + 20 < len(categories):
+            nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"mc:directories:{page + 1}"))
+        if nav:
+            rows.append(nav)
         rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
         await message.edit_text(
-            f"📁 目录管理（{len(categories)} 个）\n\n"
+            f"📁 目录管理（共 {len(categories)} 个，第 {page + 1} 页）\n\n"
             "空目录也会立即显示给会员。选择目录可修改名称；只有空目录可以删除。",
             reply_markup=InlineKeyboardMarkup(rows),
         )
