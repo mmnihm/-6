@@ -322,11 +322,14 @@ def folder_detail_keyboard(category_row, page, has_next, is_favorite):
 
 def parse_category(message) -> str:
     caption = (message.caption or "").strip()
-    # Prefer the first hashtag as the directory name (for example, #动漫).
+    # Only Chinese-only hashtags become automatic directory names.
     for token in caption.split():
         if token.startswith("#"):
             category = token[1:].strip("，,。.!！?？:：;；()（）[]【】{}")
-            if category:
+            if category and all(
+                "\u3400" <= char <= "\u4dbf" or "\u4e00" <= char <= "\u9fff"
+                for char in category
+            ):
                 return category[:40]
     first = caption.splitlines()[0].strip() if caption else ""
     if first.startswith("分类:") or first.startswith("分类："):
