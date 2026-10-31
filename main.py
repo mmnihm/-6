@@ -34,6 +34,7 @@ pending_category_actions = {}
 pending_home_button_actions = {}
 directory_import_running = False
 cangku_backup_in_progress = set()
+category_delivery_in_progress = set()
 
 
 def admin_keyboard():
@@ -2071,35 +2072,43 @@ async def user_catalog_callback_handler(client, query):
         if not category:
             await query.answer("文件夹不存在", show_alert=True)
             return
-        total = next((int(row["file_count"] or 0) for row in await db.list_categories()
-                      if row["share_key"] == share_key), 0)
-        saved_offset = await db.get_category_delivery_progress(user.id, share_key)
-        # A stale button must never make a user receive already-delivered batches again.
-        offset = max(offset, saved_offset)
-        batch = await db.list_category_files(category["name"], limit=20, offset=offset)
-        if not batch:
-            await query.answer("这个目录的资源已经领取完毕", show_alert=True)
+        delivery_key = (int(user.id), str(share_key))
+        if delivery_key in category_delivery_in_progress:
+            await query.answer("这一批资源正在发送，请稍候，不要重复点击。", show_alert=True)
             return
-        await query.answer("开始批量发送，最多20个文件")
-        progress = await message.reply_text(
-            f"📥 正在批量获取「{category['name']}」第 {offset // 20 + 1} 组资源（最多20个）…"
-        )
-        sent, failed, next_offset = await send_catalog_batch(
-            client, user.id, share_key, offset, batch
-        )
-        text_result = (
-            f"📦 本组发送完成\n\n成功：{sent} 个\n失败：{failed} 个\n"
-            f"已记录领取进度：{next_offset}/{total}"
-        )
-        buttons = []
-        if next_offset < total:
-            buttons.append([InlineKeyboardButton(
-                "📥 获取下一组（最多20个）" if failed == 0 else "🔄 重试未发送文件",
-                callback_data=f"uc:getfolder:{share_key}:{next_offset}",
-            )])
-        buttons.append([InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")])
-        await progress.edit_text(text_result, reply_markup=InlineKeyboardMarkup(buttons))
-        return
+        category_delivery_in_progress.add(delivery_key)
+        try:
+            total = next((int(row["file_count"] or 0) for row in await db.list_categories()
+                          if row["share_key"] == share_key), 0)
+            saved_offset = await db.get_category_delivery_progress(user.id, share_key)
+            # A stale button must never make a user receive already-delivered batches again.
+            offset = max(offset, saved_offset)
+            batch = await db.list_category_files(category["name"], limit=20, offset=offset)
+            if not batch:
+                await query.answer("这个目录的资源已经领取完毕", show_alert=True)
+                return
+            await query.answer("开始批量发送，最多20个文件")
+            progress = await message.reply_text(
+                f"📥 正在批量获取「{category['name']}」第 {offset // 20 + 1} 组资源（最多20个）…"
+            )
+            sent, failed, next_offset = await send_catalog_batch(
+                client, user.id, share_key, offset, batch
+            )
+            text_result = (
+                f"📦 本组发送完成\n\n成功：{sent} 个\n失败：{failed} 个\n"
+                f"已记录领取进度：{next_offset}/{total}"
+            )
+            buttons = []
+            if next_offset < total:
+                buttons.append([InlineKeyboardButton(
+                    "📥 获取下一组（最多20个）" if failed == 0 else "🔄 重试未发送文件",
+                    callback_data=f"uc:getfolder:{share_key}:{next_offset}",
+                )])
+            buttons.append([InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")])
+            await progress.edit_text(text_result, reply_markup=InlineKeyboardMarkup(buttons))
+            return
+        finally:
+            category_delivery_in_progress.discard(delivery_key)
 
     if action[1] == "open" and len(action) == 3:
         ok, result = await send_catalog_file(client, user.id, action[2])
