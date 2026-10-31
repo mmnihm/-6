@@ -2383,7 +2383,7 @@ async def user_catalog_callback_handler(client, query):
             buttons = []
             if next_offset < total:
                 buttons.append([InlineKeyboardButton(
-                    "📥 获取下一组（最多20个）" if failed == 0 else "🔄 重试未发送文件",
+                    "📥 获取下一组（最多20个）",
                     callback_data=f"uc:getfolder:{share_key}:{next_offset}",
                 )])
             buttons.append([InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")])
