@@ -759,6 +759,7 @@ class Database:
                 LEFT JOIN categories ON categories.name=all_categories.category
                 GROUP BY all_categories.category, categories.description,
                          categories.created_at, categories.updated_at, categories.share_key
+                HAVING COUNT(files.file_key) > 0
                 ORDER BY lower(all_categories.category)
             """)).fetchall()
 
