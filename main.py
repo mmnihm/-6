@@ -1868,18 +1868,63 @@ async def user_catalog_callback_handler(client, query):
         return
 
     if action[1] == "random":
-        _, _, total = await db.public_catalog(limit=1)
-        if not total:
-            await query.answer("资源库暂时没有可随机推荐的文件", show_alert=True)
-            return
-        rows, _, _ = await db.public_catalog(limit=1, offset=secrets.randbelow(total))
-        if not rows:
-            await query.answer("暂时没有找到可推荐的资源，请稍后重试", show_alert=True)
-            return
-        await query.answer("🎲 已为你随机挑选一份资源")
-        ok, result = await send_catalog_file(client, user.id, rows[0]["file_key"])
-        if not ok:
-            await message.reply_text(f"❌ 随机获取失败：{result}")
+        # Acknowledge the button immediately; database and Telegram delivery
+        # must not leave the user's callback spinner hanging.
+        await query.answer("🎲 正在为你随机发送最多 20 个文件")
+        try:
+            if not await has_access(user.id):
+                await message.reply_text("⛔ 仅限会员群成员使用。")
+                return
+            _, _, total = await db.public_catalog(limit=1)
+            if not total:
+                await message.reply_text("📭 资源库暂时没有可随机发送的文件。")
+                return
+
+            batch_size = min(20, int(total))
+            start = secrets.randbelow(int(total))
+            rows, _, _ = await db.public_catalog(
+                limit=min(batch_size, int(total) - start), offset=start
+            )
+            if len(rows) < batch_size:
+                extra, _, _ = await db.public_catalog(
+                    limit=batch_size - len(rows), offset=0
+                )
+                rows.extend(extra)
+
+            if not rows:
+                await message.reply_text("📭 暂时没有找到可发送的资源，请稍后重试。")
+                return
+
+            sent = 0
+            failed = []
+            for item in rows:
+                try:
+                    ok, result = await send_catalog_file(
+                        client, user.id, item["file_key"]
+                    )
+                    if ok:
+                        sent += 1
+                    else:
+                        failed.append(f"{item['file_name'][:40]}：{result}")
+                except Exception as exc:
+                    log.exception(
+                        "Random delivery failed: user=%s file=%s",
+                        user.id, item.get("file_key"),
+                    )
+                    failed.append(
+                        f"{item['file_name'][:40]}：{type(exc).__name__}"
+                    )
+
+            summary = f"🎲 随机发送完成：成功 {sent}/{len(rows)} 个文件。"
+            if failed:
+                summary += "\\n\\n失败 " + str(len(failed)) + " 个：\\n"
+                summary += "\\n".join(failed[:5])
+            await message.reply_text(summary)
+        except Exception:
+            log.exception("Random exploration failed for user %s", user.id)
+            await message.reply_text(
+                "❌ 随机发送失败，请稍后重试；管理员可检查机器人运行日志。"
+            )
         return
 
     if action[1] == "folders":
