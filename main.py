@@ -990,21 +990,42 @@ async def directory_import_confirm_handler(client, message):
         directory_import_running = False
 
 
-async def retry_missing_backup(client, file_key, primary_channel_id, primary_message_id, backup_channel_id):
-    """Retry a missing backup without risking the already-published primary copy."""
-    try:
-        record = await db.get_file(file_key)
-        if not record or int(record["backup_message_id"] or 0) > 0:
-            return
-        copied = await client.copy_message(
-            chat_id=backup_channel_id,
-            from_chat_id=primary_channel_id,
-            message_id=primary_message_id,
-        )
-        if await db.update_backup_message_id(file_key, copied.id):
-            log.info("Backup copy completed for file %s (message %s)", file_key, copied.id)
-    except Exception:
-        log.exception("Automatic backup retry failed for file %s", file_key)
+async def backup_retry_worker(client):
+    """Resume durable backup jobs after restarts, with bounded exponential backoff."""
+    while True:
+        try:
+            jobs = await db.list_due_backup_retries(limit=10)
+            for job in jobs:
+                file_key = str(job["file_key"])
+                try:
+                    record = await db.get_file(file_key)
+                    if not record or int(record["backup_message_id"] or 0) > 0:
+                        await db.complete_backup_retry(file_key)
+                        continue
+                    copied = await client.copy_message(
+                        chat_id=int(job["backup_channel_id"]),
+                        from_chat_id=int(job["primary_channel_id"]),
+                        message_id=int(job["primary_message_id"]),
+                    )
+                    updated = await db.update_backup_message_id(file_key, copied.id)
+                    if not updated:
+                        latest = await db.get_file(file_key)
+                        if not latest or int(latest["backup_message_id"] or 0) <= 0:
+                            raise RuntimeError("Backup copy succeeded but database update was not confirmed")
+                    await db.complete_backup_retry(file_key)
+                    log.info(
+                        "Durable backup retry completed for file %s (message %s)",
+                        file_key, copied.id,
+                    )
+                except Exception as exc:
+                    await db.fail_backup_retry(file_key, f"{type(exc).__name__}: {str(exc)[:400]}")
+                    log.exception("Durable backup retry failed for file %s", file_key)
+                await asyncio.sleep(0.3)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Backup retry worker cycle failed")
+        await asyncio.sleep(15)
 
 
 async def upload_handler(client, message):
@@ -1097,7 +1118,10 @@ async def upload_handler(client, message):
                 f"备份原因：{type(backup_error).__name__}: {str(backup_error)[:250]}",
                 disable_web_page_preview=True,
             )
-            asyncio.create_task(retry_missing_backup(client, key, primary_channel_id, primary_id, backup_channel_id))
+            await db.enqueue_backup_retry(
+                key, primary_channel_id, primary_id, backup_channel_id,
+                f"{type(backup_error).__name__}: {str(backup_error)[:400]}",
+            )
         else:
             await status.edit_text(
                 "✅ 双频道保存成功\n"
@@ -2699,6 +2723,7 @@ async def main():
     await app.start()
     scanner_started = False
     runner = None
+    backup_retry_task = None
     try:
         global scanner
         if scanner is not None:
@@ -2724,6 +2749,9 @@ async def main():
         BOT_ID = me.id
         log.info("Bot started: @%s", me.username)
 
+        backup_retry_task = asyncio.create_task(backup_retry_worker(app))
+        log.info("Durable backup retry worker started")
+
         runner = web.AppRunner(create_catalog_app(db, lambda: BOT_USERNAME))
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", config.WEB_PORT)
@@ -2732,6 +2760,12 @@ async def main():
 
         await asyncio.Event().wait()
     finally:
+        if backup_retry_task is not None:
+            backup_retry_task.cancel()
+            try:
+                await backup_retry_task
+            except asyncio.CancelledError:
+                pass
         if runner is not None:
             await runner.cleanup()
         if scanner is not None and scanner.is_connected:
