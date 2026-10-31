@@ -649,6 +649,24 @@ class Database:
                 LIMIT ?
             """, (iso_now(), max(1, min(50, int(limit)))))).fetchall()
 
+    async def claim_backup_retry(self, file_key, lease_seconds=300):
+        """Atomically lease one due job so concurrent workers cannot copy it together."""
+        now = utc_now()
+        lease_until = (now + timedelta(seconds=max(60, int(lease_seconds)))).isoformat()
+        async with self.connect() as db:
+            result = await db.execute("""
+                UPDATE backup_retry_jobs
+                SET next_retry_at=?, updated_at=?
+                WHERE file_key=? AND next_retry_at<=?
+            """, (lease_until, iso_now(), file_key, iso_now()))
+            if getattr(result, "rowcount", 0) != 1:
+                return None
+            row = await (await db.execute(
+                "SELECT * FROM backup_retry_jobs WHERE file_key=?", (file_key,)
+            )).fetchone()
+            await db.commit()
+            return row
+
     async def fail_backup_retry(self, file_key, error=""):
         async with self.connect() as db:
             row = await (await db.execute(
