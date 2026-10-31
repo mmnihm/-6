@@ -27,6 +27,7 @@ log = logging.getLogger("member-cloud")
 db = Database(config.DATABASE_PATH, database_url=config.DATABASE_URL)
 BOT_USERNAME = None
 BOT_ID = None
+telegram_http_session = None
 pending_channel_bindings = {}
 scanner_login_states = {}
 scanner_login_clients = {}
@@ -73,11 +74,12 @@ async def get_member_group_id():
 async def telegram_bot_api(method: str, payload: dict):
     """Call Telegram Bot API directly, avoiding Pyrogram user-peer cache lookups."""
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/{method}"
-    timeout = aiohttp.ClientTimeout(total=12)
+    session = telegram_http_session
+    if session is None or session.closed:
+        raise RuntimeError("Telegram HTTP session is not initialized")
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload) as response:
-                data = await response.json(content_type=None)
+        async with session.post(url, json=payload) as response:
+            data = await response.json(content_type=None)
     except Exception as exc:
         # Do not include the request URL: it contains the bot token.
         raise RuntimeError(
@@ -596,9 +598,11 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch):
     next_offset = offset
     primary_channel_id, backup_channel_id = await get_storage_channels()
     prepared = []
+    records = await db.get_files_by_keys(item["file_key"] for item in batch)
+    records_by_key = {row["file_key"]: row for row in records}
 
     for item in batch:
-        record = await db.get_file(item["file_key"])
+        record = records_by_key.get(item["file_key"])
         if not record:
             prepared.append((item, None, None, None))
             continue
@@ -659,9 +663,10 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch):
                 )
             if not isinstance(copied_messages, list) or len(copied_messages) != len(run_ids):
                 raise RuntimeError("Telegram batch copy returned an unexpected message count")
+            successful_keys = []
             for position in range(index, end):
                 current_item, current_record, _, _ = prepared[position]
-                await db.record_history(user_id, current_item["file_key"])
+                successful_keys.append(current_item["file_key"])
                 if str(current_record["source_fingerprint"] or "").startswith("cangku:"):
                     backup_id = int(current_record["backup_message_id"] or 0)
                     if backup_channel_id and backup_id <= 0:
@@ -671,9 +676,10 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch):
                             asyncio.create_task(cache_cangku_backup(
                                 client, current_item["file_key"], int(parts[1]), int(parts[2])
                             ))
-                sent += 1
-                next_offset = offset + position + 1
-                await db.set_category_delivery_progress(user_id, share_key, next_offset)
+            await db.record_history_batch(user_id, successful_keys)
+            sent += len(successful_keys)
+            next_offset = offset + end
+            await db.set_category_delivery_progress(user_id, share_key, next_offset)
             index = end
         except Exception as exc:
             log.warning(
@@ -2726,10 +2732,13 @@ async def broadcast_handler(client, message):
 
 
 async def main():
-    global BOT_USERNAME, BOT_ID
+    global BOT_USERNAME, BOT_ID, telegram_http_session
     await db.initialize()
     log.info("Database backend: %s", "PostgreSQL" if db.uses_postgres else "SQLite (local fallback)")
     await app.start()
+    telegram_http_session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=12, connect=5, sock_read=10)
+    )
     scanner_started = False
     runner = None
     backup_retry_task = None
@@ -2780,6 +2789,9 @@ async def main():
         if scanner is not None and scanner.is_connected:
             await scanner.stop()
         await app.stop()
+        if telegram_http_session is not None and not telegram_http_session.closed:
+            await telegram_http_session.close()
+        await db.close()
 
 
 if __name__ == "__main__":
