@@ -153,6 +153,22 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             0,
         )
 
+    async def test_empty_categories_are_hidden_until_they_contain_files(self):
+        await self.db.save_category("空目录")
+        await self.db.save_category("有资源的目录")
+        categories = await self.db.list_categories()
+        self.assertEqual([row["category"] for row in categories], [])
+
+        await self.db.add_file(
+            "visible-folder-file", 101, "sample.mp4", "video", 11, 22,
+            "有资源的目录"
+        )
+        categories = await self.db.list_categories()
+        self.assertEqual(
+            [row["category"] for row in categories],
+            ["有资源的目录"],
+        )
+
     async def test_catalog_stats_and_member_history(self):
         await self.db.add_file('history001', 101, 'movie.mp4', 'video', 11, 22, '电影')
         stats = await self.db.catalog_stats()
