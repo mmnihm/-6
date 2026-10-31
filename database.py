@@ -247,7 +247,8 @@ class Database:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(user_id, share_key)
             );
-        """        async with self.connect() as db:
+        """
+        async with self.connect() as db:
             if self.uses_postgres:
                 await db.executescript(schema)
                 columns = await (await db.execute(
