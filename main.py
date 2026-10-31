@@ -405,6 +405,8 @@ async def run_history_scan(primary_channel_id, backup_channel_id):
             await db.mark_scan_completed(channel_id)
 
         cleaned_categories = await db.cleanup_empty_categories()
+        # Materialize category rows and share keys for all categories found in scanned files.
+        await db.list_categories()
         if cleaned_categories:
             log.info("Removed %s empty categories after history scan", cleaned_categories)
 
@@ -1046,6 +1048,8 @@ async def directory_import_confirm_handler(client, message):
                 await asyncio.sleep(0.05)
 
         cleaned_categories = await db.cleanup_empty_categories()
+        # Materialize category rows and share keys for imported directories with files.
+        await db.list_categories()
         if cleaned_categories:
             log.info("Removed %s empty categories after directory import", cleaned_categories)
 
