@@ -2059,7 +2059,7 @@ async def admin_callback_handler(client, query):
         buttons.append([InlineKeyboardButton("⬅️ 返回目录管理", callback_data="mc:directories")])
         await message.edit_text(
             f"📁 目录：{row['category']}\n📦 文件数：{count}\n"
-            f"🔗 分享链接：{folder_share_url(str(row['share_key'])) if row['share_key'] else '暂不可用'}\n\n"
+            f"🔗 分享链接：{folder_share_url(str(row['share_key'])) if row['share_key'] and BOT_USERNAME else '机器人启动后可用'}\n\n"
             + ("这是空目录，可以删除。" if count == 0 else "目录含有资源，只能修改名称，不能删除资源。"),
             reply_markup=InlineKeyboardMarkup(buttons),
             disable_web_page_preview=True,
