@@ -37,6 +37,7 @@ pending_home_button_actions = {}
 directory_import_running = False
 cangku_backup_in_progress = set()
 category_delivery_in_progress = set()
+search_sessions = {}
 
 
 def admin_keyboard():
@@ -399,7 +400,8 @@ async def reply_admin_only(message):
 
 
 DEFAULT_HOME_BUTTONS = [
-    {"key": "history", "text": "📜 历史访问", "type": "action", "enabled": True},
+    {"key": "search", "text": "🔎 搜索资源", "type": "action", "enabled": True},
+    {"key": "history", "text": "🕘 最近获取", "type": "action", "enabled": True},
     {"key": "folders", "text": "🗂️ 文件夹列表", "type": "action", "enabled": True},
     {"key": "favorites", "text": "⭐ 收藏列表", "type": "action", "enabled": True},
     {"key": "random", "text": "🎲 随机探索", "type": "action", "enabled": True},
@@ -1897,6 +1899,70 @@ async def admin_handler(client, message):
     )
 
 
+async def build_favorites_view(user_id):
+    files = await db.list_favorites(user_id, 12)
+    folders = await db.list_favorite_categories(user_id, 20)
+    rows = []
+    sections = ["⭐ 我的收藏"]
+    if files:
+        sections.extend(["", "📄 收藏的文件"])
+        for item in files:
+            rows.append([
+                InlineKeyboardButton(
+                    f"📄 {item['file_name'][:30]}",
+                    callback_data=f"uc:open:{item['file_key']}",
+                ),
+                InlineKeyboardButton(
+                    "取消⭐",
+                    callback_data=f"uc:star:{item['file_key']}:favorites",
+                ),
+            ])
+    if folders:
+        sections.extend(["", "📁 收藏的文件夹"])
+        for item in folders:
+            rows.append([InlineKeyboardButton(
+                f"📁 {item['name'][:32]}",
+                callback_data=f"uc:folderlink:{item['share_key']}",
+            )])
+    if not files and not folders:
+        sections.extend(["", "你还没有收藏文件或文件夹。"])
+    rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
+    return "\n".join(sections), InlineKeyboardMarkup(rows)
+
+
+@app.on_message(filters.private & filters.command("search"))
+async def catalog_search_handler(client, message):
+    user = message.from_user
+    if not user or not await has_access(user.id):
+        await message.reply_text("⛔ 仅限会员群成员使用。")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply_text("请输入搜索关键词，例如：/search 电影")
+        return
+    query_text = parts[1].strip()[:80]
+    token = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]
+    if len(search_sessions) >= 500:
+        search_sessions.pop(next(iter(search_sessions)))
+    search_sessions[token] = {"user_id": int(user.id), "query": query_text}
+    records, _, total = await db.public_catalog(query=query_text, limit=12, offset=0)
+    buttons = [[InlineKeyboardButton(
+        f"📄 {row['file_name'][:32]}",
+        callback_data=f"uc:open:{row['file_key']}",
+    )] for row in records]
+    if total > 12:
+        buttons.append([InlineKeyboardButton(
+            "下一页 ➡️", callback_data=f"uc:searchpage:{token}:12"
+        )])
+    buttons.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
+    await message.reply_text(
+        f"🔎 搜索：{query_text}\n共找到 {total} 个资源（最多每页12个）\n\n"
+        + ("\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
+           if records else "没有找到匹配资源。"),
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
 @app.on_callback_query(filters.regex(r"^uc:"))
 async def user_catalog_callback_handler(client, query):
     user = query.from_user
@@ -1976,6 +2042,56 @@ async def user_catalog_callback_handler(client, query):
             )
         return
 
+    if action[1] == "search":
+        await query.answer()
+        await message.reply_text(
+            "🔎 资源搜索
+
+请发送：/search 关键词
+例如：/search 电影"
+        )
+        return
+
+    if action[1] == "searchpage" and len(action) == 4:
+        token = action[2]
+        try:
+            offset = max(0, int(action[3]))
+        except ValueError:
+            await query.answer("页码无效", show_alert=True)
+            return
+        session = search_sessions.get(token)
+        if not session or int(session["user_id"]) != int(user.id):
+            await query.answer("搜索已过期，请重新发送 /search 关键词", show_alert=True)
+            return
+        search_query = session["query"]
+        records, _, total = await db.public_catalog(
+            query=search_query, limit=12, offset=offset
+        )
+        buttons = [[InlineKeyboardButton(
+            f"📄 {row['file_name'][:32]}",
+            callback_data=f"uc:open:{row['file_key']}",
+        )] for row in records]
+        nav = []
+        if offset > 0:
+            nav.append(InlineKeyboardButton(
+                "⬅️ 上一页", callback_data=f"uc:searchpage:{token}:{max(0, offset - 12)}"
+            ))
+        if offset + 12 < total:
+            nav.append(InlineKeyboardButton(
+                "下一页 ➡️", callback_data=f"uc:searchpage:{token}:{offset + 12}"
+            ))
+        if nav:
+            buttons.append(nav)
+        buttons.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
+        await query.answer()
+        await message.edit_text(
+            f"🔎 搜索：{search_query}\n共找到 {total} 个资源（第 {offset // 12 + 1} 页）\n\n"
+            + ("\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
+               if records else "没有找到匹配资源。"),
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
     if action[1] == "folders":
         await query.answer()
         page = int(action[2]) if len(action) > 2 else 0
@@ -2034,28 +2150,19 @@ async def user_catalog_callback_handler(client, query):
         await query.answer()
         if action[1] == "history":
             records = await db.list_user_history(user.id, 12)
-            title = "📜 历史访问"
             rows = [[InlineKeyboardButton(
                 f"📄 {row['file_name'][:32]}",
                 callback_data=f"uc:open:{row['file_key']}",
             )] for row in records]
-            body = title + "\n\n" + (
+            body = "🕘 最近获取\n\n" + (
                 "\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
-                if records else "这里暂时没有记录。"
+                if records else "你还没有获取过资源。"
             )
+            rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
+            await message.edit_text(body, reply_markup=InlineKeyboardMarkup(rows))
         else:
-            records = await db.list_favorite_categories(user.id, 30)
-            title = "⭐ 已收藏的文件夹"
-            rows = [[InlineKeyboardButton(
-                f"📁 {row['name'][:32]}",
-                callback_data=f"uc:folderlink:{row['share_key']}",
-            )] for row in records]
-            body = title + "\n\n" + (
-                "\n".join(f"• {row['name']}" for row in records)
-                if records else "你还没有收藏文件夹。"
-            )
-        rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
-        await message.edit_text(body, reply_markup=InlineKeyboardMarkup(rows))
+            body, markup = await build_favorites_view(user.id)
+            await message.edit_text(body, reply_markup=markup)
         return
 
     if action[1] == "folderstar" and len(action) == 3:
@@ -2165,25 +2272,8 @@ async def user_catalog_callback_handler(client, query):
         added = await db.toggle_favorite(user.id, action[2])
         await query.answer("⭐ 已加入收藏" if added else "已取消收藏")
         if len(action) > 3 and action[3] == "favorites":
-            records = await db.list_favorites(user.id, 12)
-            rows = []
-            for row in records:
-                rows.append([InlineKeyboardButton(
-                    f"📄 {row['file_name'][:32]}",
-                    callback_data=f"uc:open:{row['file_key']}",
-                )])
-                rows.append([InlineKeyboardButton(
-                    "⭐ 取消收藏",
-                    callback_data=f"uc:star:{row['file_key']}:favorites",
-                )])
-            rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
-            await message.edit_text(
-                "⭐ 收藏列表\n\n" + (
-                    "\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
-                    if records else "这里暂时没有收藏。"
-                ),
-                reply_markup=InlineKeyboardMarkup(rows),
-            )
+            body, markup = await build_favorites_view(user.id)
+            await message.edit_text(body, reply_markup=markup)
         return
 
 
