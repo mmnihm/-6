@@ -26,6 +26,7 @@ logging.basicConfig(
 log = logging.getLogger("member-cloud")
 db = Database(config.DATABASE_PATH, database_url=config.DATABASE_URL)
 BOT_USERNAME = None
+BOT_ID = None
 pending_channel_bindings = {}
 scanner_login_states = {}
 scanner_login_clients = {}
@@ -142,10 +143,12 @@ async def get_membership_tier(user_id: int):
     try:
         # Match Cangku's proven approach: Bot API accepts numeric user IDs
         # directly and does not depend on Pyrogram's local Peer/access_hash cache.
-        bot_user = await app.get_me()
+        bot_id = BOT_ID
+        if not bot_id:
+            bot_id = (await app.get_me()).id
         bot_member = await telegram_bot_api(
             "getChatMember",
-            {"chat_id": group_id, "user_id": bot_user.id},
+            {"chat_id": group_id, "user_id": bot_id},
         )
         bot_status = str(bot_member.get("status", ""))
         if bot_status not in ("administrator", "creator"):
@@ -2690,7 +2693,7 @@ async def broadcast_handler(client, message):
 
 
 async def main():
-    global BOT_USERNAME
+    global BOT_USERNAME, BOT_ID
     await db.initialize()
     log.info("Database backend: %s", "PostgreSQL" if db.uses_postgres else "SQLite (local fallback)")
     await app.start()
@@ -2718,6 +2721,7 @@ async def main():
 
         me = await app.get_me()
         BOT_USERNAME = me.username
+        BOT_ID = me.id
         log.info("Bot started: @%s", me.username)
 
         runner = web.AppRunner(create_catalog_app(db, lambda: BOT_USERNAME))
