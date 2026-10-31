@@ -31,6 +31,27 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("file_name ILIKE %s", search_sql)
         self.assertIn("ORDER BY lower(category)", search_sql)
 
+    async def test_postgres_adapter_preserves_literal_percent_without_params(self):
+        class FakeConnection:
+            def __init__(self):
+                self.calls = []
+
+            async def execute(self, *args):
+                self.calls.append(args)
+                return "ok"
+
+        connection = FakeConnection()
+        adapter = PostgresCompat(connection)
+        await adapter.execute(
+            "SELECT * FROM files WHERE lower(file_name) LIKE '%.jpg'"
+        )
+        self.assertEqual(len(connection.calls), 1)
+        self.assertEqual(len(connection.calls[0]), 1)
+        self.assertIn("LIKE '%.jpg'", connection.calls[0][0])
+
+        await adapter.execute("SELECT * FROM files WHERE file_key=?", ("abc",))
+        self.assertEqual(connection.calls[1][1], ("abc",))
+
     async def test_only_one_first_admin_can_claim(self):
         self.assertTrue(await self.db.claim_first_admin(101))
         self.assertFalse(await self.db.claim_first_admin(202))
