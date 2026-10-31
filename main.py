@@ -192,7 +192,9 @@ async def has_access(user_id: int) -> bool:
 
 
 def media_details(message):
-    for kind in ("document", "video", "audio", "photo", "animation", "voice"):
+    # Telegram animations are document-backed internally; detect their
+    # dedicated field before the generic document field.
+    for kind in ("animation", "video", "audio", "photo", "voice", "document"):
         media = getattr(message, kind, None)
         if media:
             name = getattr(media, "file_name", None) or f"{kind}_{message.id}"
@@ -250,10 +252,13 @@ def folder_detail_text(category_row, files, page, member_group_id):
         body.extend(["", f"📝 {description}"])
     body.extend([
         "",
-        "📖 内容统计：",
-        f"　• 消息数：{int(category_row['file_count'] or 0)} 条",
-        f"　• 图片数：{int(category_row['image_count'] or 0)} 张",
-        f"　• 视频数：{int(category_row['video_count'] or 0)} 个",
+        "📖 内容统计（已入库资源）：",
+        f"　• 资源总数：{int(category_row['file_count'] or 0)} 个",
+        f"　• 🖼 图片：{int(category_row['image_count'] or 0)} 张",
+        f"　• 🎬 视频：{int(category_row['video_count'] or 0)} 个",
+        f"　• 🎞 动图：{int(category_row['animation_count'] or 0)} 个",
+        f"　• 🎵 音频/语音：{int(category_row['audio_count'] or 0)} 个",
+        f"　• 📄 文档：{int(category_row['document_count'] or 0)} 个",
         f"　• 总大小：{format_folder_size(category_row['total_size'])}（已统计 {int(category_row['sized_count'] or 0)}/{int(category_row['file_count'] or 0)} 个资源）",
         "",
         f"📅 创建时间：{format_folder_datetime(category_row['created_at'])}",

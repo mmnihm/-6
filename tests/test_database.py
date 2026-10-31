@@ -175,6 +175,38 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             ["有资源的目录", "空目录"],
         )
 
+    async def test_folder_media_stats_include_document_backed_media(self):
+        samples = [
+            ("stat-photo", "photo.jpg", "document"),
+            ("stat-video", "video.mp4", "document"),
+            ("stat-animation", "loop.gif", "animation"),
+            ("stat-audio", "track.mp3", "document"),
+            ("stat-pdf", "guide.pdf", "document"),
+            ("stat-native-video", "native-video", "video"),
+            ("stat-native-photo", "native-photo", "photo"),
+        ]
+        for index, (key, name, media_type) in enumerate(samples, start=1):
+            await self.db.add_file(
+                key, 101, name, media_type, index, index + 100, "统计测试"
+            )
+
+        folder = next(
+            row for row in await self.db.list_categories()
+            if row["category"] == "统计测试"
+        )
+        self.assertEqual(folder["file_count"], 7)
+        self.assertEqual(folder["image_count"], 2)
+        self.assertEqual(folder["video_count"], 2)
+        self.assertEqual(folder["animation_count"], 1)
+        self.assertEqual(folder["audio_count"], 1)
+        self.assertEqual(folder["document_count"], 1)
+
+        stats = await self.db.catalog_stats()
+        self.assertEqual(stats["images"], 2)
+        self.assertEqual(stats["videos"], 2)
+        self.assertEqual(stats["animations"], 1)
+        self.assertEqual(stats["audios"], 1)
+
     async def test_rename_category_keeps_files_and_empty_delete_is_safe(self):
         await self.db.save_category("待改名")
         await self.db.add_file(
