@@ -247,8 +247,7 @@ class Database:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(user_id, share_key)
             );
-        """
-        async with self.connect() as db:
+        """        async with self.connect() as db:
             if self.uses_postgres:
                 await db.executescript(schema)
                 columns = await (await db.execute(
@@ -497,8 +496,7 @@ class Database:
                 primary_id = primary["message_id"]
                 backup_id = backup["message_id"] if backup else 0
                 cur = await db.execute("""
-                    INSERT OR IGNORE INTO files(
-                        file_key, owner_id, file_name, media_type, category,
+                    INSERT OR IGNORE INTO files(                        file_key, owner_id, file_name, media_type, category,
                         primary_message_id, backup_message_id, created_at,
                         source_fingerprint
                     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -629,7 +627,7 @@ class Database:
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
         async with self.connect() as db:
             categories = await (await db.execute(
-                "SELECT DISTINCT category FROM files ORDER BY lower(category)"
+                "SELECT category FROM files GROUP BY category ORDER BY lower(category)"
             )).fetchall()
             total = (await (await db.execute(
                 "SELECT COUNT(*) AS n FROM files" + where, params
