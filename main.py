@@ -2230,6 +2230,8 @@ async def user_catalog_callback_handler(client, query):
         try:
             index = int(action[2])
             category_row = await db.get_category_by_index(index)
+            if not category_row:
+                raise IndexError("folder index no longer exists")
             category = category_row["category"]
             if action[1] == "folderresume":
                 offset = await get_saved_folder_offset(
