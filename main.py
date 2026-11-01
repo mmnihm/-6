@@ -12,6 +12,7 @@ from pyrogram import Client, filters
 from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio,
+    KeyboardButton, ReplyKeyboardMarkup,
 )
 from pyrogram.enums import ChatMemberStatus, ChatType
 from pyrogram.errors import (
@@ -45,6 +46,44 @@ directory_import_running = False
 cangku_backup_in_progress = set()
 category_delivery_in_progress = set()
 search_sessions = {}
+
+
+def admin_home_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📁 创建文件夹"), KeyboardButton("📋 文件夹列表")],
+            [KeyboardButton("📤 上传文件"), KeyboardButton("🛠 管理设置")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def upload_active_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("✅ 结束上传")],
+            [KeyboardButton("📋 文件夹列表"), KeyboardButton("🛠 管理设置")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+async def admin_home_text():
+    users, files, members, banned = await db.stats()
+    categories = await db.list_categories()
+    return (
+        "☁️ 网盘管理中心\n\n"
+        "欢迎使用文件管理后台\n"
+        "📁 创建和整理资源文件夹\n"
+        "📤 批量上传，结束后统一发布\n"
+        "📊 查看用户与资源统计\n\n"
+        f"👥 用户总数：{users}\n"
+        f"📁 文件夹数量：{len(categories)}\n"
+        f"📦 已发布资源：{files}\n\n"
+        "请选择要进行的操作。"
+    )
 
 
 def admin_keyboard():
@@ -832,6 +871,12 @@ async def start_handler(client, message):
 
     try:
         payload = message.command[1] if len(message.command) > 1 else ""
+        if await is_admin(user.id):
+            await message.reply_text(
+                await admin_home_text(),
+                reply_markup=admin_home_keyboard(),
+            )
+            return
         if payload.startswith("folder_"):
             if not await has_access(user.id):
                 await message.reply_text("⛔ 仅限会员群成员使用。请先加入会员群后重试。")
@@ -1193,8 +1238,16 @@ async def upload_handler(client, message):
         await message.reply_text("❌ 主存储频道和备份频道不能是同一个频道，请管理员检查 /storage。")
         return
 
-    selected_category = pending_upload_categories.get(user.id) if await is_admin(user.id) else None
+    active_batch = await db.get_upload_batch(user.id) if await is_admin(user.id) else None
+    selected_category = (
+        active_batch["category"] if active_batch
+        else pending_upload_categories.get(user.id) if await is_admin(user.id)
+        else None
+    )
     category = str(selected_category or parse_category(message))[:120]
+    if await is_admin(user.id) and selected_category:
+        if not active_batch:
+            await db.start_upload_batch(user.id, category)
     status = await message.reply_text("⏳ 正在检查频道权限并保存文件…")
     primary_id = None
     backup_id = 0
@@ -1243,12 +1296,20 @@ async def upload_handler(client, message):
         key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
         media_object = getattr(message, media_type, None)
         file_size = int(getattr(media_object, "file_size", 0) or 0)
-        inserted = await db.add_file(
-            key, user.id, file_name, media_type,
-            primary_id, backup_id, category, source_fingerprint,
-            file_size=file_size,
-        )
-        if inserted:
+        if await is_admin(user.id) and selected_category:
+            inserted = await db.stage_upload_batch_item(
+                key, user.id, file_name, media_type, category,
+                primary_channel_id, primary_id, backup_channel_id, backup_id,
+                source_fingerprint, file_size,
+                f"{type(backup_error).__name__}: {str(backup_error)[:400]}" if backup_error else "",
+            )
+        else:
+            inserted = await db.add_file(
+                key, user.id, file_name, media_type,
+                primary_id, backup_id, category, source_fingerprint,
+                file_size=file_size,
+            )
+        if inserted and not (await is_admin(user.id) and selected_category):
             category_catalog_cache["expires_at"] = 0
         if not inserted:
             log.info(
@@ -1259,6 +1320,15 @@ async def upload_handler(client, message):
                 await status.delete()
             except Exception:
                 log.debug("Could not delete duplicate-upload status message")
+            return
+
+        if await is_admin(user.id) and selected_category:
+            await status.edit_text(
+                "📥 文件已收到，暂未对会员发布。\n"
+                f"📂 上传目录：{category}\n📄 文件：{file_name}\n\n"
+                "可以继续发送文件；全部发送完毕后，点击下方「✅ 结束上传」。",
+                reply_markup=upload_active_keyboard(),
+            )
             return
 
         step = "生成分享链接"
@@ -1531,6 +1601,46 @@ async def scanner_login_input_handler(client, message):
     login_client = scanner_login_clients.get(user.id)
     value = (message.text or "").strip()
     if not value:
+        return
+
+    if value == "✅ 结束上传":
+        result = await db.publish_upload_batch(user.id)
+        pending_upload_categories.pop(user.id, None)
+        category_catalog_cache["expires_at"] = 0
+        if result.get("category") is None:
+            await message.reply_text("目前没有待发布的上传批次。", reply_markup=admin_home_keyboard())
+        else:
+            await message.reply_text(
+                "🎉 本批上传已结束并发布！\n\n"
+                f"📁 目录：{result['category']}\n"
+                f"✅ 新增资源：{result['published']} 个\n"
+                f"⚠️ 待补备份：{result['failed_backup']} 个\n\n"
+                "会员现在可以在文件夹列表中看到这些资源。",
+                reply_markup=admin_home_keyboard(),
+            )
+        return
+    if value == "📁 创建文件夹":
+        pending_category_actions[user.id] = {"action": "create"}
+        await message.reply_text("📁 请发送新文件夹名称。创建后选择该文件夹即可开始批量上传。")
+        return
+    if value == "📋 文件夹列表" or value == "📤 上传文件":
+        categories = await db.list_categories()
+        rows = []
+        for index, row in enumerate(categories[:20]):
+            rows.append([InlineKeyboardButton(
+                f"📁 {row['category'][:32]}（{int(row['file_count'] or 0)}）",
+                callback_data=f"mc:dirupload:{index}",
+            )])
+        if not rows:
+            rows = [[InlineKeyboardButton("➕ 新建目录", callback_data="mc:dirnew")]]
+        await message.reply_text(
+            "📋 选择一个文件夹，之后发送的文件会暂存到该目录。\n"
+            "上传完毕点击「✅ 结束上传」后才会对会员显示。",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+    if value == "🛠 管理设置":
+        await message.reply_text("🛠 完整管理设置：", reply_markup=admin_keyboard())
         return
 
     pending_admin_action = pending_admin_actions.get(user.id)
