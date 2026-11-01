@@ -1207,6 +1207,31 @@ class Database:
             )
             await db.commit()
 
+    async def get_category_storage_stats(self, category: str):
+        """Return approximate byte totals by Telegram media type for one folder."""
+        async with self.connect() as db:
+            row = await (await db.execute("""
+                SELECT
+                    COALESCE(SUM(CASE WHEN lower(media_type) IN ('video', 'video_note')
+                        THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS video_size,
+                    COALESCE(SUM(CASE WHEN lower(media_type) IN ('photo', 'image')
+                        THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS image_size,
+                    COALESCE(SUM(CASE WHEN lower(media_type) NOT IN
+                        ('video', 'video_note', 'photo', 'image')
+                        THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS other_size,
+                    COALESCE(SUM(CASE WHEN COALESCE(file_size, 0) > 0 THEN 1 ELSE 0 END), 0)
+                        AS sized_count,
+                    COUNT(*) AS file_count
+                FROM files WHERE category=?
+            """, (str(category),))).fetchone()
+            return {
+                "video_size": int(row["video_size"] or 0),
+                "image_size": int(row["image_size"] or 0),
+                "other_size": int(row["other_size"] or 0),
+                "sized_count": int(row["sized_count"] or 0),
+                "file_count": int(row["file_count"] or 0),
+            }
+
     async def get_category_by_index(self, index):
         """Load one folder summary without aggregating the whole file catalog."""
         index = max(0, int(index))
