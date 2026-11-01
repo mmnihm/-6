@@ -1170,8 +1170,9 @@ async def upload_handler(client, message):
         return
 
     if source_fingerprint and await db.get_file_by_fingerprint(source_fingerprint):
-        await message.reply_text(
-            f"⏭️ 已跳过重复文件：{file_name}\n这个文件此前已经导入网盘。"
+        log.info(
+            "Silently skipped duplicate upload: user=%s file=%s",
+            user.id, file_name,
         )
         return
 
@@ -1240,7 +1241,14 @@ async def upload_handler(client, message):
         if inserted:
             category_catalog_cache["expires_at"] = 0
         if not inserted:
-            await status.edit_text(f"⏭️ 已跳过重复文件：{file_name}\n数据库中已存在相同文件记录。")
+            log.info(
+                "Silently skipped concurrent duplicate upload: user=%s file=%s",
+                user.id, file_name,
+            )
+            try:
+                await status.delete()
+            except Exception:
+                log.debug("Could not delete duplicate-upload status message")
             return
 
         step = "生成分享链接"
