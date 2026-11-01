@@ -1795,6 +1795,7 @@ async def scanner_login_input_handler(client, message):
         else:
             # The existing live progress message is the only completion notice.
             # Keep the upload keyboard available for the next operation.
+            pass
         return
     if value == "📁 创建文件夹":
         pending_category_actions[user.id] = {"action": "create"}
