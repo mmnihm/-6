@@ -363,6 +363,16 @@ class Database:
                          secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
                     )
                     await self._refresh_category_stats(db, name)
+                missing_share_keys = await (await db.execute(
+                    "SELECT name FROM categories WHERE share_key IS NULL OR share_key=''"
+                )).fetchall()
+                for item in missing_share_keys:
+                    await db.execute(
+                        "UPDATE categories SET share_key=? WHERE name=? "
+                        "AND (share_key IS NULL OR share_key='')",
+                        (secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10],
+                         item["name"]),
+                    )
                 await db.execute(
                     "INSERT INTO settings(key, value) VALUES('category_stats_v1', 'completed')"
                 )
@@ -528,6 +538,12 @@ class Database:
                     WHEN ? > 0 THEN ? ELSE file_size END
                 WHERE file_key=? AND (backup_message_id IS NULL OR backup_message_id=0)
             """, (int(backup_id), int(file_size or 0), int(file_size or 0), key))
+            if cur.rowcount == 1:
+                row = await (await db.execute(
+                    "SELECT category FROM files WHERE file_key=?", (key,)
+                )).fetchone()
+                if row:
+                    await self._refresh_category_stats(db, row["category"], create=False)
             await db.commit()
             return cur.rowcount == 1
 
@@ -1022,18 +1038,6 @@ class Database:
     async def list_categories(self, category=None):
         """Read saved folder summaries; counts are refreshed only when that folder's files change."""
         async with self.connect() as db:
-            # Repair only missing category metadata. Normal reads use the persisted summaries.
-            if category is None:
-                names = await (await db.execute(
-                    "SELECT DISTINCT f.category FROM files f "
-                    "LEFT JOIN categories c ON c.name=f.category "
-                    "WHERE f.category IS NOT NULL AND f.category<>'' AND c.name IS NULL"
-                )).fetchall()
-                for item in names:
-                    name = str(item["category"])
-                    await self._refresh_category_stats(db, name)
-                if names:
-                    await db.commit()
             return await (await db.execute("""
                 SELECT c.name AS category,
                        COALESCE(c.file_count, 0) AS file_count,
