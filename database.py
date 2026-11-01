@@ -173,6 +173,12 @@ class Database:
                         "ON CONFLICT DO NOTHING",
                         [tuple(row[name] for name in columns) for row in rows],
                     )
+                imported_categories = await (await pg.execute(
+                    "SELECT DISTINCT category FROM files "
+                    "WHERE category IS NOT NULL AND category<>''"
+                )).fetchall()
+                for item in imported_categories:
+                    await self._refresh_category_stats(pg, str(item["category"]))
                 await pg.execute(
                     "INSERT INTO settings(key, value) VALUES(%s, %s) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -311,6 +317,22 @@ class Database:
                 await db.execute("ALTER TABLE categories ADD COLUMN updated_at TEXT")
             if "share_key" not in category_column_names:
                 await db.execute("ALTER TABLE categories ADD COLUMN share_key TEXT")
+
+            category_stat_columns = {
+                "file_count": "BIGINT NOT NULL DEFAULT 0",
+                "image_count": "BIGINT NOT NULL DEFAULT 0",
+                "video_count": "BIGINT NOT NULL DEFAULT 0",
+                "animation_count": "BIGINT NOT NULL DEFAULT 0",
+                "audio_count": "BIGINT NOT NULL DEFAULT 0",
+                "document_count": "BIGINT NOT NULL DEFAULT 0",
+                "total_size": "BIGINT NOT NULL DEFAULT 0",
+                "sized_count": "BIGINT NOT NULL DEFAULT 0",
+            }
+            for column, definition in category_stat_columns.items():
+                if column not in category_column_names:
+                    await db.execute(
+                        f"ALTER TABLE categories ADD COLUMN {column} {definition}"
+                    )
             await db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_categories_share_key "
                 "ON categories(share_key) WHERE share_key IS NOT NULL"
@@ -324,6 +346,36 @@ class Database:
                 ON files(source_fingerprint)
                 WHERE source_fingerprint IS NOT NULL
             """)
+            stats_migration = await (await db.execute(
+                "SELECT value FROM settings WHERE key='category_stats_v1'"
+            )).fetchone()
+            if not stats_migration:
+                legacy_categories = await (await db.execute(
+                    "SELECT DISTINCT category FROM files "
+                    "WHERE category IS NOT NULL AND category<>''"
+                )).fetchall()
+                for item in legacy_categories:
+                    name = str(item["category"])
+                    await db.execute(
+                        "INSERT INTO categories(name, created_at, description, updated_at, share_key) "
+                        "VALUES(?, ?, '', ?, ?) ON CONFLICT(name) DO NOTHING",
+                        (name, iso_now(), iso_now(),
+                         secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
+                    )
+                    await self._refresh_category_stats(db, name)
+                missing_share_keys = await (await db.execute(
+                    "SELECT name FROM categories WHERE share_key IS NULL OR share_key=''"
+                )).fetchall()
+                for item in missing_share_keys:
+                    await db.execute(
+                        "UPDATE categories SET share_key=? WHERE name=? "
+                        "AND (share_key IS NULL OR share_key='')",
+                        (secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10],
+                         item["name"]),
+                    )
+                await db.execute(
+                    "INSERT INTO settings(key, value) VALUES('category_stats_v1', 'completed')"
+                )
             await db.commit()
 
         if self.uses_postgres:
@@ -473,6 +525,8 @@ class Database:
             """, (key, owner_id, file_name, media_type, category,
                   primary_id, backup_id, created_at or iso_now(),
                   source_fingerprint, max(0, int(file_size or 0))))
+            if cur.rowcount == 1:
+                await self._refresh_category_stats(db, category)
             await db.commit()
             return cur.rowcount == 1
 
@@ -484,6 +538,12 @@ class Database:
                     WHEN ? > 0 THEN ? ELSE file_size END
                 WHERE file_key=? AND (backup_message_id IS NULL OR backup_message_id=0)
             """, (int(backup_id), int(file_size or 0), int(file_size or 0), key))
+            if cur.rowcount == 1:
+                row = await (await db.execute(
+                    "SELECT category FROM files WHERE file_key=?", (key,)
+                )).fetchone()
+                if row:
+                    await self._refresh_category_stats(db, row["category"], create=False)
             await db.commit()
             return cur.rowcount == 1
 
@@ -546,6 +606,8 @@ class Database:
                         WHERE source_fingerprint=? AND primary_message_id=?
                           AND backup_message_id=0
                     """, (backup_id, fingerprint, primary_id))
+            if inserted and primary:
+                await self._refresh_category_stats(db, primary["category"])
             await db.commit()
             return bool(other), inserted
 
@@ -561,6 +623,7 @@ class Database:
                 WHERE s.channel_id=? AND f.file_key IS NULL
                 ORDER BY s.message_id
             """, (primary_channel_id,))).fetchall()
+            changed_categories = set()
             for row in rows:
                 key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
                 cur = await db.execute("""
@@ -574,7 +637,11 @@ class Database:
                     row["category"], row["message_id"], row["created_at"],
                     row["fingerprint"]
                 ))
-                created += int(cur.rowcount == 1)
+                if cur.rowcount == 1:
+                    created += 1
+                    changed_categories.add(row["category"])
+            for category in changed_categories:
+                await self._refresh_category_stats(db, category)
             await db.commit()
         return created
 
@@ -763,9 +830,16 @@ class Database:
 
     async def set_file_category(self, key: str, category: str) -> bool:
         async with self.connect() as db:
+            current = await (await db.execute(
+                "SELECT category FROM files WHERE file_key=?", (key,)
+            )).fetchone()
             cur = await db.execute(
                 "UPDATE files SET category=? WHERE file_key=?", (category, key)
             )
+            if cur.rowcount > 0:
+                await self._refresh_category_stats(db, category)
+                if current and current["category"] != category:
+                    await self._refresh_category_stats(db, current["category"], create=False)
             await db.commit()
             return cur.rowcount > 0
 
@@ -848,6 +922,85 @@ class Database:
                 "audios": int(row["audios"] or 0),
             }
 
+    async def _refresh_category_stats(self, db, category: str, create=True):
+        """Recalculate and persist one category summary; never scans unrelated folders."""
+        category = str(category or "").strip()
+        if not category:
+            return
+        if create:
+            await db.execute(
+                "INSERT INTO categories(name, created_at, description, updated_at, share_key) "
+                "VALUES(?, ?, '', ?, ?) ON CONFLICT(name) DO NOTHING",
+                (category, iso_now(), iso_now(),
+                 secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
+            )
+        row = await (await db.execute("""
+            SELECT COUNT(*) AS file_count,
+                   SUM(CASE WHEN lower(media_type) IN ('photo', 'image')
+                       OR (lower(media_type)='document' AND (
+                           lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
+                           OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
+                           OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
+                           OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
+                           OR lower(file_name) LIKE '%.tiff'
+                       )) THEN 1 ELSE 0 END) AS image_count,
+                   SUM(CASE WHEN lower(media_type)='video'
+                       OR (lower(media_type)='document' AND (
+                           lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
+                           OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
+                           OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
+                           OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
+                           OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
+                           OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
+                       )) THEN 1 ELSE 0 END) AS video_count,
+                   SUM(CASE WHEN lower(media_type)='animation'
+                       OR (lower(media_type)='document' AND (
+                           lower(file_name) LIKE '%.gif' OR lower(file_name) LIKE '%.apng'
+                       )) THEN 1 ELSE 0 END) AS animation_count,
+                   SUM(CASE WHEN lower(media_type) IN ('audio', 'voice')
+                       OR (lower(media_type)='document' AND (
+                           lower(file_name) LIKE '%.mp3' OR lower(file_name) LIKE '%.m4a'
+                           OR lower(file_name) LIKE '%.aac' OR lower(file_name) LIKE '%.flac'
+                           OR lower(file_name) LIKE '%.wav' OR lower(file_name) LIKE '%.ogg'
+                           OR lower(file_name) LIKE '%.opus' OR lower(file_name) LIKE '%.wma'
+                       )) THEN 1 ELSE 0 END) AS audio_count,
+                   SUM(CASE WHEN lower(media_type)='document'
+                       AND NOT (
+                           lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
+                           OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
+                           OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
+                           OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
+                           OR lower(file_name) LIKE '%.tiff'
+                           OR lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
+                           OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
+                           OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
+                           OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
+                           OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
+                           OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
+                           OR lower(file_name) LIKE '%.gif' OR lower(file_name) LIKE '%.apng'
+                           OR lower(file_name) LIKE '%.mp3' OR lower(file_name) LIKE '%.m4a'
+                           OR lower(file_name) LIKE '%.aac' OR lower(file_name) LIKE '%.flac'
+                           OR lower(file_name) LIKE '%.wav' OR lower(file_name) LIKE '%.ogg'
+                           OR lower(file_name) LIKE '%.opus' OR lower(file_name) LIKE '%.wma'
+                       ) THEN 1 ELSE 0 END) AS document_count,
+                   SUM(COALESCE(file_size, 0)) AS total_size,
+                   SUM(CASE WHEN COALESCE(file_size, 0)>0 THEN 1 ELSE 0 END) AS sized_count
+            FROM files WHERE category=?
+        """, (category,))).fetchone()
+        await db.execute("""
+            UPDATE categories SET
+                file_count=?, image_count=?, video_count=?, animation_count=?,
+                audio_count=?, document_count=?, total_size=?, sized_count=?,
+                updated_at=?
+            WHERE name=?
+        """, (
+            int(row["file_count"] or 0), int(row["image_count"] or 0),
+            int(row["video_count"] or 0), int(row["animation_count"] or 0),
+            int(row["audio_count"] or 0), int(row["document_count"] or 0),
+            int(row["total_size"] or 0), int(row["sized_count"] or 0),
+            iso_now(), category,
+        ))
+
     async def save_category(self, name: str, description="", created_at=None):
         name = str(name or "").strip()[:120]
         if not name:
@@ -874,12 +1027,8 @@ class Database:
         index = max(0, int(index))
         async with self.connect() as db:
             row = await (await db.execute("""
-                SELECT category FROM (
-                    SELECT category FROM files WHERE category IS NOT NULL AND category<>''
-                    UNION
-                    SELECT name AS category FROM categories
-                ) AS all_categories
-                ORDER BY lower(category) LIMIT 1 OFFSET ?
+                SELECT name AS category FROM categories
+                ORDER BY lower(name) LIMIT 1 OFFSET ?
             """, (index,))).fetchone()
         if not row:
             return None
@@ -887,101 +1036,26 @@ class Database:
         return rows[0] if rows else None
 
     async def list_categories(self, category=None):
+        """Read saved folder summaries; counts are refreshed only when that folder's files change."""
         async with self.connect() as db:
-            # Only full-list requests repair legacy category rows. A single-folder
-            # request skips the catalog-wide repair scan.
-            if category is None:
-                names = await (await db.execute(
-                    "SELECT DISTINCT files.category, categories.name AS existing_name "
-                    "FROM files LEFT JOIN categories ON categories.name=files.category "
-                    "WHERE files.category IS NOT NULL AND files.category<>'' "
-                    "AND (categories.name IS NULL OR categories.share_key IS NULL OR categories.share_key='')"
-                )).fetchall()
-                for item in names:
-                    name = str(item["category"])
-                    share_key = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]
-                    if item["existing_name"] is None:
-                        await db.execute(
-                            "INSERT OR IGNORE INTO categories(name, created_at, description, updated_at, share_key) "
-                            "VALUES(?, ?, '', ?, ?)",
-                            (name, iso_now(), iso_now(), share_key),
-                        )
-                    else:
-                        await db.execute(
-                            "UPDATE categories SET share_key=? WHERE name=? AND (share_key IS NULL OR share_key='')",
-                            (share_key, name),
-                        )
-                if names:
-                    await db.commit()
             return await (await db.execute("""
-                SELECT all_categories.category,
-                       COUNT(files.file_key) AS file_count,
-                       SUM(CASE WHEN lower(files.media_type) IN ('photo', 'image')
-                           OR (lower(files.media_type)='document' AND (
-                               lower(files.file_name) LIKE '%.jpg' OR lower(files.file_name) LIKE '%.jpeg'
-                               OR lower(files.file_name) LIKE '%.png' OR lower(files.file_name) LIKE '%.webp'
-                               OR lower(files.file_name) LIKE '%.bmp' OR lower(files.file_name) LIKE '%.heic'
-                               OR lower(files.file_name) LIKE '%.heif' OR lower(files.file_name) LIKE '%.tif'
-                               OR lower(files.file_name) LIKE '%.tiff'
-                           )) THEN 1 ELSE 0 END) AS image_count,
-                       SUM(CASE WHEN lower(files.media_type)='video'
-                           OR (lower(files.media_type)='document' AND (
-                               lower(files.file_name) LIKE '%.mp4' OR lower(files.file_name) LIKE '%.mkv'
-                               OR lower(files.file_name) LIKE '%.mov' OR lower(files.file_name) LIKE '%.avi'
-                               OR lower(files.file_name) LIKE '%.webm' OR lower(files.file_name) LIKE '%.m4v'
-                               OR lower(files.file_name) LIKE '%.mpeg' OR lower(files.file_name) LIKE '%.mpg'
-                               OR lower(files.file_name) LIKE '%.3gp' OR lower(files.file_name) LIKE '%.ts'
-                               OR lower(files.file_name) LIKE '%.wmv' OR lower(files.file_name) LIKE '%.flv'
-                           )) THEN 1 ELSE 0 END) AS video_count,
-                       SUM(CASE WHEN lower(files.media_type)='animation'
-                           OR (lower(files.media_type)='document' AND (
-                               lower(files.file_name) LIKE '%.gif' OR lower(files.file_name) LIKE '%.apng'
-                           )) THEN 1 ELSE 0 END) AS animation_count,
-                       SUM(CASE WHEN lower(files.media_type) IN ('audio', 'voice')
-                           OR (lower(files.media_type)='document' AND (
-                               lower(files.file_name) LIKE '%.mp3' OR lower(files.file_name) LIKE '%.m4a'
-                               OR lower(files.file_name) LIKE '%.aac' OR lower(files.file_name) LIKE '%.flac'
-                               OR lower(files.file_name) LIKE '%.wav' OR lower(files.file_name) LIKE '%.ogg'
-                               OR lower(files.file_name) LIKE '%.opus' OR lower(files.file_name) LIKE '%.wma'
-                           )) THEN 1 ELSE 0 END) AS audio_count,
-                       SUM(CASE WHEN lower(files.media_type)='document'
-                           AND NOT (
-                               lower(files.file_name) LIKE '%.jpg' OR lower(files.file_name) LIKE '%.jpeg'
-                               OR lower(files.file_name) LIKE '%.png' OR lower(files.file_name) LIKE '%.webp'
-                               OR lower(files.file_name) LIKE '%.bmp' OR lower(files.file_name) LIKE '%.heic'
-                               OR lower(files.file_name) LIKE '%.heif' OR lower(files.file_name) LIKE '%.tif'
-                               OR lower(files.file_name) LIKE '%.tiff'
-                               OR lower(files.file_name) LIKE '%.mp4' OR lower(files.file_name) LIKE '%.mkv'
-                               OR lower(files.file_name) LIKE '%.mov' OR lower(files.file_name) LIKE '%.avi'
-                               OR lower(files.file_name) LIKE '%.webm' OR lower(files.file_name) LIKE '%.m4v'
-                               OR lower(files.file_name) LIKE '%.mpeg' OR lower(files.file_name) LIKE '%.mpg'
-                               OR lower(files.file_name) LIKE '%.3gp' OR lower(files.file_name) LIKE '%.ts'
-                               OR lower(files.file_name) LIKE '%.wmv' OR lower(files.file_name) LIKE '%.flv'
-                               OR lower(files.file_name) LIKE '%.gif' OR lower(files.file_name) LIKE '%.apng'
-                               OR lower(files.file_name) LIKE '%.mp3' OR lower(files.file_name) LIKE '%.m4a'
-                               OR lower(files.file_name) LIKE '%.aac' OR lower(files.file_name) LIKE '%.flac'
-                               OR lower(files.file_name) LIKE '%.wav' OR lower(files.file_name) LIKE '%.ogg'
-                               OR lower(files.file_name) LIKE '%.opus' OR lower(files.file_name) LIKE '%.wma'
-                           ) THEN 1 ELSE 0 END) AS document_count,
-                       SUM(COALESCE(files.file_size, 0)) AS total_size,
-                       SUM(CASE WHEN COALESCE(files.file_size, 0) > 0 THEN 1 ELSE 0 END) AS sized_count,
-                       COALESCE(categories.description, '') AS description,
-                       COALESCE(categories.created_at, MIN(files.created_at)) AS created_at,
-                       COALESCE(MAX(files.created_at), categories.updated_at,
-                                categories.created_at) AS updated_at,
-                       categories.share_key AS share_key
-                FROM (
-                    SELECT category FROM files
-                    UNION
-                    SELECT name AS category FROM categories
-                ) AS all_categories
-                LEFT JOIN files ON files.category=all_categories.category
-                LEFT JOIN categories ON categories.name=all_categories.category
-                WHERE all_categories.category = COALESCE(CAST(? AS TEXT), all_categories.category)
-                GROUP BY all_categories.category, categories.description,
-                         categories.created_at, categories.updated_at, categories.share_key
-                ORDER BY lower(all_categories.category)
-            """, (category,))).fetchall()
+                SELECT c.name AS category,
+                       COALESCE(c.file_count, 0) AS file_count,
+                       COALESCE(c.image_count, 0) AS image_count,
+                       COALESCE(c.video_count, 0) AS video_count,
+                       COALESCE(c.animation_count, 0) AS animation_count,
+                       COALESCE(c.audio_count, 0) AS audio_count,
+                       COALESCE(c.document_count, 0) AS document_count,
+                       COALESCE(c.total_size, 0) AS total_size,
+                       COALESCE(c.sized_count, 0) AS sized_count,
+                       COALESCE(c.description, '') AS description,
+                       c.created_at AS created_at,
+                       c.updated_at AS updated_at,
+                       c.share_key AS share_key
+                FROM categories c
+                WHERE (CAST(? AS TEXT) IS NULL OR c.name=CAST(? AS TEXT))
+                ORDER BY lower(c.name)
+            """, (category, category))).fetchall()
 
     async def rename_category(self, old_name: str, new_name: str) -> bool:
         old_name = str(old_name or "").strip()[:120]
@@ -1015,6 +1089,7 @@ class Database:
                     (new_name, iso_now(), iso_now(),
                      secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
                 )
+            await self._refresh_category_stats(db, new_name)
             await db.commit()
             return True
 

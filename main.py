@@ -426,6 +426,7 @@ async def run_history_scan(primary_channel_id, backup_channel_id):
                     await db.advance_scan_cursor(channel_id, item.id)
             await db.mark_scan_completed(channel_id)
 
+        category_catalog_cache["expires_at"] = 0
         cleaned_categories = await db.cleanup_empty_categories()
         # Materialize category rows and share keys for all categories found in scanned files.
         await db.list_categories()
@@ -1069,6 +1070,7 @@ async def directory_import_confirm_handler(client, message):
             if index % 100 == 0:
                 await asyncio.sleep(0.05)
 
+        category_catalog_cache["expires_at"] = 0
         cleaned_categories = await db.cleanup_empty_categories()
         # Materialize category rows and share keys for imported directories with files.
         await db.list_categories()
@@ -1220,6 +1222,8 @@ async def upload_handler(client, message):
             primary_id, backup_id, category, source_fingerprint,
             file_size=file_size,
         )
+        if inserted:
+            category_catalog_cache["expires_at"] = 0
         if not inserted:
             await status.edit_text(f"⏭️ 已跳过重复文件：{file_name}\n数据库中已存在相同文件记录。")
             return
@@ -1837,6 +1841,8 @@ async def scan_history_handler(client, message):
     p = await db.get_scan_progress(primary)
     b = await db.get_scan_progress(backup)
     backfilled = await db.publish_primary_catalog(primary, config.ADMIN_ID)
+    if backfilled:
+        category_catalog_cache["expires_at"] = 0
     if p["completed"] and b["completed"]:
         # A completed scan can still have legacy primary-channel records waiting
         # to be published. Always finalize directory maintenance before returning.
@@ -2908,6 +2914,7 @@ async def category_handler(client, message):
         return
     key, category = args[0], " ".join(args[1:])[:40]
     if await db.set_file_category(key, category):
+        category_catalog_cache["expires_at"] = 0
         await message.reply_text(f"✅ 文件 {key} 已归类为：{category}")
     else:
         await message.reply_text("❌ 没找到这个文件码。")
