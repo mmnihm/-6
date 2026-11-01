@@ -173,6 +173,12 @@ class Database:
                         "ON CONFLICT DO NOTHING",
                         [tuple(row[name] for name in columns) for row in rows],
                     )
+                imported_categories = await (await pg.execute(
+                    "SELECT DISTINCT category FROM files "
+                    "WHERE category IS NOT NULL AND category<>''"
+                )).fetchall()
+                for item in imported_categories:
+                    await self._refresh_category_stats(pg, str(item["category"]))
                 await pg.execute(
                     "INSERT INTO settings(key, value) VALUES(%s, %s) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
