@@ -601,6 +601,7 @@ class Database:
                 WHERE s.channel_id=? AND f.file_key IS NULL
                 ORDER BY s.message_id
             """, (primary_channel_id,))).fetchall()
+            changed_categories = set()
             for row in rows:
                 key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
                 cur = await db.execute("""
@@ -614,15 +615,11 @@ class Database:
                     row["category"], row["message_id"], row["created_at"],
                     row["fingerprint"]
                 ))
-                created += int(cur.rowcount == 1)
-            if created:
-                changed_categories = await (await db.execute(
-                    "SELECT DISTINCT category FROM files WHERE source_fingerprint IN "
-                    "(SELECT fingerprint FROM scanner_messages WHERE channel_id=?)",
-                    (primary_channel_id,),
-                )).fetchall()
-                for item in changed_categories:
-                    await self._refresh_category_stats(db, item["category"])
+                if cur.rowcount == 1:
+                    created += 1
+                    changed_categories.add(row["category"])
+            for category in changed_categories:
+                await self._refresh_category_stats(db, category)
             await db.commit()
         return created
 
@@ -1085,6 +1082,8 @@ class Database:
                     (new_name, iso_now(), iso_now(),
                      secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
                 )
+            await self._refresh_category_stats(db, new_name)
+            await self._refresh_category_stats(db, old_name)
             await db.commit()
             return True
 
