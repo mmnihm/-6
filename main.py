@@ -2203,6 +2203,10 @@ async def user_catalog_callback_handler(client, query):
         return
 
     if action[1] in ("folder", "folderresume") and len(action) >= 3:
+        # Acknowledge immediately so slow membership/database work never leaves
+        # Telegram's button spinner waiting.
+        await query.answer("📂 正在打开目录…")
+        await message.edit_text("📂 正在加载目录内容…")
         try:
             index = int(action[2])
             categories = await db.list_categories()
@@ -2222,7 +2226,6 @@ async def user_catalog_callback_handler(client, query):
             await query.answer("分类已更新，请重新打开列表", show_alert=True)
             return
         await save_folder_offset(user.id, category_row["share_key"], offset)
-        await query.answer()
         files = await db.list_category_files(category, limit=20, offset=offset)
         page = offset // 20
         group_id = await get_member_group_id()
