@@ -1241,7 +1241,7 @@ class Database:
                        c.share_key AS share_key
                 FROM categories c
                 WHERE (CAST(? AS TEXT) IS NULL OR c.name=CAST(? AS TEXT))
-                ORDER BY lower(c.name)
+                ORDER BY c.updated_at DESC, c.created_at DESC, lower(c.name)
             """, (category, category))).fetchall()
 
     async def rename_category(self, old_name: str, new_name: str) -> bool:
