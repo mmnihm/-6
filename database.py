@@ -25,7 +25,7 @@ class PostgresCompat:
         self.connection = connection
 
     @staticmethod
-    def adapt_sql(sql):
+    def adapt_sql(sql, has_params=False):
         statement = sql.strip()
         ignore_insert = statement.upper().startswith("INSERT OR IGNORE INTO")
         if ignore_insert:
@@ -34,6 +34,11 @@ class PostgresCompat:
                 flags=re.IGNORECASE,
             ).rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
         statement = statement.replace("?", "%s")
+        # Psycopg parses percent signs whenever query parameters are supplied.
+        # Escape SQL pattern wildcards such as LIKE '%%.mp4', while preserving
+        # positional/named placeholders and already escaped percent signs.
+        if has_params:
+            statement = re.sub(r"%(?![%sbt(])", "%%", statement)
         statement = re.sub(r"^BEGIN IMMEDIATE$", "BEGIN", statement, flags=re.I)
         statement = statement.replace(
             "ORDER BY category COLLATE NOCASE", "ORDER BY lower(category)"
@@ -42,14 +47,14 @@ class PostgresCompat:
         return statement
 
     async def execute(self, sql, params=()):
-        statement = self.adapt_sql(sql)
+        statement = self.adapt_sql(sql, bool(params))
         if params:
             return await self.connection.execute(statement, params)
         return await self.connection.execute(statement)
 
     async def executemany(self, sql, params):
         async with self.connection.cursor() as cursor:
-            await cursor.executemany(self.adapt_sql(sql), params)
+            await cursor.executemany(self.adapt_sql(sql, True), params)
             return cursor.rowcount
 
     async def executescript(self, script):
