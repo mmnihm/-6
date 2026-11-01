@@ -315,6 +315,10 @@ class Database:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_categories_share_key "
                 "ON categories(share_key) WHERE share_key IS NOT NULL"
             )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_category_created_at "
+                "ON files(category, created_at DESC)"
+            )
             await db.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_files_source_fingerprint
                 ON files(source_fingerprint)
@@ -869,21 +873,29 @@ class Database:
         async with self.connect() as db:
             # Ensure categories discovered from uploads/scans also receive stable
             # share keys, so folder favorites and deep links work for every folder.
+            # Only repair missing category rows/share keys. The old implementation
+            # issued two writes for every category on every folder click, even
+            # when all rows already existed; this was especially slow on remote DBs.
             names = await (await db.execute(
-                "SELECT DISTINCT category FROM files WHERE category IS NOT NULL AND category<>''"
+                "SELECT DISTINCT files.category, categories.name AS existing_name "
+                "FROM files LEFT JOIN categories ON categories.name=files.category "
+                "WHERE files.category IS NOT NULL AND files.category<>'' "
+                "AND (categories.name IS NULL OR categories.share_key IS NULL OR categories.share_key='')"
             )).fetchall()
             for item in names:
                 name = str(item["category"])
                 share_key = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]
-                await db.execute(
-                    "INSERT OR IGNORE INTO categories(name, created_at, description, updated_at, share_key) "
-                    "VALUES(?, ?, '', ?, ?)",
-                    (name, iso_now(), iso_now(), share_key),
-                )
-                await db.execute(
-                    "UPDATE categories SET share_key=? WHERE name=? AND (share_key IS NULL OR share_key='')",
-                    (share_key, name),
-                )
+                if item["existing_name"] is None:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO categories(name, created_at, description, updated_at, share_key) "
+                        "VALUES(?, ?, '', ?, ?)",
+                        (name, iso_now(), iso_now(), share_key),
+                    )
+                else:
+                    await db.execute(
+                        "UPDATE categories SET share_key=? WHERE name=? AND (share_key IS NULL OR share_key='')",
+                        (share_key, name),
+                    )
             if names:
                 await db.commit()
             return await (await db.execute("""
