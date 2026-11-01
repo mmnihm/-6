@@ -2667,7 +2667,7 @@ async def user_catalog_callback_handler(client, query):
         if measured < total:
             body.extend(["", "⚠️ 部分历史文件没有可用大小信息，容量为已知文件的合计，不代表完整总量。"])
         await message.edit_text(
-            "\\n".join(body),
+            "\n".join(body),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📂 查看内容", callback_data=f"uc:folder:{index}:0")],
                 [InlineKeyboardButton("📁 文件夹列表", callback_data=f"uc:folders:{page}")],
@@ -3006,20 +3006,20 @@ async def admin_callback_handler(client, query):
             buttons.append([InlineKeyboardButton("🗑 删除空目录", callback_data=f"mc:dirdelete:{index}")])
         buttons.append([InlineKeyboardButton("⬅️ 返回文件夹列表", callback_data="mc:directories")])
         detail = (
-            f"📁 目录：{row['category']}\\n"
-            f"📦 资源总数：{count} 个\\n"
-            f"🎬 视频：{int(row['video_count'] or 0)} 个，约 {format_folder_size(sizes['video_size'])}\\n"
-            f"🖼 图片：{int(row['image_count'] or 0)} 张，约 {format_folder_size(sizes['image_size'])}\\n"
-            f"🎞 动图：{int(row['animation_count'] or 0)} 个\\n"
-            f"🎵 音频：{int(row['audio_count'] or 0)} 个\\n"
-            f"📄 文档及其他：{int(row['document_count'] or 0)} 个，约 {format_folder_size(sizes['other_size'])}\\n"
-            f"💾 已统计容量：{format_folder_size(row['total_size'])}\\n"
-            f"📏 大小已知：{measured}/{count} 个\\n"
+            f"📁 目录：{row['category']}\n"
+            f"📦 资源总数：{count} 个\n"
+            f"🎬 视频：{int(row['video_count'] or 0)} 个，约 {format_folder_size(sizes['video_size'])}\n"
+            f"🖼 图片：{int(row['image_count'] or 0)} 张，约 {format_folder_size(sizes['image_size'])}\n"
+            f"🎞 动图：{int(row['animation_count'] or 0)} 个\n"
+            f"🎵 音频：{int(row['audio_count'] or 0)} 个\n"
+            f"📄 文档及其他：{int(row['document_count'] or 0)} 个，约 {format_folder_size(sizes['other_size'])}\n"
+            f"💾 已统计容量：{format_folder_size(row['total_size'])}\n"
+            f"📏 大小已知：{measured}/{count} 个\n"
             f"🔗 分享链接：{folder_share_url(str(row['share_key'])) if row['share_key'] and BOT_USERNAME else '机器人启动后可用'}"
         )
         if measured < count:
-            detail += "\\n\\n⚠️ 部分文件大小未知，容量仅为已知文件合计。"
-        detail += "\\n\\n" + ("这是空目录，可以删除。" if count == 0 else "目录含有资源，只能修改名称，不能删除资源。")
+            detail += "\n\n⚠️ 部分文件大小未知，容量仅为已知文件合计。"
+        detail += "\n\n" + ("这是空目录，可以删除。" if count == 0 else "目录含有资源，只能修改名称，不能删除资源。")
         await message.edit_text(
             detail,
             reply_markup=InlineKeyboardMarkup(buttons),
