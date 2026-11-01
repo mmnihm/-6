@@ -2387,10 +2387,10 @@ async def admin_directories_command(client, message):
             f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
             callback_data=f"mc:directory:{index}",
         )])
-    if categories:
+    for chunk_start in range(0, min(len(categories), page_size), 5):
         rows.append([
             InlineKeyboardButton(str(index + 1), callback_data=f"mc:directory:{index}")
-            for index in range(min(len(categories), page_size))
+            for index in range(chunk_start, min(chunk_start + 5, len(categories), page_size))
         ])
     if len(categories) > page_size:
         rows.append([InlineKeyboardButton("下一页 ➡️", callback_data="mc:directories:1")])
@@ -2405,11 +2405,11 @@ async def admin_directories_command(client, message):
             "text": f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
             "copy_text": {"text": str(row["category"])},
         }])
-    if categories:
+    for chunk_start in range(0, min(len(categories), page_size), 5):
         copy_rows.append([{
             "text": str(index + 1),
             "callback_data": f"mc:directory:{index}",
-        } for index in range(min(len(categories), page_size))])
+        } for index in range(chunk_start, min(chunk_start + 5, len(categories), page_size))])
     if len(categories) > page_size:
         copy_rows.append([{"text": "下一页 ➡️", "callback_data": "mc:directories:1"}])
     copy_rows.append([{"text": "⬅️ 返回管理面板", "callback_data": "mc:home"}])
@@ -2638,12 +2638,14 @@ async def user_catalog_callback_handler(client, query):
             )]
             for index, row in enumerate(selected)
         ]
-        number_row = [
-            InlineKeyboardButton(str(index + 1), callback_data=f"uc:folderstats:{start_at + index}:{page}")
-            for index in range(len(selected))
-        ]
-        if number_row:
-            rows.append(number_row)
+        for chunk_start in range(0, len(selected), 5):
+            rows.append([
+                InlineKeyboardButton(
+                    str(index + 1),
+                    callback_data=f"uc:folderstats:{start_at + index}:{page}",
+                )
+                for index in range(chunk_start, min(chunk_start + 5, len(selected)))
+            ])
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"uc:folders:{page - 1}"))
@@ -2664,11 +2666,11 @@ async def user_catalog_callback_handler(client, query):
             }]
             for row in selected
         ]
-        if selected:
+        for chunk_start in range(0, len(selected), 5):
             copy_rows.append([{
                 "text": str(index + 1),
                 "callback_data": f"uc:folderstats:{start_at + index}:{page}",
-            } for index in range(len(selected))])
+            } for index in range(chunk_start, min(chunk_start + 5, len(selected)))])
         nav_buttons = []
         if page > 0:
             nav_buttons.append({"text": "⬅️ 上一页", "callback_data": f"uc:folders:{page - 1}"})
@@ -2986,12 +2988,14 @@ async def admin_callback_handler(client, query):
                 f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
                 callback_data=f"mc:directory:{index}",
             )])
-        number_row = [
-            InlineKeyboardButton(str(index + 1), callback_data=f"mc:directory:{start_at + index}")
-            for index in range(len(selected))
-        ]
-        if number_row:
-            rows.append(number_row)
+        for chunk_start in range(0, len(selected), 5):
+            rows.append([
+                InlineKeyboardButton(
+                    str(index + 1),
+                    callback_data=f"mc:directory:{start_at + index}",
+                )
+                for index in range(chunk_start, min(chunk_start + 5, len(selected)))
+            ])
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"mc:directories:{page - 1}"))
@@ -3010,11 +3014,11 @@ async def admin_callback_handler(client, query):
                 "text": f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
                 "copy_text": {"text": str(row["category"])},
             }])
-        if selected:
+        for chunk_start in range(0, len(selected), 5):
             copy_rows.append([{
                 "text": str(index + 1),
                 "callback_data": f"mc:directory:{start_at + index}",
-            } for index in range(len(selected))])
+            } for index in range(chunk_start, min(chunk_start + 5, len(selected)))])
         admin_nav = []
         if page > 0:
             admin_nav.append({"text": "⬅️ 上一页", "callback_data": f"mc:directories:{page - 1}"})
