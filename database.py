@@ -823,7 +823,7 @@ class Database:
             if cur.rowcount > 0:
                 await self._refresh_category_stats(db, category)
                 if current and current["category"] != category:
-                    await self._refresh_category_stats(db, current["category"])
+                    await self._refresh_category_stats(db, current["category"], create=False)
             await db.commit()
             return cur.rowcount > 0
 
@@ -906,17 +906,18 @@ class Database:
                 "audios": int(row["audios"] or 0),
             }
 
-    async def _refresh_category_stats(self, db, category: str):
+    async def _refresh_category_stats(self, db, category: str, create=True):
         """Recalculate and persist one category summary; never scans unrelated folders."""
         category = str(category or "").strip()
         if not category:
             return
-        await db.execute(
-            "INSERT INTO categories(name, created_at, description, updated_at, share_key) "
-            "VALUES(?, ?, '', ?, ?) ON CONFLICT(name) DO NOTHING",
-            (category, iso_now(), iso_now(),
-             secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
-        )
+        if create:
+            await db.execute(
+                "INSERT INTO categories(name, created_at, description, updated_at, share_key) "
+                "VALUES(?, ?, '', ?, ?) ON CONFLICT(name) DO NOTHING",
+                (category, iso_now(), iso_now(),
+                 secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
+            )
         row = await (await db.execute("""
             SELECT COUNT(*) AS file_count,
                    SUM(CASE WHEN lower(media_type) IN ('photo', 'image')
@@ -1089,7 +1090,6 @@ class Database:
                      secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
                 )
             await self._refresh_category_stats(db, new_name)
-            await self._refresh_category_stats(db, old_name)
             await db.commit()
             return True
 
