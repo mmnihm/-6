@@ -2626,7 +2626,7 @@ async def admin_callback_handler(client, query):
             await message.edit_text("❌ 删除失败：目录可能已有文件，系统不会删除或影响其中资源。", reply_markup=back_keyboard())
     elif action == "admins":
         if not await is_superadmin(user.id):
-            await query.answer("只有超级管理员可以管理管理员名单", show_alert=True)
+            await message.edit_text("⛔ 只有超级管理员可以管理管理员名单。", reply_markup=back_keyboard())
             return
         delegated = await db.list_admins()
         superadmin_id = await db.get_admin_id()
@@ -2652,7 +2652,7 @@ async def admin_callback_handler(client, query):
         await message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
     elif action == "adminadd":
         if not await is_superadmin(user.id):
-            await query.answer("只有超级管理员可以添加管理员", show_alert=True)
+            await message.edit_text("⛔ 只有超级管理员可以添加管理员。", reply_markup=back_keyboard())
             return
         pending_admin_actions[user.id] = {"action": "add"}
         await message.edit_text(
@@ -2662,7 +2662,7 @@ async def admin_callback_handler(client, query):
         )
     elif action.startswith("adminremove:"):
         if not await is_superadmin(user.id):
-            await query.answer("只有超级管理员可以移除管理员", show_alert=True)
+            await message.edit_text("⛔ 只有超级管理员可以移除管理员。", reply_markup=back_keyboard())
             return
         try:
             target_id = int(action.split(":", 1)[1])
