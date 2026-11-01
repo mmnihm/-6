@@ -2709,8 +2709,8 @@ async def admin_callback_handler(client, query):
         await message.edit_text(
             f"📤 已选择上传目录：{row['category']}\n\n"
             "现在直接向机器人发送图片、视频、音频或文件，都会保存到这个目录。\n"
-            "可以连续上传多个文件；要切换目录，请重新选择其他目录。\n"
-            "发送 /uploadcancel 可取消目录选择。",
+            "可以连续上传多个文件；上传完毕请点击「✅ 结束上传」统一发布。\n"
+            "上传期间会员看不到本批文件。",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📁 选择其他目录", callback_data="mc:directories")],
                 [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
