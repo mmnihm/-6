@@ -1326,7 +1326,10 @@ async def upload_handler(client, message):
             await status.edit_text(
                 "📥 文件已收到，暂未对会员发布。\n"
                 f"📂 上传目录：{category}\n📄 文件：{file_name}\n\n"
-                "可以继续发送文件；全部发送完毕后，点击下方「✅ 结束上传」。",
+                "可以继续发送文件；全部发送完毕后，点击聊天底部的「✅ 结束上传」。"
+            )
+            await message.reply_text(
+                "📤 批量上传进行中。文件尚未对会员显示。",
                 reply_markup=upload_active_keyboard(),
             )
             return
