@@ -2612,12 +2612,12 @@ async def user_catalog_callback_handler(client, query):
         rows = [
             [InlineKeyboardButton(
                 f"📁 {row['category']}（{int(row['file_count'] or 0)}）",
-                callback_data=f"uc:folderresume:{start_at + index}",
+                callback_data=f"uc:folderstats:{start_at + index}:{page}",
             )]
             for index, row in enumerate(selected)
         ]
         number_row = [
-            InlineKeyboardButton(str(index + 1), callback_data=f"uc:folderresume:{start_at + index}")
+            InlineKeyboardButton(str(index + 1), callback_data=f"uc:folderstats:{start_at + index}:{page}")
             for index in range(len(selected))
         ]
         if number_row:
@@ -2635,6 +2635,43 @@ async def user_catalog_callback_handler(client, query):
             "点击文件夹名称或下方数字查看目录统计与内容："
             if categories else "🗂️ 暂无文件夹分类。",
             reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if action[1] == "folderstats" and len(action) >= 3:
+        try:
+            index = int(action[2])
+            page = max(0, int(action[3])) if len(action) > 3 else 0
+            category_row = await db.get_category_by_index(index)
+            if not category_row:
+                raise IndexError("folder index no longer exists")
+            sizes = await db.get_category_storage_stats(category_row["category"])
+        except (ValueError, IndexError):
+            await query.answer("目录已更新，请重新打开列表", show_alert=True)
+            return
+        total = int(category_row["file_count"] or 0)
+        measured = int(sizes["sized_count"] or 0)
+        body = [
+            f"📁 #{category_row['category']}",
+            "",
+            "📊 文件夹统计",
+            f"📦 资源总数：{total} 个",
+            f"🎬 视频：{int(category_row['video_count'] or 0)} 个，约 {format_folder_size(sizes['video_size'])}",
+            f"🖼 图片：{int(category_row['image_count'] or 0)} 张，约 {format_folder_size(sizes['image_size'])}",
+            f"🎞 动图：{int(category_row['animation_count'] or 0)} 个",
+            f"🎵 音频：{int(category_row['audio_count'] or 0)} 个",
+            f"📄 文档及其他：{int(category_row['document_count'] or 0)} 个，约 {format_folder_size(sizes['other_size'])}",
+            f"💾 已统计容量：{format_folder_size(category_row['total_size'])}",
+            f"📏 文件大小已知：{measured}/{total} 个",
+        ]
+        if measured < total:
+            body.extend(["", "⚠️ 部分历史文件没有可用大小信息，容量为已知文件的合计，不代表完整总量。"])
+        await message.edit_text(
+            "\\n".join(body),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📂 查看内容", callback_data=f"uc:folder:{index}:0")],
+                [InlineKeyboardButton("📁 文件夹列表", callback_data=f"uc:folders:{page}")],
+            ]),
         )
         return
 
