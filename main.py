@@ -124,14 +124,14 @@ async def get_member_group_id():
     value = await db.get_setting("member_group_id")
     return int(value) if value else None
 
-async def telegram_bot_api(method: str, payload: dict):
+async def telegram_bot_api(method: str, payload: dict, timeout=None):
     """Call Telegram Bot API directly, avoiding Pyrogram user-peer cache lookups."""
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/{method}"
     session = telegram_http_session
     if session is None or session.closed:
         raise RuntimeError("Telegram HTTP session is not initialized")
     try:
-        async with session.post(url, json=payload) as response:
+        async with session.post(url, json=payload, timeout=timeout) as response:
             data = await response.json(content_type=None)
     except Exception as exc:
         # Do not include the request URL: it contains the bot token.
@@ -964,11 +964,14 @@ async def _flush_album_upload(client, key):
             if member.get("status") == "administrator" and not member.get("can_post_messages", False):
                 raise RuntimeError(f"{label}中机器人没有发布消息权限")
         ids = [int(item.id) for item in messages]
+        # Album copies can take longer than lightweight Bot API calls.
+        # Give Telegram enough time to finish without changing other API timeouts.
+        copy_timeout = aiohttp.ClientTimeout(total=90, connect=10, sock_read=75)
         primary = await telegram_bot_api("copyMessages", {
             "chat_id": primary_channel_id,
             "from_chat_id": messages[0].chat.id,
             "message_ids": ids,
-        })
+        }, timeout=copy_timeout)
         if not isinstance(primary, list) or len(primary) != len(messages):
             raise RuntimeError("主频道整组复制结果不完整，未写入目录")
         backup = []
@@ -978,7 +981,7 @@ async def _flush_album_upload(client, key):
                 "chat_id": backup_channel_id,
                 "from_chat_id": messages[0].chat.id,
                 "message_ids": ids,
-            })
+            }, timeout=copy_timeout)
             if not isinstance(backup, list) or len(backup) != len(messages):
                 raise RuntimeError("备份频道整组复制结果不完整")
         except Exception as exc:
