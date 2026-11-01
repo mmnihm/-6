@@ -1784,15 +1784,17 @@ async def scanner_login_input_handler(client, message):
                 log.exception("Could not finalize upload progress message")
         if result.get("category") is None:
             await message.reply_text("目前没有待发布的上传批次。", reply_markup=admin_home_keyboard())
-        else:
+        elif progress_message is None:
             await message.reply_text(
-                "🎉 本批上传已结束并发布！\n\n"
+                "🎉 本批上传已结束并发布！\n"
                 f"📁 目录：{result['category']}\n"
                 f"✅ 新增资源：{result['published']} 个\n"
-                f"⚠️ 待补备份：{result['failed_backup']} 个\n\n"
-                "会员现在可以在文件夹列表中看到这些资源。",
+                f"⚠️ 待补备份：{result['failed_backup']} 个",
                 reply_markup=admin_home_keyboard(),
             )
+        else:
+            # The existing live progress message is the only completion notice.
+            # Keep the upload keyboard available for the next operation.
         return
     if value == "📁 创建文件夹":
         pending_category_actions[user.id] = {"action": "create"}
