@@ -2978,11 +2978,39 @@ async def admin_callback_handler(client, query):
         if nav:
             rows.append(nav)
         rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
-        await message.edit_text(
-            f"📁 目录管理（共 {len(categories)} 个，第 {page + 1} 页）\n\n"
-            "空目录也会显示给会员。点击名称或数字查看目录统计、上传和管理。",
-            reply_markup=InlineKeyboardMarkup(rows),
+        list_text = (
+            f"📁 文件夹列表（共 {len(categories)} 个，第 {page + 1} 页）\\n\\n"
+            "点击文件夹名称可复制名称；点击下方数字查看统计和管理。"
         )
+        copy_rows = [[{"text": "➕ 新建目录", "callback_data": "mc:dirnew"}]]
+        for row in selected:
+            copy_rows.append([{
+                "text": f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
+                "copy_text": {"text": str(row["category"])},
+            }])
+        if selected:
+            copy_rows.append([{
+                "text": str(index + 1),
+                "callback_data": f"mc:directory:{start_at + index}",
+            } for index in range(len(selected))])
+        admin_nav = []
+        if page > 0:
+            admin_nav.append({"text": "⬅️ 上一页", "callback_data": f"mc:directories:{page - 1}"})
+        if start_at + page_size < len(categories):
+            admin_nav.append({"text": "下一页 ➡️", "callback_data": f"mc:directories:{page + 1}"})
+        if admin_nav:
+            copy_rows.append(admin_nav)
+        copy_rows.append([{"text": "⬅️ 返回管理面板", "callback_data": "mc:home"}])
+        try:
+            await telegram_bot_api("editMessageText", {
+                "chat_id": message.chat.id,
+                "message_id": message.id,
+                "text": list_text,
+                "reply_markup": {"inline_keyboard": copy_rows},
+            })
+        except Exception:
+            log.exception("Could not render admin folder copy buttons; using compatible keyboard")
+            await message.edit_text(list_text, reply_markup=InlineKeyboardMarkup(rows))
     elif action == "dirnew":
         pending_category_actions[user.id] = {"action": "create"}
         await message.edit_text(
