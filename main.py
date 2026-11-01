@@ -2995,18 +2995,53 @@ async def admin_callback_handler(client, query):
             await message.edit_text("⚠️ 目录列表已更新，请重新打开目录管理。", reply_markup=back_keyboard())
             return
         count = int(row["file_count"] or 0)
+        sizes = await db.get_category_storage_stats(row["category"])
+        measured = int(sizes["sized_count"] or 0)
         buttons = [
+            [InlineKeyboardButton("📂 查看内容", callback_data=f"mc:dircontent:{index}")],
             [InlineKeyboardButton("📤 上传文件到此目录", callback_data=f"mc:dirupload:{index}")],
             [InlineKeyboardButton("✏️ 修改目录名称", callback_data=f"mc:dirrename:{index}")],
         ]
         if count == 0:
             buttons.append([InlineKeyboardButton("🗑 删除空目录", callback_data=f"mc:dirdelete:{index}")])
-        buttons.append([InlineKeyboardButton("⬅️ 返回目录管理", callback_data="mc:directories")])
+        buttons.append([InlineKeyboardButton("⬅️ 返回文件夹列表", callback_data="mc:directories")])
+        detail = (
+            f"📁 目录：{row['category']}\\n"
+            f"📦 资源总数：{count} 个\\n"
+            f"🎬 视频：{int(row['video_count'] or 0)} 个，约 {format_folder_size(sizes['video_size'])}\\n"
+            f"🖼 图片：{int(row['image_count'] or 0)} 张，约 {format_folder_size(sizes['image_size'])}\\n"
+            f"🎞 动图：{int(row['animation_count'] or 0)} 个\\n"
+            f"🎵 音频：{int(row['audio_count'] or 0)} 个\\n"
+            f"📄 文档及其他：{int(row['document_count'] or 0)} 个，约 {format_folder_size(sizes['other_size'])}\\n"
+            f"💾 已统计容量：{format_folder_size(row['total_size'])}\\n"
+            f"📏 大小已知：{measured}/{count} 个\\n"
+            f"🔗 分享链接：{folder_share_url(str(row['share_key'])) if row['share_key'] and BOT_USERNAME else '机器人启动后可用'}"
+        )
+        if measured < count:
+            detail += "\\n\\n⚠️ 部分文件大小未知，容量仅为已知文件合计。"
+        detail += "\\n\\n" + ("这是空目录，可以删除。" if count == 0 else "目录含有资源，只能修改名称，不能删除资源。")
         await message.edit_text(
-            f"📁 目录：{row['category']}\n📦 文件数：{count}\n"
-            f"🔗 分享链接：{folder_share_url(str(row['share_key'])) if row['share_key'] and BOT_USERNAME else '机器人启动后可用'}\n\n"
-            + ("这是空目录，可以删除。" if count == 0 else "目录含有资源，只能修改名称，不能删除资源。"),
+            detail,
             reply_markup=InlineKeyboardMarkup(buttons),
+            disable_web_page_preview=True,
+        )
+    elif action.startswith("dircontent:"):
+        try:
+            index = int(action.split(":", 1)[1])
+            row = (await db.list_categories())[index]
+        except (ValueError, IndexError):
+            await message.edit_text("⚠️ 目录列表已更新，请重新打开目录管理。", reply_markup=back_keyboard())
+            return
+        group_id = await get_member_group_id()
+        files = await db.list_category_files(row["category"], limit=20, offset=0)
+        category_row = dict(row)
+        category_row["category_index"] = index
+        await message.edit_text(
+            folder_detail_text(category_row, files, 0, group_id),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ 返回文件夹统计", callback_data=f"mc:directory:{index}")],
+                [InlineKeyboardButton("📁 文件夹列表", callback_data="mc:directories")],
+            ]),
             disable_web_page_preview=True,
         )
     elif action.startswith("dirrename:"):
