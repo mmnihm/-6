@@ -1005,7 +1005,10 @@ class Database:
                 "SELECT file_key, file_name, media_type, category, created_at, "
                 "album_group_id, album_position, "
                 "(SELECT COUNT(*) FROM files grouped WHERE grouped.album_group_id=files.album_group_id) AS album_size "
-                "FROM files" + where + " ORDER BY created_at DESC, album_position LIMIT ? OFFSET ?",
+                "FROM files" + where + " ORDER BY COALESCE((SELECT MAX(g.created_at) FROM files g "
+                "WHERE g.album_group_id=files.album_group_id), files.created_at) DESC, "
+                "CASE WHEN files.album_group_id IS NOT NULL THEN files.album_position ELSE 0 END "
+                "LIMIT ? OFFSET ?",
                 params + [limit, offset],
             )).fetchall()
             return rows, [row["category"] for row in categories], total
@@ -1340,9 +1343,15 @@ class Database:
     async def list_category_files(self, category, limit=8, offset=0):
         async with self.connect() as db:
             return await (await db.execute("""
-                SELECT file_key, file_name, media_type, category
+                SELECT file_key, file_name, media_type, category,
+                       album_group_id, album_position,
+                       (SELECT COUNT(*) FROM files grouped
+                        WHERE grouped.album_group_id=files.album_group_id) AS album_size
                 FROM files WHERE category=?
-                ORDER BY created_at DESC LIMIT ? OFFSET ?
+                ORDER BY COALESCE((SELECT MAX(g.created_at) FROM files g
+                                   WHERE g.album_group_id=files.album_group_id), files.created_at) DESC,
+                         CASE WHEN files.album_group_id IS NOT NULL THEN files.album_position ELSE 0 END
+                LIMIT ? OFFSET ?
             """, (category, limit, offset))).fetchall()
 
     async def record_history(self, user_id, file_key):
