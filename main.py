@@ -2380,13 +2380,19 @@ async def admin_directories_command(client, message):
         await reply_admin_only(message)
         return
     categories = await db.list_categories()
+    page_size = 10
     rows = [[InlineKeyboardButton("➕ 新建目录", callback_data="mc:dirnew")]]
-    for index, row in enumerate(categories[:20]):
+    for index, row in enumerate(categories[:page_size]):
         rows.append([InlineKeyboardButton(
             f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
             callback_data=f"mc:directory:{index}",
         )])
-    if len(categories) > 20:
+    if categories:
+        rows.append([
+            InlineKeyboardButton(str(index + 1), callback_data=f"mc:directory:{index}")
+            for index in range(min(len(categories), page_size))
+        ])
+    if len(categories) > page_size:
         rows.append([InlineKeyboardButton("下一页 ➡️", callback_data="mc:directories:1")])
     rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
     await message.reply_text(
@@ -2600,25 +2606,33 @@ async def user_catalog_callback_handler(client, query):
             category_catalog_cache["rows"] = [dict(row) for row in categories]
             category_catalog_cache["expires_at"] = now + 30
             categories = category_catalog_cache["rows"]
-        start_at = max(0, page) * 20
-        selected = categories[start_at:start_at + 20]
+        page_size = 10
+        start_at = max(0, page) * page_size
+        selected = categories[start_at:start_at + page_size]
         rows = [
             [InlineKeyboardButton(
-                f"🗂 {row['category']}（{row['file_count']}）",
+                f"📁 {row['category']}（{int(row['file_count'] or 0)}）",
                 callback_data=f"uc:folderresume:{start_at + index}",
             )]
             for index, row in enumerate(selected)
         ]
+        number_row = [
+            InlineKeyboardButton(str(index + 1), callback_data=f"uc:folderresume:{start_at + index}")
+            for index in range(len(selected))
+        ]
+        if number_row:
+            rows.append(number_row)
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"uc:folders:{page - 1}"))
-        if start_at + 20 < len(categories):
+        if start_at + page_size < len(categories):
             nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"uc:folders:{page + 1}"))
         if nav:
             rows.append(nav)
         rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
         await message.edit_text(
-            f"🗂️ 文件夹列表（{len(categories)} 个， 第 {page + 1} 页）\n\n选择分类查看文件："
+            f"🗂️ 文件夹列表（共 {len(categories)} 个，第 {page + 1} 页）\n\n"
+            "点击文件夹名称或下方数字查看目录统计与内容："
             if categories else "🗂️ 暂无文件夹分类。",
             reply_markup=InlineKeyboardMarkup(rows),
         )
@@ -2875,25 +2889,32 @@ async def admin_callback_handler(client, query):
         categories = await db.list_categories()
         page = int(action.split(":", 1)[1]) if ":" in action else 0
         page = max(0, page)
-        start_at = page * 20
-        selected = categories[start_at:start_at + 20]
+        page_size = 10
+        start_at = page * page_size
+        selected = categories[start_at:start_at + page_size]
         rows = [[InlineKeyboardButton("➕ 新建目录", callback_data="mc:dirnew")]]
         for index, row in enumerate(selected, start_at):
             rows.append([InlineKeyboardButton(
                 f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
                 callback_data=f"mc:directory:{index}",
             )])
+        number_row = [
+            InlineKeyboardButton(str(index + 1), callback_data=f"mc:directory:{start_at + index}")
+            for index in range(len(selected))
+        ]
+        if number_row:
+            rows.append(number_row)
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"mc:directories:{page - 1}"))
-        if start_at + 20 < len(categories):
+        if start_at + page_size < len(categories):
             nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"mc:directories:{page + 1}"))
         if nav:
             rows.append(nav)
         rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
         await message.edit_text(
             f"📁 目录管理（共 {len(categories)} 个，第 {page + 1} 页）\n\n"
-            "空目录也会立即显示给会员。选择目录可修改名称；只有空目录可以删除。",
+            "空目录也会显示给会员。点击名称或数字查看目录统计、上传和管理。",
             reply_markup=InlineKeyboardMarkup(rows),
         )
     elif action == "dirnew":
