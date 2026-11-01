@@ -1003,7 +1003,8 @@ class Database:
             )).fetchone())["n"]
             rows = await (await db.execute(
                 "SELECT file_key, file_name, media_type, category, created_at, "
-                "album_group_id, album_position "
+                "album_group_id, album_position, "
+                "(SELECT COUNT(*) FROM files grouped WHERE grouped.album_group_id=files.album_group_id) AS album_size "
                 "FROM files" + where + " ORDER BY created_at DESC, album_position LIMIT ? OFFSET ?",
                 params + [limit, offset],
             )).fetchall()
