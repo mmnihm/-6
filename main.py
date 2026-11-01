@@ -1263,31 +1263,33 @@ async def upload_handler(client, message):
         if not bot_id:
             raise RuntimeError("机器人身份尚未初始化，请稍后重试")
         for label, channel_id in (("主频道", primary_channel_id), ("备份频道", backup_channel_id)):
-            member = await client.get_chat_member(channel_id, bot_id)
-            if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-                raise RuntimeError(f"{label}中机器人不是管理员（当前状态：{member.status}）")
-            if member.status == ChatMemberStatus.ADMINISTRATOR:
-                privileges = getattr(member, "privileges", None)
-                if privileges is not None and not getattr(privileges, "can_post_messages", False):
-                    raise RuntimeError(f"{label}中机器人没有“发布消息”权限")
+            member = await telegram_bot_api("getChatMember", {
+                "chat_id": channel_id,
+                "user_id": bot_id,
+            })
+            member_status = member.get("status") if isinstance(member, dict) else None
+            if member_status not in ("administrator", "creator"):
+                raise RuntimeError(f"{label}中机器人不是管理员（当前状态：{member_status or '未知'}）")
+            if member_status == "administrator" and not member.get("can_post_messages", False):
+                raise RuntimeError(f"{label}中机器人没有“发布消息”权限")
 
         step = "保存主频道"
-        primary = await client.copy_message(
-            chat_id=primary_channel_id,
-            from_chat_id=message.chat.id,
-            message_id=message.id,
-        )
-        primary_id = primary.id
+        primary = await telegram_bot_api("copyMessage", {
+            "chat_id": primary_channel_id,
+            "from_chat_id": message.chat.id,
+            "message_id": message.id,
+        })
+        primary_id = int(primary["message_id"])
 
         step = "保存备份频道"
         backup_error = None
         try:
-            backup = await client.copy_message(
-                chat_id=backup_channel_id,
-                from_chat_id=message.chat.id,
-                message_id=message.id,
-            )
-            backup_id = backup.id
+            backup = await telegram_bot_api("copyMessage", {
+                "chat_id": backup_channel_id,
+                "from_chat_id": message.chat.id,
+                "message_id": message.id,
+            })
+            backup_id = int(backup["message_id"])
         except Exception as exc:
             backup_error = exc
             log.exception("Backup-channel copy failed; keeping primary copy")
