@@ -40,6 +40,7 @@ scanner_login_clients = {}
 pending_directory_imports = {}
 pending_category_actions = {}
 pending_upload_categories = {}
+pending_album_uploads = {}
 pending_home_button_actions = {}
 pending_admin_actions = {}
 directory_import_running = False
@@ -73,15 +74,19 @@ def upload_active_keyboard():
 async def admin_home_text():
     users, files, members, banned = await db.stats()
     categories = await db.list_categories()
+    catalog = await db.catalog_stats()
+    album_groups = sum(int(row.get("album_count", 0) or 0) for row in categories)
     return (
         "☁️ 网盘管理中心\n\n"
-        "欢迎使用文件管理后台\n"
-        "📁 创建和整理资源文件夹\n"
-        "📤 批量上传，结束后统一发布\n"
-        "📊 查看用户与资源统计\n\n"
+        "📁 目录管理：创建、整理、查看内容统计\n"
+        "📤 资源上传：支持单文件和相册成组上传\n"
+        "✅ 批量发布：点击结束上传后统一对会员开放\n\n"
         f"👥 用户总数：{users}\n"
         f"📁 文件夹数量：{len(categories)}\n"
-        f"📦 已发布资源：{files}\n\n"
+        f"📦 已发布文件：{files}\n"
+        f"🖼 图片：{catalog['images']} 张\n"
+        f"🎬 视频：{catalog['videos']} 个\n"
+        f"🗂 相册组：{album_groups} 组\n\n"
         "请选择要进行的操作。"
     )
 
@@ -330,6 +335,7 @@ def folder_detail_text(category_row, files, page, member_group_id):
         "",
         "📖 内容统计（已入库资源）：",
         f"　• 资源总数：{int(category_row['file_count'] or 0)} 个",
+        f"　• 🗂 成组相册：{int(category_row.get('album_count', 0) or 0)} 组",
         f"　• 🖼 图片：{int(category_row['image_count'] or 0)} 张",
         f"　• 🎬 视频：{int(category_row['video_count'] or 0)} 个",
         f"　• 🎞 动图：{int(category_row['animation_count'] or 0)} 个",
@@ -930,6 +936,131 @@ async def start_handler(client, message):
             log.exception("Could not send /start error reply to user_id=%s", user.id)
 
 
+async def _flush_album_upload(client, key):
+    await asyncio.sleep(1.5)
+    messages = pending_album_uploads.pop(key, [])
+    if not messages:
+        return
+    messages.sort(key=lambda item: item.id)
+    if len(messages) < 2:
+        await _upload_single_handler(client, messages[0])
+        return
+    user = messages[0].from_user
+    status = await messages[0].reply_text(f"⏳ 收到一组媒体（{len(messages)} 个），正在整组保存…")
+    try:
+        if not user or not await has_access(user.id):
+            await status.edit_text("⛔ 仅限会员群成员上传文件。")
+            return
+        primary_channel_id, backup_channel_id = await get_storage_channels()
+        if not primary_channel_id or not backup_channel_id or primary_channel_id == backup_channel_id:
+            await status.edit_text("⚠️ 请管理员先正确绑定主、备份存储频道。")
+            return
+        active_batch = await db.get_upload_batch(user.id) if await is_admin(user.id) else None
+        selected_category = (
+            active_batch["category"] if active_batch
+            else pending_upload_categories.get(user.id) if await is_admin(user.id)
+            else None
+        )
+        category = str(selected_category or parse_category(messages[0]))[:120]
+        if await is_admin(user.id) and selected_category and not active_batch:
+            await db.start_upload_batch(user.id, category)
+        if not BOT_ID:
+            me = await client.get_me()
+            globals()["BOT_ID"] = me.id
+        for label, channel_id in (("主频道", primary_channel_id), ("备份频道", backup_channel_id)):
+            member = await telegram_bot_api("getChatMember", {
+                "chat_id": channel_id, "user_id": BOT_ID,
+            })
+            if member.get("status") not in ("administrator", "creator"):
+                raise RuntimeError(f"{label}中机器人不是管理员")
+            if member.get("status") == "administrator" and not member.get("can_post_messages", False):
+                raise RuntimeError(f"{label}中机器人没有发布消息权限")
+        ids = [int(item.id) for item in messages]
+        primary = await telegram_bot_api("copyMessages", {
+            "chat_id": primary_channel_id,
+            "from_chat_id": messages[0].chat.id,
+            "message_ids": ids,
+        })
+        if not isinstance(primary, list) or len(primary) != len(messages):
+            raise RuntimeError("主频道整组复制结果不完整，未写入目录")
+        backup = []
+        backup_error = None
+        try:
+            backup = await telegram_bot_api("copyMessages", {
+                "chat_id": backup_channel_id,
+                "from_chat_id": messages[0].chat.id,
+                "message_ids": ids,
+            })
+            if not isinstance(backup, list) or len(backup) != len(messages):
+                raise RuntimeError("备份频道整组复制结果不完整")
+        except Exception as exc:
+            backup_error = exc
+            log.exception("Album backup copy failed")
+        group_id = secrets.token_urlsafe(12)
+        saved = 0
+        for position, message in enumerate(messages):
+            media_type, file_name, fingerprint = media_details(message)
+            if not media_type:
+                continue
+            if fingerprint and await db.get_file_by_fingerprint(fingerprint):
+                continue
+            media_object = getattr(message, media_type, None)
+            size = int(getattr(media_object, "file_size", 0) or 0)
+            key_file = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
+            primary_id = int(primary[position]["message_id"])
+            backup_id = int(backup[position]["message_id"]) if backup else 0
+            error_text = f"{type(backup_error).__name__}: {str(backup_error)[:400]}" if backup_error else ""
+            if await is_admin(user.id) and selected_category:
+                inserted = await db.stage_upload_batch_item(
+                    key_file, user.id, file_name, media_type, category,
+                    primary_channel_id, primary_id, backup_channel_id, backup_id,
+                    fingerprint, size, error_text, group_id, position,
+                )
+            else:
+                inserted = await db.add_file(
+                    key_file, user.id, file_name, media_type,
+                    primary_id, backup_id, category, fingerprint, size,
+                    album_group_id=group_id, album_position=position,
+                )
+            if inserted:
+                saved += 1
+                if backup_error and not (await is_admin(user.id) and selected_category):
+                    await db.enqueue_backup_retry(
+                        key_file, primary_channel_id, primary_id, backup_channel_id, error_text
+                    )
+        if not (await is_admin(user.id) and selected_category):
+            category_catalog_cache["expires_at"] = 0
+        await status.edit_text(
+            f"✅ 相册整组保存完成\n📂 目录：{category}\n"
+            f"🗂 相册：1 组\n📦 文件：{saved} 个\n"
+            f"🖼 图片：{sum(1 for x in messages if x.photo)} 张\n"
+            f"🎬 视频：{sum(1 for x in messages if x.video)} 个\n"
+            + ("\n⚠️ 备份失败，已加入自动重试。" if backup_error else "")
+            + ("\n\n尚未对会员开放，全部上传后点击「结束上传」。" if await is_admin(user.id) and selected_category else "")
+        )
+        if await is_admin(user.id) and selected_category:
+            await messages[0].reply_text("📤 批量上传进行中。相册尚未对会员显示。", reply_markup=upload_active_keyboard())
+    except Exception as exc:
+        log.exception("Grouped album upload failed")
+        await status.edit_text(f"❌ 相册整组保存失败：{type(exc).__name__}: {str(exc)[:300]}")
+        
+async def upload_handler(client, message):
+    group_id = getattr(message, "media_group_id", None)
+    if not group_id:
+        await _upload_single_handler(client, message)
+        return
+    user = message.from_user
+    if not user:
+        return
+    key = (int(user.id), int(message.chat.id), str(group_id))
+    pending_album_uploads.setdefault(key, []).append(message)
+    task_key = f"album_flush:{user.id}:{message.chat.id}:{group_id}"
+    scheduled = pending_album_uploads.get((key, "scheduled"))
+    if not scheduled:
+        pending_album_uploads[(key, "scheduled")] = True
+        asyncio.create_task(_flush_album_upload(client, key))
+
+
 @app.on_message(
     filters.private
     & (filters.document | filters.video | filters.audio | filters.photo |
@@ -1209,7 +1340,7 @@ async def backup_retry_worker(client):
         await asyncio.sleep(15)
 
 
-async def upload_handler(client, message):
+async def _upload_single_handler(client, message):
     global BOT_USERNAME, BOT_ID
     user = message.from_user
     if not user:
