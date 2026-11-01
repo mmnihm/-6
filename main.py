@@ -2979,7 +2979,7 @@ async def admin_callback_handler(client, query):
             rows.append(nav)
         rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
         list_text = (
-            f"📁 文件夹列表（共 {len(categories)} 个，第 {page + 1} 页）\\n\\n"
+            f"📁 文件夹列表（共 {len(categories)} 个，第 {page + 1} 页）\n\n"
             "点击文件夹名称可复制名称；点击下方数字查看统计和管理。"
         )
         copy_rows = [[{"text": "➕ 新建目录", "callback_data": "mc:dirnew"}]]
