@@ -1011,12 +1011,8 @@ class Database:
         index = max(0, int(index))
         async with self.connect() as db:
             row = await (await db.execute("""
-                SELECT category FROM (
-                    SELECT category FROM files WHERE category IS NOT NULL AND category<>''
-                    UNION
-                    SELECT name AS category FROM categories
-                ) AS all_categories
-                ORDER BY lower(category) LIMIT 1 OFFSET ?
+                SELECT name AS category FROM categories
+                ORDER BY lower(name) LIMIT 1 OFFSET ?
             """, (index,))).fetchone()
         if not row:
             return None
@@ -1053,7 +1049,7 @@ class Database:
                        c.updated_at AS updated_at,
                        c.share_key AS share_key
                 FROM categories c
-                WHERE (? IS NULL OR c.name=?)
+                WHERE (CAST(? AS TEXT) IS NULL OR c.name=CAST(? AS TEXT))
                 ORDER BY lower(c.name)
             """, (category, category))).fetchall()
 
