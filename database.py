@@ -224,7 +224,9 @@ class Database:
                 primary_message_id BIGINT NOT NULL,
                 backup_message_id BIGINT NOT NULL,
                 created_at TEXT NOT NULL,
-                source_fingerprint TEXT
+                source_fingerprint TEXT,
+                album_group_id TEXT,
+                album_position BIGINT NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS manual_members (
                 user_id BIGINT PRIMARY KEY,
@@ -310,7 +312,9 @@ class Database:
                 source_fingerprint TEXT,
                 file_size BIGINT NOT NULL DEFAULT 0,
                 backup_error TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                album_group_id TEXT,
+                album_position BIGINT NOT NULL DEFAULT 0
             );
         """
         async with self.connect() as db:
@@ -334,6 +338,21 @@ class Database:
                 await db.execute("ALTER TABLE files ADD COLUMN source_fingerprint TEXT")
             if "file_size" not in column_names:
                 await db.execute("ALTER TABLE files ADD COLUMN file_size BIGINT NOT NULL DEFAULT 0")
+            if "album_group_id" not in column_names:
+                await db.execute("ALTER TABLE files ADD COLUMN album_group_id TEXT")
+            if "album_position" not in column_names:
+                await db.execute("ALTER TABLE files ADD COLUMN album_position BIGINT NOT NULL DEFAULT 0")
+            batch_columns = await (await db.execute(
+                "SELECT column_name AS name FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='upload_batch_items'"
+            )).fetchall() if self.uses_postgres else await (await db.execute(
+                "PRAGMA table_info(upload_batch_items)"
+            )).fetchall()
+            batch_column_names = {row["name"] for row in batch_columns}
+            if "album_group_id" not in batch_column_names:
+                await db.execute("ALTER TABLE upload_batch_items ADD COLUMN album_group_id TEXT")
+            if "album_position" not in batch_column_names:
+                await db.execute("ALTER TABLE upload_batch_items ADD COLUMN album_position BIGINT NOT NULL DEFAULT 0")
             category_columns = await (await db.execute(
                 "SELECT column_name AS name FROM information_schema.columns "
                 "WHERE table_schema=current_schema() AND table_name='categories'"
@@ -370,6 +389,10 @@ class Database:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_files_category_created_at "
                 "ON files(category, created_at DESC)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_album_group "
+                "ON files(album_group_id, album_position)"
             )
             await db.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_files_source_fingerprint
@@ -592,6 +615,7 @@ class Database:
         self, key, owner_id, file_name, media_type, category,
         primary_channel_id, primary_id, backup_channel_id, backup_id,
         source_fingerprint=None, file_size=0, backup_error="",
+        album_group_id=None, album_position=0,
     ):
         async with self.connect() as db:
             cur = await db.execute("""
@@ -599,13 +623,15 @@ class Database:
                     file_key, owner_id, file_name, media_type, category,
                     primary_channel_id, primary_message_id, backup_channel_id,
                     backup_message_id, source_fingerprint, file_size,
-                    backup_error, created_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    backup_error, created_at, album_group_id, album_position
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 key, int(owner_id), str(file_name), str(media_type), str(category),
                 int(primary_channel_id), int(primary_id), int(backup_channel_id),
                 int(backup_id or 0), source_fingerprint, max(0, int(file_size or 0)),
                 str(backup_error or "")[:500], iso_now(),
+                str(album_group_id) if album_group_id else None,
+                max(0, int(album_position or 0)),
             ))
             await db.commit()
             return cur.rowcount == 1
@@ -630,13 +656,14 @@ class Database:
                     INSERT OR IGNORE INTO files(
                         file_key, owner_id, file_name, media_type, category,
                         primary_message_id, backup_message_id, created_at,
-                        source_fingerprint, file_size
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source_fingerprint, file_size, album_group_id, album_position
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     item["file_key"], item["owner_id"], item["file_name"],
                     item["media_type"], item["category"], item["primary_message_id"],
                     item["backup_message_id"], item["created_at"],
                     item["source_fingerprint"], item["file_size"],
+                    item["album_group_id"], item["album_position"],
                 ))
                 if cur.rowcount == 1:
                     published += 1
@@ -663,18 +690,21 @@ class Database:
 
     async def add_file(self, key, owner_id, file_name, media_type,
                        primary_id, backup_id, category="未分类",
-                       source_fingerprint=None, file_size=0, created_at=None):
+                       source_fingerprint=None, file_size=0, created_at=None,
+                        album_group_id=None, album_position=0):
         async with self.connect() as db:
             cur = await db.execute("""
                 INSERT OR IGNORE INTO files(
                     file_key, owner_id, file_name, media_type, category,
                     primary_message_id, backup_message_id, created_at,
-                    source_fingerprint, file_size
+                    source_fingerprint, file_size, album_group_id, album_position
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (key, owner_id, file_name, media_type, category,
                   primary_id, backup_id, created_at or iso_now(),
-                  source_fingerprint, max(0, int(file_size or 0))))
+                  source_fingerprint, max(0, int(file_size or 0)),
+                  str(album_group_id) if album_group_id else None,
+                  max(0, int(album_position or 0))))
             if cur.rowcount == 1:
                 await self._refresh_category_stats(db, category)
             await db.commit()
