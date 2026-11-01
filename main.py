@@ -442,11 +442,8 @@ async def run_history_scan(primary_channel_id, backup_channel_id):
             await db.mark_scan_completed(channel_id)
 
         category_catalog_cache["expires_at"] = 0
-        cleaned_categories = await db.cleanup_empty_categories()
-        # Materialize category rows and share keys for all categories found in scanned files.
+        # Keep intentionally-created empty folders; refresh the folder catalog only.
         await db.list_categories()
-        if cleaned_categories:
-            log.info("Removed %s empty categories after history scan", cleaned_categories)
 
         primary_progress = await db.get_scan_progress(primary_channel_id)
         backup_progress = await db.get_scan_progress(backup_channel_id)
@@ -1101,11 +1098,8 @@ async def directory_import_confirm_handler(client, message):
                 await asyncio.sleep(0.05)
 
         category_catalog_cache["expires_at"] = 0
-        cleaned_categories = await db.cleanup_empty_categories()
-        # Materialize category rows and share keys for imported directories with files.
+        # Preserve intentionally-created empty folders from the import or admin panel.
         await db.list_categories()
-        if cleaned_categories:
-            log.info("Removed %s empty categories after directory import", cleaned_categories)
 
         if failed == 0:
             pending_directory_imports.pop(user.id, None)
