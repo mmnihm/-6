@@ -1002,8 +1002,9 @@ class Database:
                 "SELECT COUNT(*) AS n FROM files" + where, params
             )).fetchone())["n"]
             rows = await (await db.execute(
-                "SELECT file_key, file_name, media_type, category, created_at "
-                "FROM files" + where + " ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                "SELECT file_key, file_name, media_type, category, created_at, "
+                "album_group_id, album_position "
+                "FROM files" + where + " ORDER BY created_at DESC, album_position LIMIT ? OFFSET ?",
                 params + [limit, offset],
             )).fetchall()
             return rows, [row["category"] for row in categories], total
@@ -1221,6 +1222,8 @@ class Database:
             return await (await db.execute("""
                 SELECT c.name AS category,
                        COALESCE(c.file_count, 0) AS file_count,
+                       (SELECT COUNT(DISTINCT f.album_group_id) FROM files f
+                        WHERE f.category=c.name AND f.album_group_id IS NOT NULL) AS album_count,
                        COALESCE(c.image_count, 0) AS image_count,
                        COALESCE(c.video_count, 0) AS video_count,
                        COALESCE(c.animation_count, 0) AS animation_count,
