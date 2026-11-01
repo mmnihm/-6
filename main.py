@@ -807,55 +807,69 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch):
 async def start_handler(client, message):
     user = message.from_user
     if not user:
+        log.warning("Received /start without from_user")
         return
-    await db.touch_user(user.id)
 
-    payload = message.command[1] if len(message.command) > 1 else ""
-    if payload.startswith("folder_"):
+    log.info("Received /start from user_id=%s", user.id)
+    # User statistics must never prevent the bot from answering /start.
+    try:
+        await db.touch_user(user.id)
+    except Exception:
+        log.exception("Could not update user activity for /start user_id=%s", user.id)
+
+    try:
+        payload = message.command[1] if len(message.command) > 1 else ""
+        if payload.startswith("folder_"):
+            if not await has_access(user.id):
+                await message.reply_text("⛔ 仅限会员群成员使用。请先加入会员群后重试。")
+                return
+            category_row = await db.get_category_by_share_key(payload[7:])
+            if not category_row:
+                await message.reply_text("⚠️ 这个文件夹分享链接已失效或不存在。")
+                return
+            categories = await db.list_categories()
+            category_index = next(
+                (i for i, row in enumerate(categories) if row["category"] == category_row["name"]),
+                None,
+            )
+            if category_index is None:
+                await message.reply_text("⚠️ 文件夹不存在或已被移除。")
+                return
+            category_row = categories[category_index]
+            files = await db.list_category_files(category_row["category"], limit=20, offset=0)
+            category_row = dict(category_row)
+            category_row["category_index"] = category_index
+            await message.reply_text(
+                folder_detail_text(category_row, files, 0, await get_member_group_id()),
+                reply_markup=folder_detail_keyboard(
+                    category_row, 0, len(files) == 20,
+                    await db.is_category_favorite(user.id, category_row["share_key"])
+                ),
+                disable_web_page_preview=True,
+            )
+            return
+        if payload.startswith("file_"):
+            if not await has_access(user.id):
+                await message.reply_text("⛔ 仅限会员群成员使用。请先加入会员群后重试。")
+                return
+            ok, result = await send_catalog_file(client, user.id, payload[5:])
+            if not ok:
+                await message.reply_text(f"❌ {result}")
+            return
+
         if not await has_access(user.id):
-            await message.reply_text("⛔ 仅限会员群成员使用。请先加入会员群后重试。")
+            await message.reply_text("⛔ 本机器人仅对会员开放。请先加入会员群。")
             return
-        category_row = await db.get_category_by_share_key(payload[7:])
-        if not category_row:
-            await message.reply_text("⚠️ 这个文件夹分享链接已失效或不存在。")
-            return
-        categories = await db.list_categories()
-        category_index = next(
-            (i for i, row in enumerate(categories) if row["category"] == category_row["name"]),
-            None,
-        )
-        if category_index is None:
-            await message.reply_text("⚠️ 文件夹不存在或已被移除。")
-            return
-        category_row = categories[category_index]
-        files = await db.list_category_files(category_row["category"], limit=20, offset=0)
-        category_row = dict(category_row)
-        category_row["category_index"] = category_index
         await message.reply_text(
-            folder_detail_text(category_row, files, 0, await get_member_group_id()),
-            reply_markup=folder_detail_keyboard(
-                category_row, 0, len(files) == 20,
-                await db.is_category_favorite(user.id, category_row["share_key"])
-            ),
-            disable_web_page_preview=True,
+            await user_home_text(user.id),
+            reply_markup=await user_home_keyboard(),
         )
-        return
-    if payload.startswith("file_"):
-        if not await has_access(user.id):
-            await message.reply_text("⛔ 仅限会员群成员使用。请先加入会员群后重试。")
-            return
-        ok, result = await send_catalog_file(client, user.id, payload[5:])
-        if not ok:
-            await message.reply_text(f"❌ {result}")
-        return
-
-    if not await has_access(user.id):
-        await message.reply_text("⛔ 本机器人仅对会员开放。请先加入会员群。")
-        return
-    await message.reply_text(
-        await user_home_text(user.id),
-        reply_markup=await user_home_keyboard(),
-    )
+    except Exception:
+        log.exception("Unhandled /start handler error for user_id=%s", user.id)
+        try:
+            await message.reply_text("⚠️ 机器人暂时遇到内部错误，请稍后再发送 /start。")
+        except Exception:
+            log.exception("Could not send /start error reply to user_id=%s", user.id)
 
 
 @app.on_message(
