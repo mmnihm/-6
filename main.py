@@ -2630,12 +2630,41 @@ async def user_catalog_callback_handler(client, query):
         if nav:
             rows.append(nav)
         rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
-        await message.edit_text(
-            f"🗂️ 文件夹列表（共 {len(categories)} 个，第 {page + 1} 页）\n\n"
-            "点击文件夹名称或下方数字查看目录统计与内容："
-            if categories else "🗂️ 暂无文件夹分类。",
-            reply_markup=InlineKeyboardMarkup(rows),
+        list_text = (
+            f"🗂️ 文件夹列表（共 {len(categories)} 个，第 {page + 1} 页）\\n\\n"
+            "点击文件夹名称可复制名称；点击下方数字查看目录统计。"
+            if categories else "🗂️ 暂无文件夹分类。"
         )
+        copy_rows = [
+            [{
+                "text": f"📁 {row['category']}（{int(row['file_count'] or 0)}）",
+                "copy_text": {"text": str(row["category"])},
+            }]
+            for row in selected
+        ]
+        if selected:
+            copy_rows.append([{
+                "text": str(index + 1),
+                "callback_data": f"uc:folderstats:{start_at + index}:{page}",
+            } for index in range(len(selected))])
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append({"text": "⬅️ 上一页", "callback_data": f"uc:folders:{page - 1}"})
+        if start_at + page_size < len(categories):
+            nav_buttons.append({"text": "下一页 ➡️", "callback_data": f"uc:folders:{page + 1}"})
+        if nav_buttons:
+            copy_rows.append(nav_buttons)
+        copy_rows.append([{"text": "⬅️ 返回首页", "callback_data": "uc:home"}])
+        try:
+            await telegram_bot_api("editMessageText", {
+                "chat_id": message.chat.id,
+                "message_id": message.id,
+                "text": list_text,
+                "reply_markup": {"inline_keyboard": copy_rows},
+            })
+        except Exception:
+            log.exception("Could not render folder copy buttons; using compatible keyboard")
+            await message.edit_text(list_text, reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if action[1] == "folderstats" and len(action) >= 3:
