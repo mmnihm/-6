@@ -2509,7 +2509,7 @@ async def user_catalog_callback_handler(client, query):
         await query.answer("仅限会员群成员使用", show_alert=True)
         return
 
-    opening_folder = action[1] in ("folder", "folderresume")
+    opening_folder = action[1] in ("folder", "folderresume", "folderstats")
     if opening_folder:
         # Acknowledge immediately and avoid an extra loading-message edit.
         await query.answer("📂 正在打开目录…")
