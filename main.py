@@ -2187,17 +2187,9 @@ async def admin_handler(client, message):
     if not user or not await is_admin(user.id):
         await reply_admin_only(message)
         return
-    users, files, members, banned = await db.stats()
-    group_id = await get_member_group_id()
-    primary, backup = await get_storage_channels()
     await message.reply_text(
-        "🛠 管理员控制面板\n\n"
-        f"会员群：{'已绑定' if group_id else '未绑定'}\n"
-        f"主存储：{'已绑定' if primary else '未绑定'}  |  备份：{'已绑定' if backup else '未绑定'}\n\n"
-        f"用户：{users}  |  文件：{files}\n"
-        f"手动会员：{members}  |  封禁：{banned}\n\n"
-        "请选择下方按钮管理机器人。",
-        reply_markup=admin_keyboard(),
+        await admin_home_text(),
+        reply_markup=admin_home_keyboard(),
     )
 
 
@@ -2702,6 +2694,13 @@ async def admin_callback_handler(client, query):
             row = (await db.list_categories())[index]
         except (ValueError, IndexError):
             await message.edit_text("⚠️ 目录列表已更新，请重新打开目录管理。", reply_markup=back_keyboard())
+            return
+        active_batch = await db.get_upload_batch(user.id)
+        if active_batch and active_batch["category"] != str(row["category"]):
+            await message.edit_text(
+                f"⚠️ 当前正在上传目录：{active_batch['category']}。请先点击「✅ 结束上传」，发布本批文件后再切换目录。",
+                reply_markup=back_keyboard(),
+            )
             return
         pending_upload_categories[user.id] = str(row["category"])
         await message.edit_text(
