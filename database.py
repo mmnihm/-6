@@ -201,6 +201,11 @@ class Database:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id BIGINT PRIMARY KEY,
+                added_by BIGINT NOT NULL,
+                added_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
                 first_seen TEXT NOT NULL,
@@ -423,6 +428,37 @@ class Database:
                 "SELECT value FROM settings WHERE key='superadmin_id'"
             )).fetchone()
             return int(row["value"]) if row else None
+
+    async def is_admin(self, user_id: int) -> bool:
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT 1 FROM admins WHERE user_id=?", (int(user_id),)
+            )).fetchone()
+            return row is not None
+
+    async def add_admin(self, user_id: int, added_by: int) -> bool:
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "INSERT INTO admins(user_id, added_by, added_at) VALUES(?, ?, ?) "
+                "ON CONFLICT(user_id) DO NOTHING",
+                (int(user_id), int(added_by), iso_now()),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def remove_admin(self, user_id: int) -> bool:
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "DELETE FROM admins WHERE user_id=?", (int(user_id),)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def list_admins(self):
+        async with self.connect() as db:
+            return await (await db.execute(
+                "SELECT user_id, added_by, added_at FROM admins ORDER BY added_at, user_id"
+            )).fetchall()
 
     async def touch_user(self, user_id: int):
         now = iso_now()
