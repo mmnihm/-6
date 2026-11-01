@@ -292,6 +292,26 @@ class Database:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS upload_batches (
+                owner_id BIGINT PRIMARY KEY,
+                category TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS upload_batch_items (
+                file_key TEXT PRIMARY KEY,
+                owner_id BIGINT NOT NULL,
+                file_name TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                category TEXT NOT NULL,
+                primary_channel_id BIGINT NOT NULL,
+                primary_message_id BIGINT NOT NULL,
+                backup_channel_id BIGINT NOT NULL,
+                backup_message_id BIGINT NOT NULL,
+                source_fingerprint TEXT,
+                file_size BIGINT NOT NULL DEFAULT 0,
+                backup_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
         """
         async with self.connect() as db:
             if self.uses_postgres:
@@ -551,6 +571,95 @@ class Database:
                 )).fetchall()
             found.update(row["source_fingerprint"] for row in rows)
         return found
+
+    async def start_upload_batch(self, owner_id, category):
+        async with self.connect() as db:
+            await db.execute(
+                "INSERT INTO upload_batches(owner_id, category, created_at) VALUES(?, ?, ?) "
+                "ON CONFLICT(owner_id) DO UPDATE SET category=excluded.category, created_at=excluded.created_at",
+                (int(owner_id), str(category)[:120], iso_now()),
+            )
+            await db.commit()
+
+    async def get_upload_batch(self, owner_id):
+        async with self.connect() as db:
+            return await (await db.execute(
+                "SELECT owner_id, category, created_at FROM upload_batches WHERE owner_id=?",
+                (int(owner_id),),
+            )).fetchone()
+
+    async def stage_upload_batch_item(
+        self, key, owner_id, file_name, media_type, category,
+        primary_channel_id, primary_id, backup_channel_id, backup_id,
+        source_fingerprint=None, file_size=0, backup_error="",
+    ):
+        async with self.connect() as db:
+            cur = await db.execute("""
+                INSERT OR IGNORE INTO upload_batch_items(
+                    file_key, owner_id, file_name, media_type, category,
+                    primary_channel_id, primary_message_id, backup_channel_id,
+                    backup_message_id, source_fingerprint, file_size,
+                    backup_error, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                key, int(owner_id), str(file_name), str(media_type), str(category),
+                int(primary_channel_id), int(primary_id), int(backup_channel_id),
+                int(backup_id or 0), source_fingerprint, max(0, int(file_size or 0)),
+                str(backup_error or "")[:500], iso_now(),
+            ))
+            await db.commit()
+            return cur.rowcount == 1
+
+    async def publish_upload_batch(self, owner_id):
+        """Atomically publish every staged item in a batch to the member catalog."""
+        async with self.connect() as db:
+            batch = await (await db.execute(
+                "SELECT category FROM upload_batches WHERE owner_id=?", (int(owner_id),)
+            )).fetchone()
+            if not batch:
+                return {"published": 0, "failed_backup": 0, "category": None}
+            category = str(batch["category"])
+            items = await (await db.execute(
+                "SELECT * FROM upload_batch_items WHERE owner_id=? ORDER BY created_at, file_key",
+                (int(owner_id),),
+            )).fetchall()
+            published = 0
+            failed_backup = 0
+            for item in items:
+                cur = await db.execute("""
+                    INSERT OR IGNORE INTO files(
+                        file_key, owner_id, file_name, media_type, category,
+                        primary_message_id, backup_message_id, created_at,
+                        source_fingerprint, file_size
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    item["file_key"], item["owner_id"], item["file_name"],
+                    item["media_type"], item["category"], item["primary_message_id"],
+                    item["backup_message_id"], item["created_at"],
+                    item["source_fingerprint"], item["file_size"],
+                ))
+                if cur.rowcount == 1:
+                    published += 1
+                    await self._refresh_category_stats(db, item["category"])
+                    if item["backup_error"]:
+                        failed_backup += 1
+                        now = iso_now()
+                        await db.execute("""
+                            INSERT INTO backup_retry_jobs(
+                                file_key, primary_channel_id, primary_message_id,
+                                backup_channel_id, attempts, next_retry_at,
+                                last_error, created_at, updated_at
+                            ) VALUES(?, ?, ?, ?, 0, ?, ?, ?, ?)
+                            ON CONFLICT(file_key) DO NOTHING
+                        """, (
+                            item["file_key"], item["primary_channel_id"],
+                            item["primary_message_id"], item["backup_channel_id"],
+                            now, item["backup_error"], now, now,
+                        ))
+            await db.execute("DELETE FROM upload_batch_items WHERE owner_id=?", (int(owner_id),))
+            await db.execute("DELETE FROM upload_batches WHERE owner_id=?", (int(owner_id),))
+            await db.commit()
+            return {"published": published, "failed_backup": failed_backup, "category": category}
 
     async def add_file(self, key, owner_id, file_name, media_type,
                        primary_id, backup_id, category="未分类",
