@@ -1208,21 +1208,40 @@ class Database:
             await db.commit()
 
     async def get_category_storage_stats(self, category: str):
-        """Return approximate byte totals by Telegram media type for one folder."""
+        """Return approximate byte totals by media class, including common document extensions."""
         async with self.connect() as db:
             row = await (await db.execute("""
                 SELECT
-                    COALESCE(SUM(CASE WHEN lower(media_type) IN ('video', 'video_note')
-                        THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS video_size,
-                    COALESCE(SUM(CASE WHEN lower(media_type) IN ('photo', 'image')
-                        THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS image_size,
-                    COALESCE(SUM(CASE WHEN lower(media_type) NOT IN
-                        ('video', 'video_note', 'photo', 'image')
-                        THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS other_size,
-                    COALESCE(SUM(CASE WHEN COALESCE(file_size, 0) > 0 THEN 1 ELSE 0 END), 0)
+                    COALESCE(SUM(CASE WHEN is_video=1 THEN file_size ELSE 0 END), 0)
+                        AS video_size,
+                    COALESCE(SUM(CASE WHEN is_image=1 THEN file_size ELSE 0 END), 0)
+                        AS image_size,
+                    COALESCE(SUM(CASE WHEN is_video=0 AND is_image=0
+                        THEN file_size ELSE 0 END), 0) AS other_size,
+                    COALESCE(SUM(CASE WHEN file_size>0 THEN 1 ELSE 0 END), 0)
                         AS sized_count,
                     COUNT(*) AS file_count
-                FROM files WHERE category=?
+                FROM (
+                    SELECT COALESCE(file_size, 0) AS file_size,
+                           CASE WHEN lower(media_type) IN ('video', 'video_note')
+                               OR (lower(media_type)='document' AND (
+                                   lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
+                                   OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
+                                   OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
+                                   OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
+                                   OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
+                                   OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
+                               )) THEN 1 ELSE 0 END AS is_video,
+                           CASE WHEN lower(media_type) IN ('photo', 'image')
+                               OR (lower(media_type)='document' AND (
+                                   lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
+                                   OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
+                                   OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
+                                   OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
+                                   OR lower(file_name) LIKE '%.tiff'
+                               )) THEN 1 ELSE 0 END AS is_image
+                    FROM files WHERE category=?
+                ) AS folder_files
             """, (str(category),))).fetchone()
             return {
                 "video_size": int(row["video_size"] or 0),
