@@ -1827,12 +1827,31 @@ async def scanner_login_input_handler(client, message):
     pending_category = pending_category_actions.get(user.id)
     if pending_category:
         if pending_category["action"] == "create":
-            await db.save_category(value[:120])
+            new_category = value[:120].strip()
+            if not new_category:
+                await message.reply_text("❌ 文件夹名称不能为空，请重新发送名称。")
+                return
+            active_batch = await db.get_upload_batch(user.id)
+            await db.save_category(new_category)
             category_catalog_cache["expires_at"] = 0
             pending_category_actions.pop(user.id, None)
-            await message.reply_text(
-                f"✅ 已创建目录：{value[:120]}\n空目录会立即显示在会员文件夹列表中。"
-            )
+            if active_batch:
+                await message.reply_text(
+                    f"✅ 已创建目录：{new_category}\n"
+                    "空目录会立即显示在会员文件夹列表中。\n\n"
+                    f"⚠️ 你当前还有未结束的上传批次：{active_batch['category']}。"
+                    "请先点击「✅ 结束上传」，再选择新目录上传。",
+                    reply_markup=upload_active_keyboard(),
+                )
+            else:
+                pending_upload_categories[user.id] = new_category
+                await message.reply_text(
+                    f"✅ 已创建目录：{new_category}\n"
+                    "📤 已自动选中这个目录，现在可以直接发送图片、视频或文件。\n\n"
+                    "支持连续上传单文件和成组相册。全部发送完毕后，"
+                    "点击底部「✅ 结束上传」，资源才会正式显示给会员。",
+                    reply_markup=upload_active_keyboard(),
+                )
         elif pending_category["action"] == "rename":
             old_name = pending_category["name"]
             if await db.rename_category(old_name, value[:120]):
