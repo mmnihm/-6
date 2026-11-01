@@ -38,6 +38,7 @@ scanner_login_states = {}
 scanner_login_clients = {}
 pending_directory_imports = {}
 pending_category_actions = {}
+pending_upload_categories = {}
 pending_home_button_actions = {}
 pending_admin_actions = {}
 directory_import_running = False
@@ -1198,7 +1199,8 @@ async def upload_handler(client, message):
         await message.reply_text("❌ 主存储频道和备份频道不能是同一个频道，请管理员检查 /storage。")
         return
 
-    category = parse_category(message)
+    selected_category = pending_upload_categories.get(user.id) if await is_admin(user.id) else None
+    category = str(selected_category or parse_category(message))[:120]
     status = await message.reply_text("⏳ 正在检查频道权限并保存文件…")
     primary_id = None
     backup_id = 0
@@ -1485,6 +1487,19 @@ async def scanner_login_start_handler(client, message):
     )
 
 
+@app.on_message(filters.private & filters.command("uploadcancel"))
+async def cancel_upload_category_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    selected = pending_upload_categories.pop(user.id, None)
+    await message.reply_text(
+        f"✅ 已取消目录选择（原目录：{selected}）。后续上传将按文件说明自动分类。"
+        if selected else "当前没有选择上传目录。"
+    )
+
+
 @app.on_message(filters.private & filters.command("cancel"))
 async def cancel_pending_admin_handler(client, message):
     user = message.from_user
@@ -1586,6 +1601,7 @@ async def scanner_login_input_handler(client, message):
     if pending_category:
         if pending_category["action"] == "create":
             await db.save_category(value[:120])
+            category_catalog_cache["expires_at"] = 0
             pending_category_actions.pop(user.id, None)
             await message.reply_text(
                 f"✅ 已创建目录：{value[:120]}\n空目录会立即显示在会员文件夹列表中。"
@@ -2576,6 +2592,24 @@ async def admin_callback_handler(client, query):
             "创建后空目录会立即显示给会员。",
             reply_markup=back_keyboard(),
         )
+    elif action.startswith("dirupload:"):
+        try:
+            index = int(action.split(":", 1)[1])
+            row = (await db.list_categories())[index]
+        except (ValueError, IndexError):
+            await message.edit_text("⚠️ 目录列表已更新，请重新打开目录管理。", reply_markup=back_keyboard())
+            return
+        pending_upload_categories[user.id] = str(row["category"])
+        await message.edit_text(
+            f"📤 已选择上传目录：{row['category']}\n\n"
+            "现在直接向机器人发送图片、视频、音频或文件，都会保存到这个目录。\n"
+            "可以连续上传多个文件；要切换目录，请重新选择其他目录。\n"
+            "发送 /uploadcancel 可取消目录选择。",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📁 选择其他目录", callback_data="mc:directories")],
+                [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+            ]),
+        )
     elif action.startswith("directory:"):
         try:
             index = int(action.split(":", 1)[1])
@@ -2586,6 +2620,7 @@ async def admin_callback_handler(client, query):
             return
         count = int(row["file_count"] or 0)
         buttons = [
+            [InlineKeyboardButton("📤 上传文件到此目录", callback_data=f"mc:dirupload:{index}")],
             [InlineKeyboardButton("✏️ 修改目录名称", callback_data=f"mc:dirrename:{index}")],
         ]
         if count == 0:
