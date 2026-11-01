@@ -717,35 +717,19 @@ async def send_catalog_file(client, user_id, file_key):
 
 
 async def try_send_catalog_album(client, user_id, group):
-    """Build one album from compatible media, even when source files are in different channels."""
+    """Copy one original Telegram album as a unit without rebuilding unrelated media."""
     if len(group) < 2 or len(group) > 10:
         return False
-
-    media = []
-    for item, record, source_chat_id, source_message_id in group:
-        kind = str(record["media_type"] or "").lower()
-        message = await client.get_messages(
-            source_chat_id, message_ids=source_message_id
-        )
-        if not message or getattr(message, "empty", False):
-            return False
-        source_media = getattr(message, kind, None)
-        if not source_media or not getattr(source_media, "file_id", None):
-            return False
-        caption = (getattr(message, "caption", None) or "")[:1024] or None
-        if kind == "photo":
-            media.append(InputMediaPhoto(source_media.file_id, caption=caption))
-        elif kind == "video":
-            media.append(InputMediaVideo(source_media.file_id, caption=caption))
-        elif kind == "document":
-            media.append(InputMediaDocument(source_media.file_id, caption=caption))
-        elif kind == "audio":
-            media.append(InputMediaAudio(source_media.file_id, caption=caption))
-        else:
-            return False
-
-    await client.send_media_group(chat_id=user_id, media=media)
-    return True
+    source_chats = {int(entry[2]) for entry in group}
+    if len(source_chats) != 1:
+        return False
+    message_ids = [int(entry[3]) for entry in group]
+    copied = await telegram_bot_api("copyMessages", {
+        "chat_id": int(user_id),
+        "from_chat_id": source_chats.pop(),
+        "message_ids": message_ids,
+    })
+    return isinstance(copied, list) and len(copied) == len(group)
 
 
 async def send_catalog_batch(client, user_id, share_key, offset, batch, track_progress=True):
@@ -776,33 +760,25 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 source_message_id = int(record["primary_message_id"])
         prepared.append((index, item, record, source_chat_id, source_message_id))
 
-    def album_kind(record):
-        if not record:
-            return None
-        kind = str(record["media_type"] or "").lower()
-        if kind in ("photo", "video"):
-            return "visual"
-        if kind in ("document", "audio"):
-            return kind
-        return None
-
-    # Collect by Telegram-compatible media type, not by adjacency or source channel.
-    buckets = {"visual": [], "document": [], "audio": []}
+    # Only files carrying the same stored Telegram album ID are sent together.
+    # Unrelated photos/videos are never merged into an artificial album.
+    grouped = {}
     units = []
     for entry in prepared:
-        kind = album_kind(entry[2])
-        if kind and entry[3] is not None and entry[4] is not None:
-            buckets[kind].append(entry)
+        album_id = entry[1]["album_group_id"]
+        if album_id and entry[3] is not None and entry[4] is not None:
+            grouped.setdefault(str(album_id), []).append(entry)
         else:
             units.append([entry])
-
-    for entries in buckets.values():
-        for position in range(0, len(entries), 10):
-            chunk = entries[position:position + 10]
-            if len(chunk) >= 2:
-                units.append(chunk)
-            else:
-                units.extend([[entry] for entry in chunk])
+    for album_id, entries in grouped.items():
+        entries.sort(key=lambda entry: int(entry[1]["album_position"] or 0))
+        expected = int(entries[0][1]["album_size"] or len(entries))
+        if 2 <= len(entries) <= 10 and len(entries) == expected:
+            units.append(entries)
+        else:
+            # A group crossing a page boundary is delivered individually rather
+            # than sending a misleading partial album.
+            units.extend([[entry] for entry in entries])
 
     units.sort(key=lambda unit: unit[0][0])
     completed = set()
