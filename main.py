@@ -1816,10 +1816,18 @@ async def scan_history_handler(client, message):
     b = await db.get_scan_progress(backup)
     backfilled = await db.publish_primary_catalog(primary, config.ADMIN_ID)
     if p["completed"] and b["completed"]:
+        # A completed scan can still have legacy primary-channel records waiting
+        # to be published. Always finalize directory maintenance before returning.
+        cleaned_categories = await db.cleanup_empty_categories()
+        categories = await db.list_categories()
+        _, total_files, _, _ = await db.stats()
         await message.reply_text(
             "✅ 两个频道的历史扫描已完成。\n"
             f"本次从已保存的主频道扫描记录补入目录：{backfilled} 个文件。\n"
-            "已有文件和扫描进度均已保留。"
+            f"📁 当前有效文件夹：{len(categories)} 个\n"
+            f"🧹 本次清理空文件夹：{cleaned_categories} 个\n"
+            f"📦 当前目录资源总数：{total_files} 个\n\n"
+            "标签分类已同步建立目录索引和分享链接；已有文件及扫描进度均已保留。"
         )
         return
     scan_task = asyncio.create_task(run_history_scan(primary, backup))
