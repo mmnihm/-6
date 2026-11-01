@@ -32,6 +32,7 @@ BOT_USERNAME = None
 BOT_ID = None
 telegram_http_session = None
 pending_channel_bindings = {}
+membership_cache = {}
 scanner_login_states = {}
 scanner_login_clients = {}
 pending_directory_imports = {}
@@ -141,6 +142,13 @@ async def get_membership_tier(user_id: int):
     if await db.has_manual_membership(user_id):
         return "手动会员"
 
+    now = asyncio.get_running_loop().time()
+    cached = membership_cache.get(int(user_id))
+    if cached and cached[0] > now:
+        return cached[1]
+    if cached:
+        membership_cache.pop(int(user_id), None)
+
     group_id = await get_member_group_id()
     if not group_id:
         log.error("Membership check cannot run: member group is not bound")
@@ -174,11 +182,18 @@ async def get_membership_tier(user_id: int):
             "Membership check via Bot API: user=%s group=%s status=%s",
             user_id, group_id, status,
         )
-        if status in ("member", "administrator", "creator"):
-            return "黄金会员"
-        if status == "restricted" and member.get("is_member") is True:
-            return "黄金会员"
-        return None
+        if status in ("member", "administrator", "creator") or (
+            status == "restricted" and member.get("is_member") is True
+        ):
+            tier = "黄金会员"
+        else:
+            tier = None
+        # Cache group membership for 15 seconds to avoid repeated serial
+        # Telegram getChatMember calls on rapid folder navigation.
+        if len(membership_cache) >= 2000:
+            membership_cache.pop(next(iter(membership_cache)))
+        membership_cache[int(user_id)] = (now + 15, tier)
+        return tier
     except Exception as exc:
         log.error(
             "Bot API membership check failed: user=%s group=%s error=%s",
@@ -2051,12 +2066,21 @@ async def catalog_search_handler(client, message):
 @app.on_callback_query(filters.regex(r"^uc:"))
 async def user_catalog_callback_handler(client, query):
     user = query.from_user
-    if not user or not await has_access(user.id):
-        await query.answer("仅限会员群成员使用", show_alert=True)
-        return
     action = query.data.split(":")
     message = query.message
-    if not message:
+    if not user or not message:
+        await query.answer("仅限会员群成员使用", show_alert=True)
+        return
+
+    opening_folder = action[1] in ("folder", "folderresume")
+    if opening_folder:
+        # Acknowledge immediately and avoid an extra loading-message edit.
+        await query.answer("📂 正在打开目录…")
+        if not await has_access(user.id):
+            await message.edit_text("⛔ 仅限会员群成员使用。")
+            return
+    elif not await has_access(user.id):
+        await query.answer("仅限会员群成员使用", show_alert=True)
         return
 
     if action[1] == "home":
@@ -2203,14 +2227,9 @@ async def user_catalog_callback_handler(client, query):
         return
 
     if action[1] in ("folder", "folderresume") and len(action) >= 3:
-        # Acknowledge immediately so slow membership/database work never leaves
-        # Telegram's button spinner waiting.
-        await query.answer("📂 正在打开目录…")
-        await message.edit_text("📂 正在加载目录内容…")
         try:
             index = int(action[2])
-            categories = await db.list_categories()
-            category_row = categories[index]
+            category_row = await db.get_category_by_index(index)
             category = category_row["category"]
             if action[1] == "folderresume":
                 offset = await get_saved_folder_offset(
