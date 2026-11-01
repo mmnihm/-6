@@ -39,6 +39,7 @@ scanner_login_clients = {}
 pending_directory_imports = {}
 pending_category_actions = {}
 pending_home_button_actions = {}
+pending_admin_actions = {}
 directory_import_running = False
 cangku_backup_in_progress = set()
 category_delivery_in_progress = set()
@@ -54,6 +55,7 @@ def admin_keyboard():
         [InlineKeyboardButton("🔘 首页按钮设置", callback_data="mc:homebuttons")],
         [InlineKeyboardButton("📢 群发广播", callback_data="mc:broadcast"), InlineKeyboardButton("📊 数据统计", callback_data="mc:stats")],
         [InlineKeyboardButton("🔐 扫描账号登录", callback_data="mc:scannerlogin")],
+        [InlineKeyboardButton("🛡 管理员管理", callback_data="mc:admins")],
         [InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
     ])
 
@@ -123,8 +125,8 @@ WELCOME = (
 )
 
 
-async def is_admin(user_id: int) -> bool:
-    if config.ADMIN_ID == user_id:
+async def is_superadmin(user_id: int) -> bool:
+    if int(config.ADMIN_ID) == int(user_id):
         return True
     try:
         stored_admin_id = await db.get_admin_id()
@@ -134,9 +136,21 @@ async def is_admin(user_id: int) -> bool:
         return False
 
 
+async def is_admin(user_id: int) -> bool:
+    if await is_superadmin(user_id):
+        return True
+    try:
+        return await db.is_admin(user_id)
+    except Exception:
+        log.exception("Could not read delegated admin list")
+        return False
+
+
 async def get_membership_tier(user_id: int):
-    if await is_admin(user_id):
+    if await is_superadmin(user_id):
         return "超级管理员"
+    if await is_admin(user_id):
+        return "管理员"
     # These independent local checks used to run as two serial database
     # round trips. Run them concurrently without weakening either permission.
     is_banned, has_manual_membership = await asyncio.gather(
@@ -461,7 +475,7 @@ async def run_history_scan(primary_channel_id, backup_channel_id):
 
 
 async def reply_admin_only(message):
-    await message.reply_text("⛔ 仅超级管理员可使用此命令。")
+    await message.reply_text("⛔ 仅管理员可使用此命令。")
 
 
 DEFAULT_HOME_BUTTONS = [
@@ -1471,6 +1485,15 @@ async def scanner_login_start_handler(client, message):
     )
 
 
+@app.on_message(filters.private & filters.command("cancel"))
+async def cancel_pending_admin_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        return
+    if pending_admin_actions.pop(user.id, None):
+        await message.reply_text("已取消添加管理员。")
+
+
 @app.on_message(filters.private & filters.command("scancancel"))
 async def scanner_login_cancel_handler(client, message):
     user = message.from_user
@@ -1499,6 +1522,29 @@ async def scanner_login_input_handler(client, message):
     login_client = scanner_login_clients.get(user.id)
     value = (message.text or "").strip()
     if not value:
+        return
+
+    pending_admin_action = pending_admin_actions.get(user.id)
+    if pending_admin_action:
+        if pending_admin_action.get("action") == "add":
+            try:
+                target_id = int(value)
+                if target_id <= 0:
+                    raise ValueError()
+            except ValueError:
+                await message.reply_text("❌ 用户 ID 必须是正整数，请重新发送，或发送 /cancel 取消。")
+                return
+            superadmin_id = await db.get_admin_id()
+            if target_id in (int(config.ADMIN_ID), int(superadmin_id or 0)):
+                await message.reply_text("⚠️ 这个账号已经是超级管理员，无需重复添加。")
+                pending_admin_actions.pop(user.id, None)
+                return
+            added = await db.add_admin(target_id, user.id)
+            pending_admin_actions.pop(user.id, None)
+            await message.reply_text(
+                f"✅ 已添加管理员：{target_id}" if added
+                else f"ℹ️ 用户 {target_id} 已经是管理员。"
+            )
         return
 
     pending_home_action = pending_home_button_actions.get(user.id)
@@ -2025,7 +2071,7 @@ async def admin_handler(client, message):
     group_id = await get_member_group_id()
     primary, backup = await get_storage_channels()
     await message.reply_text(
-        "👑 超级管理员控制面板\n\n"
+        "🛠 管理员控制面板\n\n"
         f"会员群：{'已绑定' if group_id else '未绑定'}\n"
         f"主存储：{'已绑定' if primary else '未绑定'}  |  备份：{'已绑定' if backup else '未绑定'}\n\n"
         f"用户：{users}  |  文件：{files}\n"
@@ -2450,7 +2496,7 @@ async def admin_callback_handler(client, query):
         group_id = await get_member_group_id()
         primary, backup = await get_storage_channels()
         text = (
-            "👑 超级管理员控制面板\n\n"
+            "🛠 管理员控制面板\n\n"
             f"会员群：{'已绑定' if group_id else '未绑定'}\n"
             f"主存储：{'已绑定' if primary else '未绑定'}  |  备份：{'已绑定' if backup else '未绑定'}\n\n"
             f"用户：{users}  |  文件：{files}\n手动会员：{members}  |  封禁：{banned}\n\n请选择下方按钮管理机器人。"
@@ -2578,6 +2624,64 @@ async def admin_callback_handler(client, query):
             ]))
         else:
             await message.edit_text("❌ 删除失败：目录可能已有文件，系统不会删除或影响其中资源。", reply_markup=back_keyboard())
+    elif action == "admins":
+        if not await is_superadmin(user.id):
+            await query.answer("只有超级管理员可以管理管理员名单", show_alert=True)
+            return
+        delegated = await db.list_admins()
+        superadmin_id = await db.get_admin_id()
+        lines = [
+            f"👑 超级管理员：{int(config.ADMIN_ID)}"
+        ]
+        if superadmin_id and int(superadmin_id) != int(config.ADMIN_ID):
+            lines.append(f"👑 数据库超级管理员：{int(superadmin_id)}")
+        rows = [[InlineKeyboardButton("➕ 添加管理员", callback_data="mc:adminadd")]]
+        if delegated:
+            lines.append("")
+            lines.append("🛡 其他管理员：")
+            for item in delegated:
+                admin_id = int(item["user_id"])
+                lines.append(f"• {admin_id}")
+                rows.append([InlineKeyboardButton(
+                    f"❌ 移除管理员 {admin_id}",
+                    callback_data=f"mc:adminremove:{admin_id}",
+                )])
+        else:
+            lines.extend(["", "目前还没有添加其他管理员。"])
+        rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
+        await message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+    elif action == "adminadd":
+        if not await is_superadmin(user.id):
+            await query.answer("只有超级管理员可以添加管理员", show_alert=True)
+            return
+        pending_admin_actions[user.id] = {"action": "add"}
+        await message.edit_text(
+            "➕ 添加管理员\n\n请发送对方的 Telegram 数字用户 ID。\n"
+            "只接受数字 ID，不要发送用户名。\n\n发送 /cancel 可取消。",
+            reply_markup=back_keyboard(),
+        )
+    elif action.startswith("adminremove:"):
+        if not await is_superadmin(user.id):
+            await query.answer("只有超级管理员可以移除管理员", show_alert=True)
+            return
+        try:
+            target_id = int(action.split(":", 1)[1])
+        except ValueError:
+            await message.edit_text("❌ 管理员 ID 无效。", reply_markup=back_keyboard())
+            return
+        superadmin_id = await db.get_admin_id()
+        if target_id in (int(config.ADMIN_ID), int(superadmin_id or 0)):
+            await message.edit_text("❌ 不能移除超级管理员。", reply_markup=back_keyboard())
+            return
+        removed = await db.remove_admin(target_id)
+        await message.edit_text(
+            ("✅ 已移除管理员：" if removed else "ℹ️ 这个用户不在管理员名单中：")
+            + str(target_id),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ 返回管理员列表", callback_data="mc:admins")],
+                [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+            ]),
+        )
     elif action == "homebuttons":
         buttons = await get_home_buttons()
         rows = []
@@ -2704,7 +2808,7 @@ async def admin_callback_handler(client, query):
                 await message.edit_text("❌ 无法启动登录流程，请稍后重试。", reply_markup=back_keyboard())
     elif action == "commands":
         await message.edit_text(
-            "📖 管理命令速查\n\n"
+            "📖 管理命令速查\n\n管理员名单：打开 /admin → 管理员管理（仅超级管理员）\n\n"
             "/bindgroup — 绑定会员群\n/membercheck [用户ID] — 检查会员群和成员权限\n/bindmain — 绑定主存储频道\n/bindbackup — 绑定备份频道\n/storage — 查看绑定状态\n"
             "/grant 用户ID 天数|永久 — 授权会员\n/revoke 用户ID — 取消授权\n/ban 用户ID 原因 — 封禁\n/unban 用户ID — 解封\n"
             "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scancheck — 分别检查主备份频道访问和历史读取权限\n/scan — 自动扫描主备份频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
