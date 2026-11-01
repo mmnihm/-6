@@ -2214,7 +2214,7 @@ async def user_catalog_callback_handler(client, query):
         else:
             categories = await db.list_categories()
             category_catalog_cache["rows"] = [dict(row) for row in categories]
-            category_catalog_cache["expires_at"] = now + 15
+            category_catalog_cache["expires_at"] = now + 30
             categories = category_catalog_cache["rows"]
         start_at = max(0, page) * 20
         selected = categories[start_at:start_at + 20]
@@ -2244,7 +2244,7 @@ async def user_catalog_callback_handler(client, query):
         try:
             index = int(action[2])
             cached_rows = category_catalog_cache["rows"]
-            if category_catalog_cache["expires_at"] > asyncio.get_running_loop().time() and index < len(cached_rows):
+            if category_catalog_cache["expires_at"] > asyncio.get_running_loop().time() and 0 <= index < len(cached_rows):
                 category_row = dict(cached_rows[index])
             else:
                 category_row = await db.get_category_by_index(index)
