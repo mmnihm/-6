@@ -40,6 +40,7 @@ scanner_login_clients = {}
 pending_directory_imports = {}
 pending_category_actions = {}
 pending_upload_categories = {}
+upload_status_messages = {}
 pending_album_uploads = {}
 pending_home_button_actions = {}
 pending_admin_actions = {}
@@ -69,6 +70,20 @@ def upload_active_keyboard():
         resize_keyboard=True,
         is_persistent=True,
     )
+
+async def get_upload_status_message(message, user_id, text):
+    """Reuse one editable progress message for an admin's active upload batch."""
+    status = upload_status_messages.get(int(user_id))
+    if status is None:
+        status = await message.reply_text(text, reply_markup=upload_active_keyboard())
+        upload_status_messages[int(user_id)] = status
+    else:
+        try:
+            await status.edit_text(text)
+        except Exception as exc:
+            log.debug("Could not update upload progress message: %s", exc)
+    return status
+
 
 
 async def admin_home_text():
@@ -934,7 +949,19 @@ async def _flush_album_upload(client, key):
         await _upload_single_handler(client, messages[0])
         return
     user = messages[0].from_user
-    status = await messages[0].reply_text(f"⏳ 收到一组媒体（{len(messages)} 个），正在整组保存…")
+    if user and await is_admin(user.id):
+        active_batch = await db.get_upload_batch(user.id)
+        selected_for_status = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
+    else:
+        selected_for_status = None
+    status = (
+        await get_upload_status_message(
+            messages[0], user.id,
+            f"⏳ 正在上传到目录：{selected_for_status}\n📦 正在整组保存 {len(messages)} 个文件…",
+        )
+        if user and selected_for_status else
+        await messages[0].reply_text(f"⏳ 收到一组媒体（{len(messages)} 个），正在整组保存…")
+    )
     try:
         if not user or not await has_access(user.id):
             await status.edit_text("⛔ 仅限会员群成员上传文件。")
@@ -1030,7 +1057,13 @@ async def _flush_album_upload(client, key):
             + ("\n\n尚未对会员开放，全部上传后点击「结束上传」。" if await is_admin(user.id) and selected_category else "")
         )
         if await is_admin(user.id) and selected_category:
-            await messages[0].reply_text("📤 批量上传进行中。相册尚未对会员显示。", reply_markup=upload_active_keyboard())
+            await status.edit_text(
+                "📥 相册已保存到待发布批次。\n"
+                f"📂 上传目录：{category}\n"
+                f"🗂 相册：1 组 · 📦 文件：{saved} 个\n"
+                "可以继续发送文件；此提示会自动更新，不会逐个发送提醒。\n"
+                "全部发送完毕后，点击「✅ 结束上传」统一发布。"
+            )
     except Exception as exc:
         log.exception("Grouped album upload failed")
         await status.edit_text(f"❌ 相册整组保存失败：{type(exc).__name__}: {str(exc)[:300]}")
@@ -1369,7 +1402,15 @@ async def _upload_single_handler(client, message):
     if await is_admin(user.id) and selected_category:
         if not active_batch:
             await db.start_upload_batch(user.id, category)
-    status = await message.reply_text("⏳ 正在检查频道权限并保存文件…")
+    is_admin_batch = bool(await is_admin(user.id) and selected_category)
+    status = (
+        await get_upload_status_message(
+            message, user.id,
+            f"⏳ 正在上传到目录：{category}\n📦 正在保存文件，请继续发送；完成后点击「✅ 结束上传」。",
+        )
+        if is_admin_batch else
+        await message.reply_text("⏳ 正在检查频道权限并保存文件…")
+    )
     primary_id = None
     backup_id = 0
     step = "检查主频道权限"
@@ -1445,15 +1486,12 @@ async def _upload_single_handler(client, message):
                 log.debug("Could not delete duplicate-upload status message")
             return
 
-        if await is_admin(user.id) and selected_category:
+        if is_admin_batch:
             await status.edit_text(
-                "📥 文件已收到，暂未对会员发布。\n"
-                f"📂 上传目录：{category}\n📄 文件：{file_name}\n\n"
-                "可以继续发送文件；全部发送完毕后，点击聊天底部的「✅ 结束上传」。"
-            )
-            await message.reply_text(
-                "📤 批量上传进行中。文件尚未对会员显示。",
-                reply_markup=upload_active_keyboard(),
+                "📥 文件已保存到待发布批次。\n"
+                f"📂 上传目录：{category}\n"
+                "📦 可以继续发送文件；此提示会自动更新，不会逐个发送提醒。\n"
+                "全部发送完毕后，点击「✅ 结束上传」统一发布。"
             )
             return
 
@@ -1733,6 +1771,17 @@ async def scanner_login_input_handler(client, message):
         result = await db.publish_upload_batch(user.id)
         pending_upload_categories.pop(user.id, None)
         category_catalog_cache["expires_at"] = 0
+        progress_message = upload_status_messages.pop(int(user.id), None)
+        if result.get("category") is not None and progress_message is not None:
+            try:
+                await progress_message.edit_text(
+                    "🎉 本批上传已结束并发布！\n"
+                    f"📁 目录：{result['category']}\n"
+                    f"✅ 新增资源：{result['published']} 个\n"
+                    f"⚠️ 待补备份：{result['failed_backup']} 个"
+                )
+            except Exception:
+                log.exception("Could not finalize upload progress message")
         if result.get("category") is None:
             await message.reply_text("目前没有待发布的上传批次。", reply_markup=admin_home_keyboard())
         else:
