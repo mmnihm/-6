@@ -869,35 +869,50 @@ class Database:
             )
             await db.commit()
 
-    async def list_categories(self):
+    async def get_category_by_index(self, index):
+        """Load one folder summary without aggregating the whole file catalog."""
+        index = max(0, int(index))
         async with self.connect() as db:
-            # Ensure categories discovered from uploads/scans also receive stable
-            # share keys, so folder favorites and deep links work for every folder.
-            # Only repair missing category rows/share keys. The old implementation
-            # issued two writes for every category on every folder click, even
-            # when all rows already existed; this was especially slow on remote DBs.
-            names = await (await db.execute(
-                "SELECT DISTINCT files.category, categories.name AS existing_name "
-                "FROM files LEFT JOIN categories ON categories.name=files.category "
-                "WHERE files.category IS NOT NULL AND files.category<>'' "
-                "AND (categories.name IS NULL OR categories.share_key IS NULL OR categories.share_key='')"
-            )).fetchall()
-            for item in names:
-                name = str(item["category"])
-                share_key = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]
-                if item["existing_name"] is None:
-                    await db.execute(
-                        "INSERT OR IGNORE INTO categories(name, created_at, description, updated_at, share_key) "
-                        "VALUES(?, ?, '', ?, ?)",
-                        (name, iso_now(), iso_now(), share_key),
-                    )
-                else:
-                    await db.execute(
-                        "UPDATE categories SET share_key=? WHERE name=? AND (share_key IS NULL OR share_key='')",
-                        (share_key, name),
-                    )
-            if names:
-                await db.commit()
+            row = await (await db.execute("""
+                SELECT category FROM (
+                    SELECT category FROM files WHERE category IS NOT NULL AND category<>''
+                    UNION
+                    SELECT name AS category FROM categories
+                ) AS all_categories
+                ORDER BY lower(category) LIMIT 1 OFFSET ?
+            """, (index,))).fetchone()
+        if not row:
+            return None
+        rows = await self.list_categories(category=str(row["category"]))
+        return rows[0] if rows else None
+
+    async def list_categories(self, category=None):
+        async with self.connect() as db:
+            # Only full-list requests repair legacy category rows. A single-folder
+            # request skips the catalog-wide repair scan.
+            if category is None:
+                names = await (await db.execute(
+                    "SELECT DISTINCT files.category, categories.name AS existing_name "
+                    "FROM files LEFT JOIN categories ON categories.name=files.category "
+                    "WHERE files.category IS NOT NULL AND files.category<>'' "
+                    "AND (categories.name IS NULL OR categories.share_key IS NULL OR categories.share_key='')"
+                )).fetchall()
+                for item in names:
+                    name = str(item["category"])
+                    share_key = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]
+                    if item["existing_name"] is None:
+                        await db.execute(
+                            "INSERT OR IGNORE INTO categories(name, created_at, description, updated_at, share_key) "
+                            "VALUES(?, ?, '', ?, ?)",
+                            (name, iso_now(), iso_now(), share_key),
+                        )
+                    else:
+                        await db.execute(
+                            "UPDATE categories SET share_key=? WHERE name=? AND (share_key IS NULL OR share_key='')",
+                            (share_key, name),
+                        )
+                if names:
+                    await db.commit()
             return await (await db.execute("""
                 SELECT all_categories.category,
                        COUNT(files.file_key) AS file_count,
@@ -962,10 +977,11 @@ class Database:
                 ) AS all_categories
                 LEFT JOIN files ON files.category=all_categories.category
                 LEFT JOIN categories ON categories.name=all_categories.category
+                WHERE all_categories.category = COALESCE(CAST(? AS TEXT), all_categories.category)
                 GROUP BY all_categories.category, categories.description,
                          categories.created_at, categories.updated_at, categories.share_key
                 ORDER BY lower(all_categories.category)
-            """)).fetchall()
+            """, (category,))).fetchall()
 
     async def rename_category(self, old_name: str, new_name: str) -> bool:
         old_name = str(old_name or "").strip()[:120]
