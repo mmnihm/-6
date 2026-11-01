@@ -691,7 +691,7 @@ async def try_send_catalog_album(client, user_id, group):
     return True
 
 
-async def send_catalog_batch(client, user_id, share_key, offset, batch):
+async def send_catalog_batch(client, user_id, share_key, offset, batch, track_progress=True):
     """Group compatible media across the whole batch; skip failures and keep going."""
     sent = failed = 0
     next_offset = offset
@@ -754,7 +754,8 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch):
         nonlocal next_offset
         while next_offset - offset in completed:
             next_offset += 1
-        await db.set_category_delivery_progress(user_id, share_key, next_offset)
+        if track_progress:
+            await db.set_category_delivery_progress(user_id, share_key, next_offset)
 
     for unit in units:
         is_album = len(unit) >= 2
@@ -2146,30 +2147,12 @@ async def user_catalog_callback_handler(client, query):
                 await message.reply_text("📭 暂时没有找到可发送的资源，请稍后重试。")
                 return
 
-            sent = 0
-            failed = []
-            for item in rows:
-                try:
-                    ok, result = await send_catalog_file(
-                        client, user.id, item["file_key"]
-                    )
-                    if ok:
-                        sent += 1
-                    else:
-                        failed.append(f"{item['file_name'][:40]}：{result}")
-                except Exception as exc:
-                    log.exception(
-                        "Random delivery failed: user=%s file=%s",
-                        user.id, item["file_key"],
-                    )
-                    failed.append(
-                        f"{item['file_name'][:40]}：{type(exc).__name__}"
-                    )
-
+            sent, failed, _ = await send_catalog_batch(
+                client, user.id, "random", 0, rows, track_progress=False
+            )
             summary = f"🎲 随机发送完成：成功 {sent}/{len(rows)} 个文件。"
             if failed:
-                summary += "\n\n失败 " + str(len(failed)) + " 个：\n"
-                summary += "\n".join(failed[:5])
+                summary += f"\\n\\n⚠️ 有 {failed} 个文件未能发送，已自动跳过；其余资源不受影响。"
             await message.reply_text(summary)
         except Exception:
             log.exception("Random exploration failed for user %s", user.id)
