@@ -1841,6 +1841,8 @@ async def scan_history_handler(client, message):
     p = await db.get_scan_progress(primary)
     b = await db.get_scan_progress(backup)
     backfilled = await db.publish_primary_catalog(primary, config.ADMIN_ID)
+    if backfilled:
+        category_catalog_cache["expires_at"] = 0
     if p["completed"] and b["completed"]:
         # A completed scan can still have legacy primary-channel records waiting
         # to be published. Always finalize directory maintenance before returning.
