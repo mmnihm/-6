@@ -1801,7 +1801,24 @@ async def scanner_login_input_handler(client, message):
         pending_category_actions[user.id] = {"action": "create"}
         await message.reply_text("📁 请发送新文件夹名称。创建后选择该文件夹即可开始批量上传。")
         return
-    if value == "📋 文件夹列表" or value == "📤 上传文件":
+    if value == "📋 文件夹列表":
+        categories = await db.list_categories()
+        rows = []
+        for index, row in enumerate(categories[:20]):
+            rows.append([InlineKeyboardButton(
+                f"📁 {row['category'][:32]}（{int(row['file_count'] or 0)}）",
+                callback_data=f"mc:directory:{index}",
+            )])
+        rows.append([InlineKeyboardButton("📂 查看全部目录 / 翻页", callback_data="mc:directories")])
+        if not categories:
+            rows.insert(0, [InlineKeyboardButton("➕ 新建目录", callback_data="mc:dirnew")])
+        await message.reply_text(
+            f"📋 管理员目录列表（共 {len(categories)} 个）\n\n"
+            "点击目录可查看详情、修改名称或上传文件；目录超过 20 个时，点击下方按钮翻页。",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+    if value == "📤 上传文件":
         categories = await db.list_categories()
         rows = []
         for index, row in enumerate(categories[:20]):
@@ -1809,11 +1826,12 @@ async def scanner_login_input_handler(client, message):
                 f"📁 {row['category'][:32]}（{int(row['file_count'] or 0)}）",
                 callback_data=f"mc:dirupload:{index}",
             )])
-        if not rows:
-            rows = [[InlineKeyboardButton("➕ 新建目录", callback_data="mc:dirnew")]]
+        rows.append([InlineKeyboardButton("📂 查看全部目录 / 翻页", callback_data="mc:directories")])
+        if not categories:
+            rows.insert(0, [InlineKeyboardButton("➕ 新建目录", callback_data="mc:dirnew")])
         await message.reply_text(
-            "📋 选择一个文件夹，之后发送的文件会暂存到该目录。\n"
-            "上传完毕点击「✅ 结束上传」后才会对会员显示。",
+            f"📤 选择上传目录（共 {len(categories)} 个）\n\n"
+            "选择后直接发送文件；上传完成点击「✅ 结束上传」统一发布。",
             reply_markup=InlineKeyboardMarkup(rows),
         )
         return
