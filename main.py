@@ -2977,18 +2977,26 @@ async def broadcast_handler(client, message):
 
 
 async def main():
-    global BOT_USERNAME, BOT_ID, telegram_http_session
-    await db.initialize()
-    log.info("Database backend: %s", "PostgreSQL" if db.uses_postgres else "SQLite (local fallback)")
-    await app.start()
-    telegram_http_session = aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=12, connect=5, sock_read=10)
-    )
+    global BOT_USERNAME, BOT_ID, telegram_http_session, scanner
     scanner_started = False
+    app_started = False
     runner = None
     backup_retry_task = None
     try:
-        global scanner
+        # Keep database initialization inside the cleanup scope. A migration
+        # error must not leave AsyncConnectionPool worker tasks behind.
+        await db.initialize()
+        log.info(
+            "Database backend: %s",
+            "PostgreSQL" if db.uses_postgres else "SQLite (local fallback)",
+        )
+
+        await app.start()
+        app_started = True
+        telegram_http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=12, connect=5, sock_read=10)
+        )
+
         if scanner is not None:
             try:
                 await scanner.start()
@@ -2998,7 +3006,9 @@ async def main():
                     raise RuntimeError("History scanner must be a normal Telegram user account")
                 log.info("History scanner ready: user %s", scanner_me.id)
             except Exception:
-                log.exception("History scanner is unavailable; bot will continue without history scanning")
+                log.exception(
+                    "History scanner is unavailable; bot will continue without history scanning"
+                )
                 if scanner_started:
                     try:
                         await scanner.stop()
@@ -3023,20 +3033,48 @@ async def main():
 
         await asyncio.Event().wait()
     finally:
+        # Each resource is closed independently so one cleanup failure cannot
+        # prevent the PostgreSQL pool from being closed.
         if backup_retry_task is not None:
             backup_retry_task.cancel()
             try:
                 await backup_retry_task
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                log.exception("Backup retry worker stopped with an error")
+
         if runner is not None:
-            await runner.cleanup()
-        if scanner is not None and scanner.is_connected:
-            await scanner.stop()
-        await app.stop()
+            try:
+                await runner.cleanup()
+            except Exception:
+                log.exception("Could not clean up catalog web server")
+
+        if scanner_started and scanner is not None:
+            try:
+                if scanner.is_connected:
+                    await scanner.stop()
+            except Exception:
+                log.exception("Could not stop history scanner")
+
+        if app_started:
+            try:
+                await app.stop()
+            except Exception:
+                log.exception("Could not stop Telegram bot client")
+
         if telegram_http_session is not None and not telegram_http_session.closed:
-            await telegram_http_session.close()
-        await db.close()
+            try:
+                await telegram_http_session.close()
+            except Exception:
+                log.exception("Could not close Telegram HTTP session")
+            finally:
+                telegram_http_session = None
+
+        try:
+            await db.close()
+        except Exception:
+            log.exception("Could not close database connection pool")
 
 
 if __name__ == "__main__":
