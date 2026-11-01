@@ -75,7 +75,7 @@ async def admin_home_text():
     users, files, members, banned = await db.stats()
     categories = await db.list_categories()
     catalog = await db.catalog_stats()
-    album_groups = sum(int(row.get("album_count", 0) or 0) for row in categories)
+    album_groups = sum(int(row["album_count"] or 0) for row in categories)
     return (
         "☁️ 网盘管理中心\n\n"
         "📁 目录管理：创建、整理、查看内容统计\n"
@@ -355,7 +355,18 @@ def folder_detail_text(category_row, files, page, member_group_id):
         body.append("👥 加入已绑定会员群/频道：1 个（系统自动验证）")
     body.append("或由管理员授予有效会员权限")
     body.extend(["", f"📄 资源列表（第 {page + 1} 页）："])
-    body.append("\n".join(f"• {row['file_name'][:48]}" for row in files) if files else "这个目录暂时没有资源。")
+    file_labels = []
+    seen_album_ids = set()
+    for row in files:
+        album_id = row["album_group_id"]
+        if album_id:
+            if str(album_id) in seen_album_ids:
+                continue
+            seen_album_ids.add(str(album_id))
+            file_labels.append(f"• 🗂 相册组（{int(row['album_size'] or 0)} 个文件）")
+        else:
+            file_labels.append(f"• {row['file_name'][:48]}")
+    body.append("\n".join(file_labels) if file_labels else "这个目录暂时没有资源。")
     return "\n".join(body)
 
 
@@ -913,8 +924,9 @@ async def start_handler(client, message):
 
 
 async def _flush_album_upload(client, key):
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(2.0)
     messages = pending_album_uploads.pop(key, [])
+    pending_album_uploads.pop((key, "scheduled"), None)
     if not messages:
         return
     messages.sort(key=lambda item: item.id)
@@ -1030,7 +1042,6 @@ async def upload_handler(client, message):
         return
     key = (int(user.id), int(message.chat.id), str(group_id))
     pending_album_uploads.setdefault(key, []).append(message)
-    task_key = f"album_flush:{user.id}:{message.chat.id}:{group_id}"
     scheduled = pending_album_uploads.get((key, "scheduled"))
     if not scheduled:
         pending_album_uploads[(key, "scheduled")] = True
