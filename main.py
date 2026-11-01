@@ -2395,11 +2395,33 @@ async def admin_directories_command(client, message):
     if len(categories) > page_size:
         rows.append([InlineKeyboardButton("下一页 ➡️", callback_data="mc:directories:1")])
     rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
-    await message.reply_text(
-        f"📁 目录管理（共 {len(categories)} 个）\\n\\n"
-        "可以新建空目录、修改目录名称；只有空目录可以删除。",
-        reply_markup=InlineKeyboardMarkup(rows),
+    list_text = (
+        f"📁 文件夹列表（共 {len(categories)} 个，第 1 页）\\n\\n"
+        "点击文件夹名称可复制名称；点击下方数字查看统计和管理。"
     )
+    copy_rows = [[{"text": "➕ 新建目录", "callback_data": "mc:dirnew"}]]
+    for row in categories[:page_size]:
+        copy_rows.append([{
+            "text": f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
+            "copy_text": {"text": str(row["category"])},
+        }])
+    if categories:
+        copy_rows.append([{
+            "text": str(index + 1),
+            "callback_data": f"mc:directory:{index}",
+        } for index in range(min(len(categories), page_size))])
+    if len(categories) > page_size:
+        copy_rows.append([{"text": "下一页 ➡️", "callback_data": "mc:directories:1"}])
+    copy_rows.append([{"text": "⬅️ 返回管理面板", "callback_data": "mc:home"}])
+    try:
+        await telegram_bot_api("sendMessage", {
+            "chat_id": message.chat.id,
+            "text": list_text,
+            "reply_markup": {"inline_keyboard": copy_rows},
+        })
+    except Exception:
+        log.exception("Could not render initial admin folder copy buttons")
+        await message.reply_text(list_text, reply_markup=InlineKeyboardMarkup(rows))
 
 
 @app.on_message(filters.private & filters.command("admin"))
