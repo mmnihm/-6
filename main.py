@@ -33,6 +33,7 @@ BOT_ID = None
 telegram_http_session = None
 pending_channel_bindings = {}
 membership_cache = {}
+category_catalog_cache = {"expires_at": 0.0, "rows": []}
 scanner_login_states = {}
 scanner_login_clients = {}
 pending_directory_imports = {}
@@ -136,10 +137,16 @@ async def is_admin(user_id: int) -> bool:
 async def get_membership_tier(user_id: int):
     if await is_admin(user_id):
         return "超级管理员"
-    if await db.is_banned(user_id):
+    # These independent local checks used to run as two serial database
+    # round trips. Run them concurrently without weakening either permission.
+    is_banned, has_manual_membership = await asyncio.gather(
+        db.is_banned(user_id),
+        db.has_manual_membership(user_id),
+    )
+    if is_banned:
         log.info("Membership denied: user %s is in the local ban list", user_id)
         return None
-    if await db.has_manual_membership(user_id):
+    if has_manual_membership:
         return "手动会员"
 
     now = asyncio.get_running_loop().time()
@@ -2201,7 +2208,14 @@ async def user_catalog_callback_handler(client, query):
     if action[1] == "folders":
         await query.answer()
         page = int(action[2]) if len(action) > 2 else 0
-        categories = await db.list_categories()
+        now = asyncio.get_running_loop().time()
+        if category_catalog_cache["expires_at"] > now:
+            categories = category_catalog_cache["rows"]
+        else:
+            categories = await db.list_categories()
+            category_catalog_cache["rows"] = [dict(row) for row in categories]
+            category_catalog_cache["expires_at"] = now + 30
+            categories = category_catalog_cache["rows"]
         start_at = max(0, page) * 20
         selected = categories[start_at:start_at + 20]
         rows = [
@@ -2229,13 +2243,21 @@ async def user_catalog_callback_handler(client, query):
     if action[1] in ("folder", "folderresume") and len(action) >= 3:
         try:
             index = int(action[2])
-            category_row = await db.get_category_by_index(index)
+            cached_rows = category_catalog_cache["rows"]
+            if category_catalog_cache["expires_at"] > asyncio.get_running_loop().time() and 0 <= index < len(cached_rows):
+                category_row = dict(cached_rows[index])
+            else:
+                category_row = await db.get_category_by_index(index)
             if not category_row:
                 raise IndexError("folder index no longer exists")
             category = category_row["category"]
             if action[1] == "folderresume":
-                offset = await get_saved_folder_offset(
-                    user.id, category_row["share_key"], category_row["file_count"]
+                offset, group_id, is_favorite = await asyncio.gather(
+                    get_saved_folder_offset(
+                        user.id, category_row["share_key"], category_row["file_count"]
+                    ),
+                    get_member_group_id(),
+                    db.is_category_favorite(user.id, category_row["share_key"]),
                 )
             else:
                 offset = max(0, int(action[3])) if len(action) > 3 else 0
@@ -2243,20 +2265,24 @@ async def user_catalog_callback_handler(client, query):
                     (offset // 20) * 20,
                     max(0, ((int(category_row["file_count"] or 0) - 1) // 20) * 20),
                 )
+                group_id, is_favorite = await asyncio.gather(
+                    get_member_group_id(),
+                    db.is_category_favorite(user.id, category_row["share_key"]),
+                )
         except (ValueError, IndexError):
             await query.answer("分类已更新，请重新打开列表", show_alert=True)
             return
-        await save_folder_offset(user.id, category_row["share_key"], offset)
-        files = await db.list_category_files(category, limit=20, offset=offset)
+        files, _ = await asyncio.gather(
+            db.list_category_files(category, limit=20, offset=offset),
+            save_folder_offset(user.id, category_row["share_key"], offset),
+        )
         page = offset // 20
-        group_id = await get_member_group_id()
         category_row = dict(category_row)
         category_row["category_index"] = index
         await message.edit_text(
             folder_detail_text(category_row, files, page, group_id),
             reply_markup=folder_detail_keyboard(
-                category_row, page, len(files) == 20,
-                await db.is_category_favorite(user.id, category_row["share_key"])
+                category_row, page, len(files) == 20, is_favorite
             ),
             disable_web_page_preview=True,
         )
