@@ -1213,7 +1213,8 @@ class Database:
         async with self.connect() as db:
             row = await (await db.execute("""
                 SELECT name AS category FROM categories
-                ORDER BY lower(name) LIMIT 1 OFFSET ?
+                ORDER BY updated_at DESC, created_at DESC, lower(name)
+                LIMIT 1 OFFSET ?
             """, (index,))).fetchone()
         if not row:
             return None
