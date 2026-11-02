@@ -630,6 +630,14 @@ class Database:
                 (int(owner_id),),
             )).fetchone()
 
+    async def count_upload_batch_items(self, owner_id):
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT COUNT(*) AS n FROM upload_batch_items WHERE owner_id=?",
+                (int(owner_id),),
+            )).fetchone()
+            return int(row["n"] or 0)
+
     async def stage_upload_batch_item(
         self, key, owner_id, file_name, media_type, category,
         primary_channel_id, primary_id, backup_channel_id, backup_id,
