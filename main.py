@@ -423,6 +423,22 @@ async def save_folder_offset(user_id, share_key, offset):
     )
 
 
+async def get_saved_folder_list_page(user_id, total_pages):
+    key = f"folder_list_page:{int(user_id)}"
+    try:
+        page = max(0, int(await db.get_setting(key) or 0))
+    except (TypeError, ValueError):
+        page = 0
+    return min(page, max(0, int(total_pages or 1) - 1))
+
+
+async def save_folder_list_page(user_id, page):
+    await db.set_setting(
+        f"folder_list_page:{int(user_id)}",
+        str(max(0, int(page))),
+    )
+
+
 def folder_detail_keyboard(category_row, page, has_next, is_favorite):
     share_key = str(category_row["share_key"] or "")
     rows = []
@@ -2654,7 +2670,6 @@ async def user_catalog_callback_handler(client, query):
 
     if action[1] == "folders":
         await query.answer()
-        page = int(action[2]) if len(action) > 2 else 0
         now = asyncio.get_running_loop().time()
         if category_catalog_cache["expires_at"] > now:
             categories = category_catalog_cache["rows"]
@@ -2664,7 +2679,17 @@ async def user_catalog_callback_handler(client, query):
             category_catalog_cache["expires_at"] = now + 30
             categories = category_catalog_cache["rows"]
         page_size = 10
-        start_at = max(0, page) * page_size
+        total_pages = (len(categories) + page_size - 1) // page_size
+        if len(action) > 2:
+            try:
+                page = max(0, int(action[2]))
+            except (TypeError, ValueError):
+                page = 0
+        else:
+            page = await get_saved_folder_list_page(user.id, total_pages)
+        page = min(page, max(0, total_pages - 1))
+        await save_folder_list_page(user.id, page)
+        start_at = page * page_size
         selected = categories[start_at:start_at + page_size]
         rows = [
             [InlineKeyboardButton(
