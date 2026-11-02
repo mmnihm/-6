@@ -2937,15 +2937,42 @@ async def user_catalog_callback_handler(client, query):
             progress = await message.reply_text(
                 f"📥 正在发送「{category['name']}」全部资源，共 {len(batch)} 个文件…"
             )
-            sent, failed, next_offset = await send_catalog_batch(
-                client, user.id, share_key, offset, batch
-            )
-            text_result = (
-                f"📦 目录资源发送完成\n\n成功：{sent} 个\n失败：{failed} 个\n"
-                f"领取进度：{next_offset}/{total}"
-            )
-            buttons = [[InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")]]
-            await progress.edit_text(text_result, reply_markup=InlineKeyboardMarkup(buttons))
+            try:
+                sent, failed, next_offset = await send_catalog_batch(
+                    client, user.id, share_key, offset, batch
+                )
+                text_result = (
+                    f"📦 目录资源发送完成！\n\n"
+                    f"📁 目录：{category['name']}\n"
+                    f"✅ 成功发送：{sent} 个\n"
+                    f"❌ 发送失败：{failed} 个\n"
+                    f"📊 领取进度：{next_offset}/{total}"
+                )
+            except Exception as exc:
+                log.exception(
+                    "Folder resource delivery aborted: user=%s share_key=%s",
+                    user.id, share_key,
+                )
+                text_result = (
+                    f"⚠️ 资源发送过程中出现异常，发送已中止。\n"
+                    f"请稍后重新进入目录继续领取。\n\n"
+                    f"原因：{str(exc)[:180]}"
+                )
+
+            buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")],
+                [InlineKeyboardButton("🏠 返回主菜单", callback_data="uc:home")],
+            ])
+            # Keep the progress message update best-effort; always send a separate
+            # final result message so the user receives a visible completion notice.
+            try:
+                await progress.edit_text("✅ 资源发送处理结束")
+            except Exception:
+                log.warning(
+                    "Could not update folder delivery progress message: user=%s share_key=%s",
+                    user.id, share_key, exc_info=True,
+                )
+            await message.reply_text(text_result, reply_markup=buttons)
             return
         finally:
             category_delivery_in_progress.discard(delivery_key)
