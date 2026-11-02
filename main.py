@@ -110,16 +110,9 @@ async def _show_upload_confirmation_after_idle(client, user_id):
     uid = int(user_id)
     current = asyncio.current_task()
     try:
-        # Wait for a quiet period so one multi-select send is counted as a whole.
+        # Only debounce incoming Telegram updates. Do not wait for channel copies:
+        # the admin should be able to choose finish/continue while saving runs.
         await asyncio.sleep(1.0)
-        while True:
-            tasks = list(pending_upload_tasks.get(uid, set()))
-            if not tasks:
-                await asyncio.sleep(0.25)
-                tasks = list(pending_upload_tasks.get(uid, set()))
-                if not tasks:
-                    break
-            await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
         if pending_upload_confirmation_tasks.get(uid) is not current:
             return
         last_message = upload_latest_messages.get(uid)
@@ -127,7 +120,6 @@ async def _show_upload_confirmation_after_idle(client, user_id):
         if not batch or not last_message:
             return
         received = int(upload_received_counts.get(uid, 0))
-        saved = await db.count_upload_batch_items(uid)
         old = upload_confirmation_messages.get(uid)
         if old:
             try:
@@ -135,9 +127,9 @@ async def _show_upload_confirmation_after_idle(client, user_id):
             except Exception:
                 pass
         prompt = await last_message.reply_text(
-            f"📥 本轮收到文件：{received} 个\n"
-            f"📦 已成功保存待发布：{saved} 个\n\n"
-            "请确认下一步：",
+            f"📥 已接收文件：{received} 个\\n"
+            "⏳ 文件正在后台保存，不会因为显示此提示而中断。\\n\\n"
+            "请选择下一步：",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ 结束上传", callback_data="mc:uploadfinish"),
                  InlineKeyboardButton("➕ 继续上传", callback_data="mc:uploadcontinue")]
@@ -3187,7 +3179,7 @@ async def admin_callback_handler(client, query):
         upload_confirmation_messages.pop(int(user.id), None)
         await message.edit_text(
             f"📥 当前已收到：{upload_received_counts.get(int(user.id), 0)} 个文件。\n"
-            "可以继续发送文件；机器人会在本轮发送完成后再次显示确认。",
+            "继续发送的文件仍加入当前文件夹和同一批次，不会发布或清空已有计数。",
             reply_markup=None,
         )
         return
