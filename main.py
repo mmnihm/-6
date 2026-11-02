@@ -3081,7 +3081,7 @@ async def admin_callback_handler(client, query):
         sizes = await db.get_category_storage_stats(row["category"])
         measured = int(sizes["sized_count"] or 0)
         buttons = [
-            [InlineKeyboardButton("📂 查看内容", callback_data=f"mc:dircontent:{index}")],
+            [InlineKeyboardButton("📂 查看内容（直接发送文件）", callback_data=f"mc:dircontent:{index}")],
             [InlineKeyboardButton("📤 上传文件到此目录", callback_data=f"mc:dirupload:{index}")],
             [InlineKeyboardButton("✏️ 修改目录名称", callback_data=f"mc:dirrename:{index}")],
         ]
@@ -3141,8 +3141,8 @@ async def admin_callback_handler(client, query):
                 client, user.id, share_key, offset, batch
             )
             result_text = (
-                f"📦「{row['category']}」本组发送完成\\n\\n"
-                f"成功：{sent} 个\\n失败：{failed} 个\\n"
+                f"📦「{row['category']}」本组发送完成\n\n"
+                f"成功：{sent} 个\n失败：{failed} 个\n"
                 f"已发送进度：{next_offset}/{total}"
             )
             buttons = []
