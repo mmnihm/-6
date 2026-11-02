@@ -689,7 +689,8 @@ DEFAULT_HOME_BUTTONS = [
     {"key": "latest", "text": "🆕 最新资源", "type": "action", "enabled": True},
     {"key": "random", "text": "🎲 随机探索", "type": "action", "enabled": True},
     {"key": "favorites", "text": "⭐ 收藏列表", "type": "action", "enabled": True},
-    {"key": "notifications", "text": "🔔 新资源通知", "type": "action", "enabled": True},
+    {"key": "notifications", "text": "🔔 新资源订阅", "type": "action", "enabled": True},
+    {"key": "member", "text": "👤 会员中心", "type": "action", "enabled": True},
 ]
 
 
@@ -716,14 +717,14 @@ async def get_home_buttons():
         if current is None:
             buttons.append(dict(default))
             continue
-        if default["key"] in ("random", "latest", "folders", "favorites", "search", "history", "notifications"):
+        if default["key"] in ("random", "latest", "folders", "favorites", "search", "history", "notifications", "member"):
             current["text"] = default["text"]
             current["type"] = "action"
             current["enabled"] = True
     # "再来一批" is a result-screen action, never a home-menu button.
     buttons = [item for item in buttons if item.get("key") != "random_again"]
     # Keep built-in actions in a clear two-column order; custom URL buttons follow.
-    built_in_order = ["search", "history", "folders", "latest", "random", "favorites", "notifications"]
+    built_in_order = ["folders", "random", "notifications", "favorites", "member", "search", "history", "latest"]
     built_ins = {str(item.get("key")): item for item in buttons if item.get("key") in built_in_order}
     custom = [item for item in buttons if item.get("key") not in built_in_order]
     buttons = [built_ins[key] for key in built_in_order if key in built_ins] + custom
@@ -746,13 +747,15 @@ async def user_home_keyboard():
             str(item["text"])[:60], callback_data=f"uc:{item['key']}"
         )
 
-    # Main actions are grouped into balanced rows for a cleaner mobile layout.
+    # Primary member actions follow the selected three-row layout.
+    # Existing search/history/latest features remain available below them.
     rows = []
     for group in (
+        ("folders", "random"),
+        ("notifications", "favorites"),
+        ("member",),
         ("search", "history"),
-        ("folders", "latest"),
-        ("random", "favorites"),
-        ("notifications",),
+        ("latest",),
     ):
         row = [make_button(by_key[key]) for key in group if key in by_key]
         if row:
@@ -761,7 +764,7 @@ async def user_home_keyboard():
     # Preserve any custom buttons added by the administrator.
     custom = [item for item in enabled if item.get("key") not in {
         "search", "history", "folders", "latest", "random", "favorites",
-        "notifications", "random_again",
+        "notifications", "member", "random_again",
     }]
     for index in range(0, len(custom), 2):
         rows.append([make_button(item) for item in custom[index:index + 2]])
@@ -775,7 +778,8 @@ async def user_home_text(user_id):
     tier = await get_membership_tier(user_id)
     stats = await db.catalog_stats()
     return (
-        "🤖 欢迎使用网盘机器人\n\n"
+        "📂 会员资源中心\n\n"
+        "欢迎使用会员专属资源库。\n\n"
         f"🏅 会员级别：{tier or '未开通'}\n\n"
         "📊 资源统计\n"
         f"• 文件夹：{stats['folders']} 个\n"
@@ -2746,6 +2750,26 @@ async def user_catalog_callback_handler(client, query):
         await message.edit_text(
             await user_home_text(user.id),
             reply_markup=await user_home_keyboard(),
+        )
+        return
+
+    if action[1] == "member":
+        await query.answer()
+        tier = await get_membership_tier(user.id)
+        stats = await db.catalog_stats()
+        await message.edit_text(
+            "👤 会员中心\n\n"
+            f"🏅 会员级别：{tier or '未开通'}\n"
+            f"🆔 用户 ID：{user.id}\n\n"
+            "📊 资源库概况\n"
+            f"📁 文件夹：{stats['folders']} 个\n"
+            f"📦 资源消息：{stats['messages']} 条\n"
+            f"🖼 图片：{stats['images']} 张\n"
+            f"🎬 视频：{stats['videos']} 个\n\n"
+            "感谢使用会员资源中心。",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 返回主页", callback_data="uc:home")]
+            ]),
         )
         return
 
