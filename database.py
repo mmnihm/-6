@@ -714,7 +714,8 @@ class Database:
     async def add_file(self, key, owner_id, file_name, media_type,
                        primary_id, backup_id, category="未分类",
                        source_fingerprint=None, file_size=0, created_at=None,
-                        album_group_id=None, album_position=0):
+                        album_group_id=None, album_position=0,
+                       refresh_stats=True):
         async with self.connect() as db:
             cur = await db.execute("""
                 INSERT OR IGNORE INTO files(
@@ -729,7 +730,17 @@ class Database:
                   str(album_group_id) if album_group_id else None,
                   max(0, int(album_position or 0))))
             if cur.rowcount == 1:
-                await self._refresh_category_stats(db, category)
+                if refresh_stats:
+                    await self._refresh_category_stats(db, category)
+                else:
+                    category_name = str(category or "").strip()
+                    if category_name:
+                        await db.execute(
+                            "INSERT INTO categories(name, created_at, description, updated_at, share_key) "
+                            "VALUES(?, ?, '', ?, ?) ON CONFLICT(name) DO NOTHING",
+                            (category_name, iso_now(), iso_now(),
+                             secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
+                        )
             await db.commit()
             return cur.rowcount == 1
 
@@ -1305,6 +1316,16 @@ class Database:
                 "share_key=COALESCE(NULLIF(categories.share_key, ''), excluded.share_key)",
                 (name, created, str(description or "")[:1000], now, share_key),
             )
+            await db.commit()
+
+    async def refresh_category_stats(self, categories):
+        """Refresh summaries for a set of changed folders in one database transaction."""
+        names = sorted({str(name or "").strip() for name in categories if str(name or "").strip()})
+        if not names:
+            return
+        async with self.connect() as db:
+            for name in names:
+                await self._refresh_category_stats(db, name)
             await db.commit()
 
     async def get_category_storage_stats(self, category: str):
