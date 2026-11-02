@@ -2612,7 +2612,7 @@ async def user_catalog_callback_handler(client, query):
                 await message.reply_text("📭 暂时没有找到可发送的资源，请稍后重试。")
                 return
 
-            sent, failed, _ = await send_catalog_batch(
+            sent, failed, _, _last_sent_message_id = await send_catalog_batch(
                 client, user.id, "random", 0, rows, track_progress=False
             )
             summary = f"🎲 随机发送完成：成功 {sent}/{len(rows)} 个文件。"
@@ -3259,7 +3259,7 @@ async def admin_callback_handler(client, query):
                 f"📥 正在发送「{row['category']}」第 {offset // 20 + 1} 组文件（最多20个）…"
             )
             try:
-                sent, failed, next_offset = await send_catalog_batch(
+                sent, failed, next_offset, _last_sent_message_id = await send_catalog_batch(
                     client, user.id, f"admin:{share_key}", offset, batch,
                     track_progress=False,
                 )
@@ -3297,10 +3297,30 @@ async def admin_callback_handler(client, query):
                     f"已处理进度：{offset}/{total}\n"
                     f"原因：{str(exc)[:180]}"
                 )
+                # A failed batch still gets its own final notification.
+                # Remove the temporary status message instead of editing it.
                 try:
-                    await progress.edit_text(error_text)
+                    await progress.delete()
                 except Exception:
-                    await message.reply_text(error_text)
+                    log.warning("Could not delete failed admin delivery progress message")
+                try:
+                    await client.send_message(
+                        user.id,
+                        error_text,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("📁 返回目录", callback_data="mc:directories")],
+                            [InlineKeyboardButton("🏠 返回主页", callback_data="mc:home")],
+                        ]),
+                    )
+                except Exception:
+                    log.exception(
+                        "Could not send standalone admin delivery error summary: user=%s category=%s",
+                        user.id, row["category"],
+                    )
+                    try:
+                        await message.reply_text(error_text)
+                    except Exception:
+                        log.exception("All admin delivery error notification methods failed")
         finally:
             category_delivery_in_progress.discard(delivery_key)
     elif action.startswith("dirrename:"):
