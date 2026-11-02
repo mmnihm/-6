@@ -376,6 +376,9 @@ class Database:
                 "document_count": "BIGINT NOT NULL DEFAULT 0",
                 "total_size": "BIGINT NOT NULL DEFAULT 0",
                 "sized_count": "BIGINT NOT NULL DEFAULT 0",
+                "video_size": "BIGINT NOT NULL DEFAULT 0",
+                "image_size": "BIGINT NOT NULL DEFAULT 0",
+                "other_size": "BIGINT NOT NULL DEFAULT 0",
             }
             for column, definition in category_stat_columns.items():
                 if column not in category_column_names:
@@ -428,6 +431,18 @@ class Database:
                     )
                 await db.execute(
                     "INSERT INTO settings(key, value) VALUES('category_stats_v1', 'completed')"
+                )
+            size_stats_migration = await (await db.execute(
+                "SELECT value FROM settings WHERE key='category_size_stats_v1'"
+            )).fetchone()
+            if not size_stats_migration:
+                existing_categories = await (await db.execute(
+                    "SELECT name FROM categories"
+                )).fetchall()
+                for item in existing_categories:
+                    await self._refresh_category_stats(db, str(item["name"]), create=False)
+                await db.execute(
+                    "INSERT INTO settings(key, value) VALUES('category_size_stats_v1', 'completed')"
                 )
             await db.commit()
 
@@ -1192,18 +1207,58 @@ class Database:
                    SUM(CASE WHEN COALESCE(file_size, 0)>0 THEN 1 ELSE 0 END) AS sized_count
             FROM files WHERE category=?
         """, (category,))).fetchone()
+        size_row = await (await db.execute("""
+            SELECT
+                COALESCE(SUM(CASE WHEN
+                    lower(media_type) IN ('video', 'video_note')
+                    OR (lower(media_type)='document' AND (
+                        lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
+                        OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
+                        OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
+                        OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
+                        OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
+                        OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
+                    )) THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS video_size,
+                COALESCE(SUM(CASE WHEN
+                    lower(media_type) IN ('photo', 'image')
+                    OR (lower(media_type)='document' AND (
+                        lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
+                        OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
+                        OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
+                        OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
+                        OR lower(file_name) LIKE '%.tiff'
+                    )) THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS image_size,
+                COALESCE(SUM(CASE WHEN NOT (
+                    lower(media_type) IN ('video', 'video_note', 'photo', 'image')
+                    OR (lower(media_type)='document' AND (
+                        lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
+                        OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
+                        OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
+                        OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
+                        OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
+                        OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
+                        OR lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
+                        OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
+                        OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
+                        OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
+                        OR lower(file_name) LIKE '%.tiff'
+                    ))
+                ) THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS other_size
+            FROM files WHERE category=?
+        """, (category,))).fetchone()
         await db.execute("""
             UPDATE categories SET
                 file_count=?, image_count=?, video_count=?, animation_count=?,
                 audio_count=?, document_count=?, total_size=?, sized_count=?,
-                updated_at=?
+                video_size=?, image_size=?, other_size=?, updated_at=?
             WHERE name=?
         """, (
             int(row["file_count"] or 0), int(row["image_count"] or 0),
             int(row["video_count"] or 0), int(row["animation_count"] or 0),
             int(row["audio_count"] or 0), int(row["document_count"] or 0),
             int(row["total_size"] or 0), int(row["sized_count"] or 0),
-            iso_now(), category,
+            int(size_row["video_size"] or 0), int(size_row["image_size"] or 0),
+            int(size_row["other_size"] or 0), iso_now(), category,
         ))
 
     async def save_category(self, name: str, description="", created_at=None):
@@ -1228,48 +1283,24 @@ class Database:
             await db.commit()
 
     async def get_category_storage_stats(self, category: str):
-        """Return approximate byte totals by media class, including common document extensions."""
+        """Read precomputed size totals; file aggregation runs only when a folder changes."""
         async with self.connect() as db:
             row = await (await db.execute("""
-                SELECT
-                    COALESCE(SUM(CASE WHEN is_video=1 THEN file_size ELSE 0 END), 0)
-                        AS video_size,
-                    COALESCE(SUM(CASE WHEN is_image=1 THEN file_size ELSE 0 END), 0)
-                        AS image_size,
-                    COALESCE(SUM(CASE WHEN is_video=0 AND is_image=0
-                        THEN file_size ELSE 0 END), 0) AS other_size,
-                    COALESCE(SUM(CASE WHEN file_size>0 THEN 1 ELSE 0 END), 0)
-                        AS sized_count,
-                    COUNT(*) AS file_count
-                FROM (
-                    SELECT COALESCE(file_size, 0) AS file_size,
-                           CASE WHEN lower(media_type) IN ('video', 'video_note')
-                               OR (lower(media_type)='document' AND (
-                                   lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
-                                   OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
-                                   OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
-                                   OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
-                                   OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
-                                   OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
-                               )) THEN 1 ELSE 0 END AS is_video,
-                           CASE WHEN lower(media_type) IN ('photo', 'image')
-                               OR (lower(media_type)='document' AND (
-                                   lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
-                                   OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
-                                   OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
-                                   OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
-                                   OR lower(file_name) LIKE '%.tiff'
-                               )) THEN 1 ELSE 0 END AS is_image
-                    FROM files WHERE category=?
-                ) AS folder_files
+                SELECT COALESCE(video_size, 0) AS video_size,
+                       COALESCE(image_size, 0) AS image_size,
+                       COALESCE(other_size, 0) AS other_size,
+                       COALESCE(sized_count, 0) AS sized_count,
+                       COALESCE(file_count, 0) AS file_count
+                FROM categories WHERE name=?
             """, (str(category),))).fetchone()
-            return {
-                "video_size": int(row["video_size"] or 0),
-                "image_size": int(row["image_size"] or 0),
-                "other_size": int(row["other_size"] or 0),
-                "sized_count": int(row["sized_count"] or 0),
-                "file_count": int(row["file_count"] or 0),
-            }
+            if not row:
+                return {
+                    "video_size": 0, "image_size": 0, "other_size": 0,
+                    "sized_count": 0, "file_count": 0,
+                }
+            return {key: int(row[key] or 0) for key in (
+                "video_size", "image_size", "other_size", "sized_count", "file_count"
+            )}
 
     async def get_category_by_index(self, index):
         """Load one folder summary without aggregating the whole file catalog."""
