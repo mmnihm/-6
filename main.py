@@ -1167,16 +1167,14 @@ async def directory_export_upload_handler(client, message):
         await upload_handler(client, message)
         return
 
-    # Acknowledge immediately so the admin can see that the document was received.
-    status = await message.reply_text("⏳ 已收到文件，正在检查是否为 Cangku 目录迁移 JSON…")
+    # Only intercept an actual Cangku JSON export. Ordinary media uploads
+    # must go straight to the silent batch pipeline without creating/deleting
+    # temporary Telegram status messages.
     document = message.document
     if not document or not (document.file_name or "").lower().endswith(".json"):
-        try:
-            await status.delete()
-        except Exception:
-            pass
         await upload_handler(client, message)
         return
+    status = await message.reply_text("⏳ 已收到 JSON 文件，正在检查目录迁移清单…")
     local_path = None
     try:
         await status.edit_text("📥 正在从 Telegram 下载 JSON 文件…")
