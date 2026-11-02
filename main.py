@@ -70,9 +70,11 @@ def admin_home_keyboard():
 
 
 def upload_active_keyboard():
+    # Keep the two essential admin actions visible throughout folder selection
+    # and upload: create another folder or finish the current upload batch.
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📋 文件夹列表"), KeyboardButton("🛠 管理设置")],
+            [KeyboardButton("📁 创建文件夹"), KeyboardButton("✅ 结束上传")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -1924,36 +1926,67 @@ async def scanner_login_input_handler(client, message):
         return
 
     if value == "✅ 结束上传":
-        # Wait for both single-file and album jobs. Album jobs are registered
-        # before their quiet-period timer starts, so the final album is included.
-        while True:
-            upload_tasks = list(pending_upload_tasks.get(int(user.id), set()))
-            if not upload_tasks:
-                await asyncio.sleep(0.2)
-                upload_tasks = list(pending_upload_tasks.get(int(user.id), set()))
-                if not upload_tasks:
-                    break
-            await asyncio.gather(*upload_tasks, return_exceptions=True)
-        received_count = upload_received_counts.pop(int(user.id), 0)
-        result = await db.publish_upload_batch(user.id)
-        upload_progress_state.pop(int(user.id), None)
-        pending_upload_categories.pop(user.id, None)
-        category_catalog_cache["expires_at"] = 0
-        upload_status_messages.pop(int(user.id), None)
-        if result.get("category") is None:
-            await message.reply_text("目前没有待发布的上传批次。", reply_markup=admin_home_keyboard())
-        else:
-            # Exactly one completion notice; no progress messages are created or deleted.
-            await message.reply_text(
-                f"✅ 本次上传完成\n📥 收到文件：{received_count} 个\n"
-                f"📦 成功入库：{result['published']} 个文件"
-                + (f"\n⚠️ 未成功入库：{max(0, received_count - result['published'])} 个，请查看部署日志。" if received_count > result["published"] else ""),
-                reply_markup=admin_home_keyboard(),
+        uid = int(user.id)
+        if uid in upload_finish_in_progress:
+            await message.reply_text("⏳ 正在结束上传，请稍候。", reply_markup=upload_active_keyboard())
+            return
+        upload_finish_in_progress.add(uid)
+        timer = pending_upload_confirmation_tasks.get(uid)
+        if timer and not timer.done():
+            timer.cancel()
+        try:
+            status = await message.reply_text(
+                f"⏳ 正在结束上传……\n📥 已接收：{upload_received_counts.get(uid, 0)} 个文件\n"
+                "正在等待后台保存任务完成，请不要重复点击。",
+                reply_markup=upload_active_keyboard(),
             )
+            while True:
+                tasks = list(pending_upload_tasks.get(uid, set()))
+                if not tasks:
+                    await asyncio.sleep(0.2)
+                    tasks = list(pending_upload_tasks.get(uid, set()))
+                    if not tasks:
+                        break
+                await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+            received_count = int(upload_received_counts.get(uid, 0))
+            try:
+                result = await db.publish_upload_batch(uid)
+            except Exception:
+                log.exception("Could not publish upload batch for user %s", uid)
+                await status.reply_text(
+                    "❌ 后台保存已结束，但发布入库失败。本次批次和接收数量已保留，请检查部署日志后重试。",
+                    reply_markup=upload_active_keyboard(),
+                )
+                return
+            upload_received_counts.pop(uid, None)
+            upload_progress_state.pop(uid, None)
+            pending_upload_categories.pop(uid, None)
+            category_catalog_cache["expires_at"] = 0
+            upload_status_messages.pop(uid, None)
+            upload_confirmation_messages.pop(uid, None)
+            upload_latest_messages.pop(uid, None)
+            if result.get("category") is None:
+                completion_text = "目前没有待发布的上传批次。"
+            else:
+                published = int(result.get("published", 0))
+                completion_text = (
+                    f"✅ 本次上传完成\n📥 收到文件：{received_count} 个\n"
+                    f"📦 成功入库：{published} 个文件"
+                    + (f"\n⚠️ 未成功入库：{max(0, received_count - published)} 个，请检查部署日志。" if received_count > published else "")
+                )
+            await status.reply_text(completion_text, reply_markup=admin_home_keyboard())
+        finally:
+            upload_finish_in_progress.discard(uid)
         return
     if value == "📁 创建文件夹":
         pending_category_actions[user.id] = {"action": "create"}
-        await message.reply_text("📁 请发送新文件夹名称。创建后选择该文件夹即可开始批量上传。")
+        await message.reply_text(
+            "📁 请发送新文件夹名称。创建后会自动选中该目录。\n"
+            "如不想创建，点击下方「❌ 取消建立」。",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ 取消建立", callback_data="mc:categorycancel")]
+            ]),
+        )
         return
     if value == "📋 文件夹列表":
         categories = await db.list_categories()
@@ -3172,6 +3205,16 @@ async def admin_callback_handler(client, query):
     await query.answer()
     action = query.data.split(":", 1)[1]
     message = query.message
+    if action == "categorycancel":
+        pending_category_actions.pop(user.id, None)
+        active_batch = await db.get_upload_batch(user.id)
+        await message.edit_text("已取消建立文件夹，没有创建任何目录。")
+        await client.send_message(
+            user.id,
+            "已退出创建文件夹流程，可以继续操作。",
+            reply_markup=upload_active_keyboard() if active_batch else admin_home_keyboard(),
+        )
+        return
     if action == "uploadcontinue":
         await message.edit_text(
             f"📥 当前已收到：{upload_received_counts.get(int(user.id), 0)} 个文件。\n"
@@ -3244,11 +3287,11 @@ async def admin_callback_handler(client, query):
             try:
                 await message.edit_text(completion_text, reply_markup=None)
             except Exception as exc:
-                if type(exc).__name__ == "MessageNotModified":
-                    pass
-                else:
+                if type(exc).__name__ != "MessageNotModified":
                     log.warning("Could not edit upload-finish result for user %s: %s", uid, exc)
-                    await message.reply_text(completion_text, reply_markup=admin_home_keyboard())
+            # Editing an inline confirmation does not reliably restore the
+            # persistent reply keyboard. Send it explicitly after completion.
+            await client.send_message(user.id, "请选择下一步操作。", reply_markup=admin_home_keyboard())
         finally:
             upload_finish_in_progress.discard(uid)
         return
