@@ -2769,9 +2769,9 @@ async def user_catalog_callback_handler(client, query):
         )] for item in records]
         rows.append([InlineKeyboardButton("🎲 随机探索", callback_data="uc:random")])
         rows.append([InlineKeyboardButton("🏠 返回主页", callback_data="uc:home")])
-        body = "🆕 最新资源（按入库时间排序）\\n"
-        body += f"共 {total} 个资源，以下显示最新 12 个。\\n\\n"
-        body += ("\\n".join(
+        body = "🆕 最新资源（按入库时间排序）\n"
+        body += f"共 {total} 个资源，以下显示最新 12 个。\n\n"
+        body += ("\n".join(
             f"• {item['file_name'][:48]}（{item['category']}）" for item in records
         ) if records else "暂时没有资源。")
         await message.edit_text(body, reply_markup=InlineKeyboardMarkup(rows))
