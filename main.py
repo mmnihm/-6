@@ -688,7 +688,9 @@ DEFAULT_HOME_BUTTONS = [
     {"key": "folders", "text": "🗂️ 文件夹列表", "type": "action", "enabled": True},
     {"key": "favorites", "text": "⭐ 收藏列表", "type": "action", "enabled": True},
     {"key": "random", "text": "🎲 随机探索", "type": "action", "enabled": True},
+    {"key": "random_again", "text": "🔄 再来一批", "type": "action", "enabled": True},
     {"key": "notifications", "text": "🔔 新资源通知", "type": "action", "enabled": True},
+    {"key": "latest", "text": "🆕 最新资源", "type": "action", "enabled": True},
 ]
 
 
@@ -714,12 +716,18 @@ async def get_home_buttons():
         if current is None:
             buttons.append(dict(default))
             continue
-        # Random exploration must remain visible and usable; old saved settings
-        # may contain a stale disabled entry from an earlier broken menu.
-        if default["key"] == "random":
+        if default["key"] in ("random", "random_again", "latest"):
             current["text"] = default["text"]
             current["type"] = "action"
             current["enabled"] = True
+    # Keep the two shortcut buttons immediately after their related home actions,
+    # including for users whose menu was saved before this update.
+    for parent, child in (("random", "random_again"), ("folders", "latest")):
+        child_item = next((item for item in buttons if item.get("key") == child), None)
+        if child_item:
+            buttons.remove(child_item)
+            parent_index = next((i for i, item in enumerate(buttons) if item.get("key") == parent), len(buttons) - 1)
+            buttons.insert(parent_index + 1, child_item)
     return buttons
 
 
@@ -739,6 +747,12 @@ async def user_home_keyboard():
             button = InlineKeyboardButton(
                 str(item["text"])[:60], callback_data=f"uc:{item['key']}"
             )
+        if item.get("key") in ("folders", "latest", "random", "random_again"):
+            if current:
+                rows.append(current)
+                current = []
+            rows.append([button])
+            continue
         current.append(button)
         if len(current) == 2:
             rows.append(current)
@@ -2741,6 +2755,26 @@ async def user_catalog_callback_handler(client, query):
                 [InlineKeyboardButton("🏠 返回主页", callback_data="uc:home")],
             ]),
         )
+        return
+
+    if action[1] == "random_again":
+        action[1] = "random"
+
+    if action[1] == "latest":
+        await query.answer("正在整理最新资源…")
+        records, _, total = await db.public_catalog(limit=12, offset=0)
+        rows = [[InlineKeyboardButton(
+            f"📄 {str(item['file_name'])[:38]}",
+            callback_data=f"uc:open:{item['file_key']}",
+        )] for item in records]
+        rows.append([InlineKeyboardButton("🎲 随机探索", callback_data="uc:random")])
+        rows.append([InlineKeyboardButton("🏠 返回主页", callback_data="uc:home")])
+        body = "🆕 最新资源（按入库时间排序）\\n"
+        body += f"共 {total} 个资源，以下显示最新 12 个。\\n\\n"
+        body += ("\\n".join(
+            f"• {item['file_name'][:48]}（{item['category']}）" for item in records
+        ) if records else "暂时没有资源。")
+        await message.edit_text(body, reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if action[1] == "random":
