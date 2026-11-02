@@ -2400,9 +2400,9 @@ async def admin_directories_command(client, message):
         "点击文件夹名称可复制名称；点击下方数字查看统计和管理。"
     )
     copy_rows = [[{"text": "➕ 新建目录", "callback_data": "mc:dirnew"}]]
-    for row in categories[:page_size]:
+    for index, row in enumerate(categories[:page_size]):
         copy_rows.append([{
-            "text": f"{start_at + len(copy_rows)}. 📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
+            "text": f"{index + 1}. 📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
             "copy_text": {"text": str(row["category"])},
         }])
     for chunk_start in range(0, min(len(categories), page_size), 5):
