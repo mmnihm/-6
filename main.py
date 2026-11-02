@@ -949,7 +949,10 @@ async def _flush_album_upload(client, key):
         await _upload_single_handler(client, messages[0])
         return
     user = messages[0].from_user
-    if user and await is_admin(user.id):
+    # Ignore uploads from non-members silently; do not create a status message.
+    if not user or not await has_access(user.id):
+        return
+    if await is_admin(user.id):
         active_batch = await db.get_upload_batch(user.id)
         selected_for_status = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
     else:
@@ -963,9 +966,6 @@ async def _flush_album_upload(client, key):
         await messages[0].reply_text(f"⏳ 收到一组媒体（{len(messages)} 个），正在整组保存…")
     )
     try:
-        if not user or not await has_access(user.id):
-            await status.edit_text("⛔ 仅限会员群成员上传文件。")
-            return
         primary_channel_id, backup_channel_id = await get_storage_channels()
         if not primary_channel_id or not backup_channel_id or primary_channel_id == backup_channel_id:
             await status.edit_text("⚠️ 请管理员先正确绑定主、备份存储频道。")
@@ -1370,7 +1370,6 @@ async def _upload_single_handler(client, message):
         return
     await db.touch_user(user.id)
     if not await has_access(user.id):
-        await message.reply_text("⛔ 仅限会员群成员上传文件。")
         return
 
     media_type, file_name, source_fingerprint = media_details(message)
