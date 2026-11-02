@@ -1304,23 +1304,24 @@ async def directory_import_confirm_handler(client, message):
             )
 
         total = len(pending["resources"])
+        changed_categories = set()
         for index, item in enumerate(pending["resources"], 1):
             fingerprint = item["source_fingerprint"]
             try:
-                if await db.get_file_by_fingerprint(fingerprint):
-                    skipped += 1
+                # The unique source-fingerprint index makes a separate lookup
+                # unnecessary; INSERT OR IGNORE handles duplicates atomically.
+                file_key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
+                inserted = await db.add_file(
+                    file_key, user.id, item["file_name"], item["media_type"],
+                    item["message_id"], 0, item["category"], fingerprint,
+                    item.get("file_size", 0), item.get("created_at"),
+                    refresh_stats=False,
+                )
+                if inserted:
+                    changed_categories.add(item["category"])
+                    success += 1
                 else:
-                    file_key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
-                    inserted = await db.add_file(
-                        file_key, user.id, item["file_name"], item["media_type"],
-                        item["message_id"], 0, item["category"], fingerprint,
-                        item.get("file_size", 0), item.get("created_at")
-                    )
-                    if inserted:
-                        await db.save_category(item["category"])
-                        success += 1
-                    else:
-                        skipped += 1
+                    skipped += 1
             except Exception:
                 failed += 1
                 log.exception("Directory index import failed: %s", fingerprint)
@@ -1338,6 +1339,8 @@ async def directory_import_confirm_handler(client, message):
             if index % 100 == 0:
                 await asyncio.sleep(0.05)
 
+        # Recalculate each affected folder once after the import, not once per file.
+        await db.refresh_category_stats(changed_categories)
         category_catalog_cache["expires_at"] = 0
         # Preserve intentionally-created empty folders from the import or admin panel.
         await db.list_categories()
