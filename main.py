@@ -2818,21 +2818,23 @@ async def user_catalog_callback_handler(client, query):
             summary = f"🎲 随机发送完成：成功 {sent}/{len(rows)} 个文件。"
             if failed:
                 summary += f"\n\n⚠️ 有 {failed} 个文件未能发送，已自动跳过；其余资源不受影响。"
-            # Send the final summary as a standalone bot message.
-            # This keeps the inline keyboard attached to the actual completion
-            # message rather than relying on the callback message reply helper.
-            summary_keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 再来一批", callback_data="uc:random_again")],
-                [InlineKeyboardButton("🏠 返回主页", callback_data="uc:home")],
-            ])
-            await client.send_message(
-                chat_id=user.id,
-                text=summary,
-                reply_markup=summary_keyboard,
-            )
+            # Send the completion summary through the same direct Bot API
+            # transport used by the reliable file-copy path. The raw JSON
+            # reply_markup makes it explicit that Telegram receives buttons.
+            result_message = await telegram_bot_api("sendMessage", {
+                "chat_id": int(user.id),
+                "text": summary,
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [{"text": "🔄 再来一批", "callback_data": "uc:random_again"}],
+                        [{"text": "🏠 返回主页", "callback_data": "uc:home"}],
+                    ]
+                },
+            })
             log.info(
-                "Random delivery summary sent with inline keyboard: user=%s sent=%s total=%s failed=%s",
-                user.id, sent, len(rows), failed,
+                "Random completion sent via Bot API with inline keyboard: user=%s message_id=%s sent=%s total=%s failed=%s",
+                user.id, result_message.get("message_id") if isinstance(result_message, dict) else None,
+                sent, len(rows), failed,
             )
         except Exception:
             log.exception("Random exploration failed for user %s", user.id)
