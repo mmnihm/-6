@@ -686,11 +686,10 @@ DEFAULT_HOME_BUTTONS = [
     {"key": "search", "text": "🔎 搜索资源", "type": "action", "enabled": True},
     {"key": "history", "text": "🕘 最近获取", "type": "action", "enabled": True},
     {"key": "folders", "text": "🗂️ 文件夹列表", "type": "action", "enabled": True},
-    {"key": "favorites", "text": "⭐ 收藏列表", "type": "action", "enabled": True},
-    {"key": "random", "text": "🎲 随机探索", "type": "action", "enabled": True},
-    {"key": "random_again", "text": "🔄 再来一批", "type": "action", "enabled": True},
-    {"key": "notifications", "text": "🔔 新资源通知", "type": "action", "enabled": True},
     {"key": "latest", "text": "🆕 最新资源", "type": "action", "enabled": True},
+    {"key": "random", "text": "🎲 随机探索", "type": "action", "enabled": True},
+    {"key": "favorites", "text": "⭐ 收藏列表", "type": "action", "enabled": True},
+    {"key": "notifications", "text": "🔔 新资源通知", "type": "action", "enabled": True},
 ]
 
 
@@ -704,6 +703,7 @@ async def get_home_buttons():
                 buttons = [
                     item for item in parsed
                     if isinstance(item, dict) and item.get("key") and item.get("text")
+                    and item.get("key") != "random_again"
                 ]
         except (TypeError, ValueError):
             log.warning("Invalid home_buttons setting; restoring default buttons")
@@ -716,18 +716,17 @@ async def get_home_buttons():
         if current is None:
             buttons.append(dict(default))
             continue
-        if default["key"] in ("random", "random_again", "latest"):
+        if default["key"] in ("random", "latest", "folders", "favorites", "search", "history", "notifications"):
             current["text"] = default["text"]
             current["type"] = "action"
             current["enabled"] = True
-    # Keep the two shortcut buttons immediately after their related home actions,
-    # including for users whose menu was saved before this update.
-    for parent, child in (("random", "random_again"), ("folders", "latest")):
-        child_item = next((item for item in buttons if item.get("key") == child), None)
-        if child_item:
-            buttons.remove(child_item)
-            parent_index = next((i for i, item in enumerate(buttons) if item.get("key") == parent), len(buttons) - 1)
-            buttons.insert(parent_index + 1, child_item)
+    # "再来一批" is a result-screen action, never a home-menu button.
+    buttons = [item for item in buttons if item.get("key") != "random_again"]
+    # Keep built-in actions in a clear two-column order; custom URL buttons follow.
+    built_in_order = ["search", "history", "folders", "latest", "random", "favorites", "notifications"]
+    built_ins = {str(item.get("key")): item for item in buttons if item.get("key") in built_in_order}
+    custom = [item for item in buttons if item.get("key") not in built_in_order]
+    buttons = [built_ins[key] for key in built_in_order if key in built_ins] + custom
     return buttons
 
 
@@ -737,28 +736,36 @@ async def save_home_buttons(buttons):
 
 async def user_home_keyboard():
     buttons = await get_home_buttons()
-    rows, current = [], []
-    for item in buttons:
-        if not item.get("enabled", True):
-            continue
+    enabled = [item for item in buttons if item.get("enabled", True)]
+    by_key = {str(item.get("key")): item for item in enabled}
+
+    def make_button(item):
         if item.get("type") == "url":
-            button = InlineKeyboardButton(str(item["text"])[:60], url=str(item["url"]))
-        else:
-            button = InlineKeyboardButton(
-                str(item["text"])[:60], callback_data=f"uc:{item['key']}"
-            )
-        if item.get("key") in ("folders", "latest", "random", "random_again"):
-            if current:
-                rows.append(current)
-                current = []
-            rows.append([button])
-            continue
-        current.append(button)
-        if len(current) == 2:
-            rows.append(current)
-            current = []
-    if current:
-        rows.append(current)
+            return InlineKeyboardButton(str(item["text"])[:60], url=str(item["url"]))
+        return InlineKeyboardButton(
+            str(item["text"])[:60], callback_data=f"uc:{item['key']}"
+        )
+
+    # Main actions are grouped into balanced rows for a cleaner mobile layout.
+    rows = []
+    for group in (
+        ("search", "history"),
+        ("folders", "latest"),
+        ("random", "favorites"),
+        ("notifications",),
+    ):
+        row = [make_button(by_key[key]) for key in group if key in by_key]
+        if row:
+            rows.append(row)
+
+    # Preserve any custom buttons added by the administrator.
+    custom = [item for item in enabled if item.get("key") not in {
+        "search", "history", "folders", "latest", "random", "favorites",
+        "notifications", "random_again",
+    }]
+    for index in range(0, len(custom), 2):
+        rows.append([make_button(item) for item in custom[index:index + 2]])
+
     return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 刷新首页", callback_data="uc:home")]
     ])
@@ -2814,7 +2821,8 @@ async def user_catalog_callback_handler(client, query):
             await message.reply_text(
                 summary,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🏠 返回主页", callback_data="uc:home")]
+                    [InlineKeyboardButton("🔄 再来一批", callback_data="uc:random_again")],
+                    [InlineKeyboardButton("🏠 返回主页", callback_data="uc:home")],
                 ]),
             )
         except Exception:
