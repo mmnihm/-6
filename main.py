@@ -43,7 +43,8 @@ pending_upload_categories = {}
 upload_status_messages = {}
 pending_album_uploads = {}
 pending_upload_tasks = {}
-upload_copy_semaphore = asyncio.Semaphore(4)
+upload_copy_semaphore = asyncio.Semaphore(2)
+upload_received_counts = {}
 upload_progress_state = {}
 pending_home_button_actions = {}
 pending_admin_actions = {}
@@ -1020,8 +1021,6 @@ async def start_handler(client, message):
 
 
 async def _flush_album_upload(client, key):
-    # Wait until this album has been quiet for 3 seconds. The scheduled task
-    # is reset whenever another message from the same Telegram album arrives.
     await asyncio.sleep(3.0)
     if pending_album_uploads.get((key, "scheduled")) is asyncio.current_task():
         pending_album_uploads.pop((key, "scheduled"), None)
@@ -1032,35 +1031,29 @@ async def _flush_album_upload(client, key):
     if len(messages) < 2:
         await _upload_single_handler(client, messages[0])
         return
+
     user = messages[0].from_user
-    # Ignore uploads from non-members silently; do not create a status message.
     if not user or not await has_access(user.id):
         return
-    if await is_admin(user.id):
-        active_batch = await db.get_upload_batch(user.id)
-        selected_for_status = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
-    else:
-        selected_for_status = None
-    # Admin batch uploads stay completely silent; other uploads retain feedback.
-    is_admin_batch = bool(selected_for_status)
-    status = None if is_admin_batch else await messages[0].reply_text(f"⏳ 收到一组媒体（{len(messages)} 个），正在整组保存…")
-
+    active_batch = await db.get_upload_batch(user.id) if await is_admin(user.id) else None
+    selected_category = (
+        active_batch["category"] if active_batch
+        else pending_upload_categories.get(user.id) if await is_admin(user.id)
+        else None
+    )
+    is_admin_batch = bool(await is_admin(user.id) and selected_category)
+    status = None if is_admin_batch else await messages[0].reply_text(
+        f"⏳ 收到一组媒体（{len(messages)} 个），正在逐个保存…"
+    )
+    saved = 0
+    failed = 0
+    backup_failed = 0
     try:
         primary_channel_id, backup_channel_id = await get_storage_channels()
         if not primary_channel_id or not backup_channel_id or primary_channel_id == backup_channel_id:
-            if status is not None:
-                await status.edit_text("⚠️ 请管理员先正确绑定主、备份存储频道。")
-            else:
-                log.error("Upload batch has invalid primary/backup channel binding for user %s", user.id)
-            return
-        active_batch = await db.get_upload_batch(user.id) if await is_admin(user.id) else None
-        selected_category = (
-            active_batch["category"] if active_batch
-            else pending_upload_categories.get(user.id) if await is_admin(user.id)
-            else None
-        )
+            raise RuntimeError("主、备份存储频道未正确绑定")
         category = str(selected_category or parse_category(messages[0]))[:120]
-        if await is_admin(user.id) and selected_category and not active_batch:
+        if is_admin_batch and not active_batch:
             await db.start_upload_batch(user.id, category)
         if not BOT_ID:
             me = await client.get_me()
@@ -1073,82 +1066,87 @@ async def _flush_album_upload(client, key):
                 raise RuntimeError(f"{label}中机器人不是管理员")
             if member.get("status") == "administrator" and not member.get("can_post_messages", False):
                 raise RuntimeError(f"{label}中机器人没有发布消息权限")
-        ids = [int(item.id) for item in messages]
-        # Album copies can take longer than lightweight Bot API calls.
-        # Give Telegram enough time to finish without changing other API timeouts.
-        copy_timeout = aiohttp.ClientTimeout(total=90, connect=10, sock_read=75)
-        primary = await telegram_bot_api("copyMessages", {
-            "chat_id": primary_channel_id,
-            "from_chat_id": messages[0].chat.id,
-            "message_ids": ids,
-        }, timeout=copy_timeout)
-        if not isinstance(primary, list) or len(primary) != len(messages):
-            raise RuntimeError("主频道整组复制结果不完整，未写入目录")
-        backup = []
-        backup_error = None
-        try:
-            backup = await telegram_bot_api("copyMessages", {
-                "chat_id": backup_channel_id,
-                "from_chat_id": messages[0].chat.id,
-                "message_ids": ids,
-            }, timeout=copy_timeout)
-            if not isinstance(backup, list) or len(backup) != len(messages):
-                raise RuntimeError("备份频道整组复制结果不完整")
-        except Exception as exc:
-            backup_error = exc
-            log.exception("Album backup copy failed")
-        group_id = secrets.token_urlsafe(12)
-        saved = 0
+
+        album_group_id = secrets.token_urlsafe(12)
         for position, message in enumerate(messages):
             media_type, file_name, fingerprint = media_details(message)
             if not media_type:
+                failed += 1
+                log.warning("Album item has unsupported media: user=%s message=%s", user.id, message.id)
                 continue
             if is_admin_batch:
-                fingerprint = f"upload:{messages[position].chat.id}:{messages[position].id}"
+                fingerprint = f"upload:{message.chat.id}:{message.id}"
             elif fingerprint and await db.get_file_by_fingerprint(fingerprint):
                 continue
             media_object = getattr(message, media_type, None)
-            size = int(getattr(media_object, "file_size", 0) or 0)
+            file_size = int(getattr(media_object, "file_size", 0) or 0)
+            try:
+                primary = await telegram_bot_api("copyMessage", {
+                    "chat_id": primary_channel_id,
+                    "from_chat_id": message.chat.id,
+                    "message_id": message.id,
+                })
+                primary_id = int(primary["message_id"])
+            except Exception:
+                failed += 1
+                log.exception("Album primary copy failed: user=%s source_message=%s", user.id, message.id)
+                continue
+
+            backup_id = 0
+            backup_error = None
+            try:
+                backup = await telegram_bot_api("copyMessage", {
+                    "chat_id": backup_channel_id,
+                    "from_chat_id": message.chat.id,
+                    "message_id": message.id,
+                })
+                backup_id = int(backup["message_id"])
+            except Exception as exc:
+                backup_error = exc
+                backup_failed += 1
+                log.exception("Album backup copy failed; primary copy will be indexed: user=%s source_message=%s", user.id, message.id)
+
             key_file = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
-            primary_id = int(primary[position]["message_id"])
-            backup_id = int(backup[position]["message_id"]) if backup else 0
             error_text = f"{type(backup_error).__name__}: {str(backup_error)[:400]}" if backup_error else ""
-            if await is_admin(user.id) and selected_category:
+            if is_admin_batch:
                 inserted = await db.stage_upload_batch_item(
                     key_file, user.id, file_name, media_type, category,
                     primary_channel_id, primary_id, backup_channel_id, backup_id,
-                    fingerprint, size, error_text, group_id, position,
+                    fingerprint, file_size, error_text, album_group_id, position,
                 )
             else:
                 inserted = await db.add_file(
                     key_file, user.id, file_name, media_type,
-                    primary_id, backup_id, category, fingerprint, size,
-                    album_group_id=group_id, album_position=position,
+                    primary_id, backup_id, category, fingerprint, file_size,
+                    album_group_id=album_group_id, album_position=position,
                 )
             if inserted:
                 saved += 1
-                if backup_error and not (await is_admin(user.id) and selected_category):
+                if backup_error and not is_admin_batch:
                     await db.enqueue_backup_retry(
                         key_file, primary_channel_id, primary_id, backup_channel_id, error_text
                     )
-        if not (await is_admin(user.id) and selected_category):
+
+        if not is_admin_batch:
             category_catalog_cache["expires_at"] = 0
-        if not is_admin_batch and status is not None:
+        if status is not None:
             await status.edit_text(
-                f"✅ 相册整组保存完成\n📂 目录：{category}\n"
-                f"🗂 相册：1 组\n📦 文件：{saved} 个\n"
-                f"🖼 图片：{sum(1 for x in messages if x.photo)} 张\n"
-                f"🎬 视频：{sum(1 for x in messages if x.video)} 个"
-                + ("\n⚠️ 备份失败，已加入自动重试。" if backup_error else "")
+                f"✅ 相册处理完成\n📂 目录：{category}\n"
+                f"📥 收到：{len(messages)} 个\n📦 成功保存：{saved} 个\n"
+                f"⚠️ 主频道保存失败：{failed} 个"
+                + (f"\n⚠️ 备份失败：{backup_failed} 个（已安排重试）" if backup_failed else "")
             )
     except Exception as exc:
         log.exception("Grouped album upload failed for user %s", user.id)
         if status is not None:
             try:
-                await status.edit_text(f"❌ 相册整组保存失败：{type(exc).__name__}: {str(exc)[:300]}")
+                await status.edit_text(
+                    f"❌ 相册处理异常：{type(exc).__name__}: {str(exc)[:300]}\n"
+                    f"已成功保存：{saved} 个；失败：{failed} 个"
+                )
             except Exception:
                 log.exception("Could not report album upload failure")
-        
+
 async def upload_handler(client, message):
     group_id = getattr(message, "media_group_id", None)
     if not group_id:
@@ -1157,6 +1155,7 @@ async def upload_handler(client, message):
             active_batch = await db.get_upload_batch(user.id)
             selected_category = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
             if selected_category:
+                upload_received_counts[int(user.id)] = upload_received_counts.get(int(user.id), 0) + 1
                 track_upload_task(user.id, asyncio.create_task(_run_single_upload_task(client, message)))
                 return
         await _upload_single_handler(client, message)
@@ -1164,6 +1163,11 @@ async def upload_handler(client, message):
     user = message.from_user
     if not user:
         return
+    if await is_admin(user.id):
+        active_batch = await db.get_upload_batch(user.id)
+        selected_category = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
+        if selected_category:
+            upload_received_counts[int(user.id)] = upload_received_counts.get(int(user.id), 0) + 1
     key = (int(user.id), int(message.chat.id), str(group_id))
     pending_album_uploads.setdefault(key, []).append(message)
     scheduled = pending_album_uploads.get((key, "scheduled"))
@@ -1868,6 +1872,7 @@ async def scanner_login_input_handler(client, message):
                 if not upload_tasks:
                     break
             await asyncio.gather(*upload_tasks, return_exceptions=True)
+        received_count = upload_received_counts.pop(int(user.id), 0)
         result = await db.publish_upload_batch(user.id)
         upload_progress_state.pop(int(user.id), None)
         pending_upload_categories.pop(user.id, None)
@@ -1878,7 +1883,9 @@ async def scanner_login_input_handler(client, message):
         else:
             # Exactly one completion notice; no progress messages are created or deleted.
             await message.reply_text(
-                f"✅ 成功入库：{result['published']} 个文件",
+                f"✅ 本次上传完成\n📥 收到文件：{received_count} 个\n"
+                f"📦 成功入库：{result['published']} 个文件"
+                + (f"\n⚠️ 未成功入库：{max(0, received_count - result['published'])} 个，请查看部署日志。" if received_count > result["published"] else ""),
                 reply_markup=admin_home_keyboard(),
             )
         return
