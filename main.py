@@ -688,6 +688,7 @@ DEFAULT_HOME_BUTTONS = [
     {"key": "folders", "text": "🗂️ 文件夹列表", "type": "action", "enabled": True},
     {"key": "favorites", "text": "⭐ 收藏列表", "type": "action", "enabled": True},
     {"key": "random", "text": "🎲 随机探索", "type": "action", "enabled": True},
+    {"key": "notifications", "text": "🔔 新资源通知", "type": "action", "enabled": True},
 ]
 
 
@@ -2724,6 +2725,21 @@ async def user_catalog_callback_handler(client, query):
         await message.edit_text(
             await user_home_text(user.id),
             reply_markup=await user_home_keyboard(),
+        )
+        return
+
+    if action[1] == "notifications":
+        enabled = await db.toggle_notification_subscription(user.id)
+        await query.answer("已开启新资源提醒" if enabled else "已关闭新资源提醒")
+        await message.edit_text(
+            "🔔 新资源通知设置\n\n" + (
+                "✅ 已开启。管理员发布新资源后，你会收到提醒。"
+                if enabled else "🔕 当前已关闭。开启后可及时收到新资源提醒。"
+            ),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔕 关闭通知" if enabled else "🔔 开启通知", callback_data="uc:notifications")],
+                [InlineKeyboardButton("🏠 返回主页", callback_data="uc:home")],
+            ]),
         )
         return
 
