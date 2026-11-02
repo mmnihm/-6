@@ -2933,7 +2933,9 @@ async def user_catalog_callback_handler(client, query):
             except (TypeError, ValueError):
                 page = 0
         else:
-            page = await get_saved_folder_list_page(user.id, total_pages)
+            # Opening the folder list from the home menu always starts at page 1.
+            # Explicit pagination callbacks still preserve their requested page.
+            page = 0
         page = min(page, max(0, total_pages - 1))
         await save_folder_list_page(user.id, page)
         start_at = page * page_size
