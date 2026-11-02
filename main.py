@@ -552,7 +552,7 @@ def folder_detail_keyboard(category_row, page, has_next, is_favorite):
     rows = []
     if int(category_row["file_count"] or 0) > 0:
         rows.append([InlineKeyboardButton(
-            "📥 获取资源（每批20个）",
+            "📥 获取资源（单文件每批20个）",
             callback_data=f"uc:getfolder:{share_key}:{page * 20}",
         )])
     rows.append([InlineKeyboardButton(
@@ -2811,7 +2811,7 @@ async def user_catalog_callback_handler(client, query):
     if action[1] == "random":
         # Acknowledge the button immediately; database and Telegram delivery
         # must not leave the user's callback spinner hanging.
-        await query.answer("🎲 正在为你随机发送最多 20 个文件")
+        await query.answer("🎲 正在随机选择资源（相册整组发送）")
         try:
             if not await has_access(user.id):
                 await message.reply_text("⛔ 仅限会员群成员使用。")
@@ -3201,7 +3201,7 @@ async def user_catalog_callback_handler(client, query):
                     f"✅ 成功发送：{sent} 个\n"
                     f"❌ 发送失败：{failed} 个\n"
                     f"📊 领取进度：{next_offset}/{total}"
-                    + ("\n\n还有资源，点击下方按钮继续领取下一批（最多20个）。"
+                    + ("\n\n还有资源，点击下方按钮继续领取（单文件每批20个，相册整组）。"
                        if next_offset < total else "\n\n🎉 该目录资源已全部领取完毕。")
                 )
             except Exception as exc:
@@ -3224,7 +3224,7 @@ async def user_catalog_callback_handler(client, query):
             button_rows = []
             if next_offset < total:
                 button_rows.append([InlineKeyboardButton(
-                    "📥 继续领取下一批（最多20个）",
+                    "📥 继续领取（单文件20个，相册整组）",
                     callback_data=f"uc:getfolder:{share_key}:{next_offset}",
                 )])
             button_rows.extend([
@@ -3249,7 +3249,7 @@ async def user_catalog_callback_handler(client, query):
                 api_markup = {
                     "inline_keyboard": (
                         [[{
-                            "text": "📥 继续领取下一批（最多20个）",
+                            "text": "📥 继续领取（单文件20个，相册整组）",
                             "callback_data": f"uc:getfolder:{share_key}:{next_offset}",
                         }]] if next_offset < total else []
                     ) + [
@@ -3615,7 +3615,7 @@ async def admin_callback_handler(client, query):
                 )
                 return
             progress = await message.reply_text(
-                f"📥 正在发送「{row['category']}」第 {offset // 20 + 1} 组文件（最多20个）…"
+                f"📥 正在发送「{row['category']}」资源（单文件每批20个，相册整组）…"
             )
             try:
                 sent, failed, next_offset, _last_sent_message_id = await send_catalog_batch(
@@ -3630,7 +3630,7 @@ async def admin_callback_handler(client, query):
                 buttons = []
                 if next_offset < total:
                     buttons.append([InlineKeyboardButton(
-                        "📥 继续发送下一组（最多20个）",
+                        "📥 继续发送下一组（单文件20个，相册整组）",
                         callback_data=f"mc:dircontent:{index}:{next_offset}",
                     )])
                 # Remove the temporary status message, then send the completion
