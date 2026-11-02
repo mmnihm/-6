@@ -699,7 +699,7 @@ async def cache_cangku_backup(client, file_key, source_chat_id, source_message_i
         cangku_backup_in_progress.discard(file_key)
 
 
-async def send_catalog_file(client, user_id, file_key):
+async def send_catalog_file(client, user_id, file_key, return_message_id=False):
     record = await db.get_file(file_key)
     if not record:
         return False, "文件不存在或已被移除。"
@@ -774,6 +774,8 @@ async def send_catalog_file(client, user_id, file_key):
                 return False, "文件暂时无法取回，请联系管理员检查存储频道。"
 
     await db.record_history(user_id, file_key)
+    if return_message_id:
+        return True, "文件已发送。", copied_message_id
     return True, "文件已发送。"
 
 
@@ -790,13 +792,14 @@ async def try_send_catalog_album(client, user_id, group):
         "from_chat_id": source_chats.pop(),
         "message_ids": message_ids,
     })
-    return isinstance(copied, list) and len(copied) == len(group)
+    return copied if isinstance(copied, list) and len(copied) == len(group) else False
 
 
 async def send_catalog_batch(client, user_id, share_key, offset, batch, track_progress=True):
     """Group compatible media across the whole batch; skip failures and keep going."""
     sent = failed = 0
     next_offset = offset
+    last_sent_message_id = None
     primary_channel_id, backup_channel_id = await get_storage_channels()
     records = await db.get_files_by_keys(item["file_key"] for item in batch)
     records_by_key = {row["file_key"]: row for row in records}
@@ -870,6 +873,7 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 )
 
         if delivered:
+            last_sent_message_id = int(delivered[-1]["message_id"])
             keys = [entry[1]["file_key"] for entry in unit]
             await db.record_history_batch(user_id, keys)
             sent += len(unit)
@@ -880,11 +884,12 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
         # Single files and failed albums use the existing reliable copy path.
         for entry in unit:
             position, item = entry[0], entry[1]
-            ok, error_text = await send_catalog_file(
-                client, user_id, item["file_key"]
+            ok, error_text, copied_message_id = await send_catalog_file(
+                client, user_id, item["file_key"], return_message_id=True
             )
             if ok:
                 sent += 1
+                last_sent_message_id = int(copied_message_id)
             else:
                 failed += 1
                 log.warning(
@@ -895,7 +900,7 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
             completed.add(position)
             await advance_progress()
 
-    return sent, failed, next_offset
+    return sent, failed, next_offset, last_sent_message_id
 
 
 @app.on_message(filters.private & filters.command("start"))
@@ -2937,7 +2942,7 @@ async def user_catalog_callback_handler(client, query):
             # Do not post a status message before the files: the final
             # delivery summary is sent only after every resource message.
             try:
-                sent, failed, next_offset = await send_catalog_batch(
+                sent, failed, next_offset, last_sent_message_id = await send_catalog_batch(
                     client, user.id, share_key, offset, batch
                 )
                 text_result = (
@@ -2962,8 +2967,17 @@ async def user_catalog_callback_handler(client, query):
                 [InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")],
                 [InlineKeyboardButton("🏠 返回主菜单", callback_data="uc:home")],
             ])
-            # This is deliberately the last message, after all delivered files.
-            await message.reply_text(text_result, reply_markup=buttons)
+            # Reply directly to the final delivered media so the completion
+            # notice appears immediately beneath the last file in Telegram.
+            if last_sent_message_id is not None:
+                await client.send_message(
+                    user.id,
+                    text_result,
+                    reply_to_message_id=last_sent_message_id,
+                    reply_markup=buttons,
+                )
+            else:
+                await message.reply_text(text_result, reply_markup=buttons)
             return
         finally:
             category_delivery_in_progress.discard(delivery_key)
