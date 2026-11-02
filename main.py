@@ -444,7 +444,7 @@ def folder_detail_keyboard(category_row, page, has_next, is_favorite):
     rows = []
     if int(category_row["file_count"] or 0) > 0:
         rows.append([InlineKeyboardButton(
-            "📥 获取全部资源",
+            "📥 获取资源（每批20个）",
             callback_data=f"uc:getfolder:{share_key}:{page * 20}",
         )])
     rows.append([InlineKeyboardButton(
@@ -2564,10 +2564,13 @@ async def user_catalog_callback_handler(client, query):
         await query.answer("仅限会员群成员使用", show_alert=True)
         return
 
-    opening_folder = action[1] in ("folder", "folderresume", "folderstats")
+    opening_folder = action[1] in ("folder", "folderresume", "folderstats", "getfolder")
     if opening_folder:
-        # Acknowledge immediately and avoid an extra loading-message edit.
-        await query.answer("📂 正在打开目录…")
+        # Acknowledge immediately so slow database or Telegram delivery work
+        # never leaves the callback spinner running.
+        await query.answer(
+            "📥 正在准备本批资源…" if action[1] == "getfolder" else "📂 正在打开目录…"
+        )
         if not await has_access(user.id):
             await message.edit_text("⛔ 仅限会员群成员使用。")
             return
@@ -2915,61 +2918,79 @@ async def user_catalog_callback_handler(client, query):
         try:
             offset = max(0, int(action[3]))
         except ValueError:
-            await query.answer("批次参数无效", show_alert=True)
+            await message.reply_text("⚠️ 批次参数无效，请重新打开目录。")
             return
         category = await db.get_category_by_share_key(share_key)
         if not category:
-            await query.answer("文件夹不存在", show_alert=True)
+            await message.reply_text("⚠️ 文件夹不存在或已被移除。")
             return
         delivery_key = (int(user.id), str(share_key))
         if delivery_key in category_delivery_in_progress:
-            await query.answer("这一批资源正在发送，请稍候，不要重复点击。", show_alert=True)
+            await message.reply_text("⏳ 这一批资源正在发送，请稍候，不要重复点击。")
             return
         category_delivery_in_progress.add(delivery_key)
         try:
-            # Use the live file-row count for delivery decisions; the folder card
-            # uses cached summary counters and must not hide newly added files.
-            total = await db.count_category_files(category["name"])
+            # The category row stores counts refreshed only when files are
+            # published or scanned; do not COUNT(*) over the files table per click.
+            total = int(category["file_count"] or 0)
             # Keep member delivery progress separate from legacy admin-send progress.
             member_progress_key = f"member:{share_key}"
             saved_offset = await db.get_category_delivery_progress(user.id, member_progress_key)
             # A stale button must never make a user receive already-delivered batches again.
             offset = max(offset, saved_offset)
             remaining = max(0, total - offset)
-            batch = await db.list_category_files(category["name"], limit=remaining, offset=offset)
+            batch = await db.list_category_files(
+                category["name"], limit=min(20, remaining), offset=offset
+            )
             if not batch:
-                await query.answer("这个目录的资源已经领取完毕", show_alert=True)
+                await message.reply_text("📭 这个目录的资源已经领取完毕。")
                 return
-            await query.answer(f"开始发送全部剩余资源，共 {len(batch)} 个文件")
             # Do not post a status message before the files: the final
             # delivery summary is sent only after every resource message.
             last_sent_message_id = None
+            next_offset = offset
             try:
                 sent, failed, next_offset, last_sent_message_id = await send_catalog_batch(
                     client, user.id, member_progress_key, offset, batch
                 )
                 text_result = (
-                    f"📦 目录资源发送完成！\n\n"
+                    f"📦 本批资源发送完成！\n\n"
                     f"📁 目录：{category['name']}\n"
+                    f"📥 本批处理：{len(batch)} 个\n"
                     f"✅ 成功发送：{sent} 个\n"
                     f"❌ 发送失败：{failed} 个\n"
                     f"📊 领取进度：{next_offset}/{total}"
+                    + ("\n\n还有资源，点击下方按钮继续领取下一批（最多20个）。"
+                       if next_offset < total else "\n\n🎉 该目录资源已全部领取完毕。")
                 )
             except Exception as exc:
                 log.exception(
                     "Folder resource delivery aborted: user=%s share_key=%s",
                     user.id, share_key,
                 )
+                try:
+                    next_offset = await db.get_category_delivery_progress(
+                        user.id, member_progress_key
+                    )
+                except Exception:
+                    log.exception("Could not reload folder delivery progress")
                 text_result = (
-                    f"⚠️ 资源发送过程中出现异常，发送已中止。\n"
-                    f"请稍后重新进入目录继续领取。\n\n"
+                    f"⚠️ 本批资源发送过程中出现异常，发送已中止。\n"
+                    f"请稍后继续领取，已成功处理的进度会保留。\n\n"
                     f"原因：{str(exc)[:180]}"
                 )
 
-            buttons = InlineKeyboardMarkup([
+            button_rows = []
+            if next_offset < total:
+                button_rows.append([InlineKeyboardButton(
+                    "📥 继续领取下一批（最多20个）",
+                    callback_data=f"uc:getfolder:{share_key}:{next_offset}",
+                )])
+            button_rows.extend([
                 [InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")],
                 [InlineKeyboardButton("🏠 返回主菜单", callback_data="uc:home")],
             ])
+            buttons = InlineKeyboardMarkup(button_rows)
             # Send a standalone message only after the entire media batch has
             # finished. Do not reply to an earlier message: Telegram clients may
             # visually anchor/reposition reply previews away from the bottom.
@@ -2985,7 +3006,12 @@ async def user_catalog_callback_handler(client, query):
                     user.id,
                 )
                 api_markup = {
-                    "inline_keyboard": [
+                    "inline_keyboard": (
+                        [[{
+                            "text": "📥 继续领取下一批（最多20个）",
+                            "callback_data": f"uc:getfolder:{share_key}:{next_offset}",
+                        }]] if next_offset < total else []
+                    ) + [
                         [{"text": "📁 返回文件夹", "callback_data": f"uc:folderlink:{share_key}"}],
                         [{"text": "🏠 返回主菜单", "callback_data": "uc:home"}],
                     ]
