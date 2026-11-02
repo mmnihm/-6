@@ -986,6 +986,10 @@ async def _flush_album_upload(client, key):
         if selected_for_status else
         await messages[0].reply_text(f"⏳ 收到一组媒体（{len(messages)} 个），正在整组保存…")
     )
+    if selected_for_status:
+        await update_admin_upload_progress(
+            messages[0], user.id, selected_for_status, increment=0, force=True
+        )
     try:
         primary_channel_id, backup_channel_id = await get_storage_channels()
         if not primary_channel_id or not backup_channel_id or primary_channel_id == backup_channel_id:
@@ -1432,7 +1436,7 @@ async def _upload_single_handler(client, message):
         if is_admin_batch else
         await message.reply_text("⏳ 正在检查频道权限并保存文件…")
     )
-    if is_admin_batch:
+    if is_admin_batch and not getattr(message, "media_group_id", None):
         await update_admin_upload_progress(message, user.id, category, increment=1)
     primary_id = None
     backup_id = 0
