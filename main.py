@@ -2928,8 +2928,9 @@ async def user_catalog_callback_handler(client, query):
             return
         category_delivery_in_progress.add(delivery_key)
         try:
-            total = next((int(row["file_count"] or 0) for row in await db.list_categories()
-                          if row["share_key"] == share_key), 0)
+            # Use the live file-row count for delivery decisions; the folder card
+            # uses cached summary counters and must not hide newly added files.
+            total = await db.count_category_files(category["name"])
             saved_offset = await db.get_category_delivery_progress(user.id, share_key)
             # A stale button must never make a user receive already-delivered batches again.
             offset = max(offset, saved_offset)
@@ -2971,11 +2972,41 @@ async def user_catalog_callback_handler(client, query):
             # Send a standalone message only after the entire media batch has
             # finished. Do not reply to an earlier message: Telegram clients may
             # visually anchor/reposition reply previews away from the bottom.
-            await client.send_message(
-                user.id,
-                text_result,
-                reply_markup=buttons,
-            )
+            try:
+                await client.send_message(
+                    user.id,
+                    text_result,
+                    reply_markup=buttons,
+                )
+            except Exception:
+                log.exception(
+                    "Could not send standalone delivery summary; falling back to Bot API: user=%s",
+                    user.id,
+                )
+                api_markup = {
+                    "inline_keyboard": [
+                        [{"text": "📁 返回文件夹", "callback_data": f"uc:folderlink:{share_key}"}],
+                        [{"text": "🏠 返回主菜单", "callback_data": "uc:home"}],
+                    ]
+                }
+                try:
+                    await telegram_bot_api("sendMessage", {
+                        "chat_id": user.id,
+                        "text": text_result,
+                        "reply_markup": api_markup,
+                    })
+                except Exception:
+                    log.exception(
+                        "Bot API summary fallback failed; trying reply to folder message: user=%s",
+                        user.id,
+                    )
+                    try:
+                        await message.reply_text(text_result, reply_markup=buttons)
+                    except Exception:
+                        log.exception(
+                            "All delivery summary methods failed: user=%s share_key=%s",
+                            user.id, share_key,
+                        )
             return
         finally:
             category_delivery_in_progress.discard(delivery_key)
@@ -3212,33 +3243,56 @@ async def admin_callback_handler(client, query):
             return
         category_delivery_in_progress.add(delivery_key)
         try:
-            total = int(row["file_count"] or 0)
-            saved_offset = await db.get_category_delivery_progress(user.id, share_key)
-            offset = max(offset, saved_offset)
+            # Count actual rows instead of trusting the cached folder-card summary.
+            total = await db.count_category_files(row["category"])
+            offset = min(offset, total)
             batch = await db.list_category_files(row["category"], limit=20, offset=offset)
             if not batch:
-                await message.reply_text(f"✅「{row['category']}」没有更多文件了。")
+                await message.reply_text(
+                    f"📁「{row['category']}」当前实际资源：{total} 个。\n"
+                    "这一页没有可发送的文件；重新打开目录后可从头查看。"
+                )
                 return
             progress = await message.reply_text(
                 f"📥 正在发送「{row['category']}」第 {offset // 20 + 1} 组文件（最多20个）…"
             )
-            sent, failed, next_offset = await send_catalog_batch(
-                client, user.id, share_key, offset, batch
-            )
-            result_text = (
-                f"📦「{row['category']}」本组发送完成\n\n"
-                f"成功：{sent} 个\n失败：{failed} 个\n"
-                f"已发送进度：{next_offset}/{total}"
-            )
-            buttons = []
-            if next_offset < total:
-                buttons.append([InlineKeyboardButton(
-                    "📥 继续发送下一组（最多20个）",
-                    callback_data=f"mc:dircontent:{index}:{next_offset}",
-                )])
-            buttons.append([InlineKeyboardButton("📁 返回文件夹统计", callback_data=f"mc:directory:{index}")])
-            buttons.append([InlineKeyboardButton("📋 文件夹列表", callback_data="mc:directories")])
-            await progress.edit_text(result_text, reply_markup=InlineKeyboardMarkup(buttons))
+            try:
+                sent, failed, next_offset = await send_catalog_batch(
+                    client, user.id, f"admin:{share_key}", offset, batch,
+                    track_progress=False,
+                )
+                result_text = (
+                    f"📦「{row['category']}」本组发送完成\n\n"
+                    f"成功：{sent} 个\n失败：{failed} 个\n"
+                    f"已发送进度：{next_offset}/{total}"
+                )
+                buttons = []
+                if next_offset < total:
+                    buttons.append([InlineKeyboardButton(
+                        "📥 继续发送下一组（最多20个）",
+                        callback_data=f"mc:dircontent:{index}:{next_offset}",
+                    )])
+                buttons.append([InlineKeyboardButton("📁 返回文件夹统计", callback_data=f"mc:directory:{index}")])
+                buttons.append([InlineKeyboardButton("📋 文件夹列表", callback_data="mc:directories")])
+                try:
+                    await progress.edit_text(result_text, reply_markup=InlineKeyboardMarkup(buttons))
+                except Exception:
+                    log.exception("Could not edit admin delivery result; sending a new message")
+                    await message.reply_text(result_text, reply_markup=InlineKeyboardMarkup(buttons))
+            except Exception as exc:
+                log.exception(
+                    "Admin directory delivery failed: user=%s category=%s offset=%s",
+                    user.id, row["category"], offset,
+                )
+                error_text = (
+                    f"⚠️「{row['category']}」发送过程中出现异常。\n"
+                    f"已处理进度：{offset}/{total}\n"
+                    f"原因：{str(exc)[:180]}"
+                )
+                try:
+                    await progress.edit_text(error_text)
+                except Exception:
+                    await message.reply_text(error_text)
         finally:
             category_delivery_in_progress.discard(delivery_key)
     elif action.startswith("dirrename:"):
