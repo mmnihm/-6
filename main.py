@@ -2941,6 +2941,7 @@ async def user_catalog_callback_handler(client, query):
             await query.answer(f"开始发送全部剩余资源，共 {len(batch)} 个文件")
             # Do not post a status message before the files: the final
             # delivery summary is sent only after every resource message.
+            last_sent_message_id = None
             try:
                 sent, failed, next_offset, last_sent_message_id = await send_catalog_batch(
                     client, user.id, share_key, offset, batch
