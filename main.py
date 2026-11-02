@@ -428,7 +428,7 @@ def folder_detail_keyboard(category_row, page, has_next, is_favorite):
     rows = []
     if int(category_row["file_count"] or 0) > 0:
         rows.append([InlineKeyboardButton(
-            "📥 获取本批资源（最多20个）",
+            "📥 获取全部资源",
             callback_data=f"uc:getfolder:{share_key}:{page * 20}",
         )])
     rows.append([InlineKeyboardButton(
@@ -2903,28 +2903,23 @@ async def user_catalog_callback_handler(client, query):
             saved_offset = await db.get_category_delivery_progress(user.id, share_key)
             # A stale button must never make a user receive already-delivered batches again.
             offset = max(offset, saved_offset)
-            batch = await db.list_category_files(category["name"], limit=20, offset=offset)
+            remaining = max(0, total - offset)
+            batch = await db.list_category_files(category["name"], limit=remaining, offset=offset)
             if not batch:
                 await query.answer("这个目录的资源已经领取完毕", show_alert=True)
                 return
-            await query.answer("开始批量发送，最多20个文件")
+            await query.answer(f"开始发送全部剩余资源，共 {len(batch)} 个文件")
             progress = await message.reply_text(
-                f"📥 正在批量获取「{category['name']}」第 {offset // 20 + 1} 组资源（最多20个）…"
+                f"📥 正在发送「{category['name']}」全部资源，共 {len(batch)} 个文件…"
             )
             sent, failed, next_offset = await send_catalog_batch(
                 client, user.id, share_key, offset, batch
             )
             text_result = (
-                f"📦 本组发送完成\n\n成功：{sent} 个\n失败：{failed} 个\n"
-                f"已记录领取进度：{next_offset}/{total}"
+                f"📦 目录资源发送完成\n\n成功：{sent} 个\n失败：{failed} 个\n"
+                f"领取进度：{next_offset}/{total}"
             )
-            buttons = []
-            if next_offset < total:
-                buttons.append([InlineKeyboardButton(
-                    "📥 获取下一组（最多20个）",
-                    callback_data=f"uc:getfolder:{share_key}:{next_offset}",
-                )])
-            buttons.append([InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")])
+            buttons = [[InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")]]
             await progress.edit_text(text_result, reply_markup=InlineKeyboardMarkup(buttons))
             return
         finally:
