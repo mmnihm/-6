@@ -43,6 +43,7 @@ pending_upload_categories = {}
 upload_status_messages = {}
 pending_album_uploads = {}
 pending_album_upload_tasks = {}
+upload_progress_state = {}
 pending_home_button_actions = {}
 pending_admin_actions = {}
 directory_import_running = False
@@ -80,10 +81,27 @@ async def get_upload_status_message(message, user_id, text):
         upload_status_messages[int(user_id)] = status
     else:
         try:
-            await status.edit_text(text)
+            await status.edit_text(text, reply_markup=upload_active_keyboard())
         except Exception as exc:
             log.debug("Could not update upload progress message: %s", exc)
     return status
+
+
+async def update_admin_upload_progress(message, user_id, category, increment=1, force=False):
+    """Maintain one compact live counter instead of sending per-file/per-album notices."""
+    uid = int(user_id)
+    state = upload_progress_state.setdefault(uid, {"received": 0, "last_shown": 0})
+    state["received"] += int(increment)
+    received = state["received"]
+    # Avoid hammering Telegram with edits during a fast multi-album forward.
+    if force or state["last_shown"] == 0 or received - state["last_shown"] >= 5:
+        await get_upload_status_message(
+            message, uid,
+            f"📂 上传目录：{category}\n📥 已接收 {received} 个文件，后台保存中…\n"
+            "全部发送完毕后点击「✅ 结束上传」。",
+        )
+        state["last_shown"] = received
+    return received
 
 
 
@@ -961,12 +979,11 @@ async def _flush_album_upload(client, key):
         selected_for_status = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
     else:
         selected_for_status = None
+    # Admin progress is reported by the single shared counter message.
+    # Non-admin upload feedback remains unchanged.
     status = (
-        await get_upload_status_message(
-            messages[0], user.id,
-            f"⏳ 正在上传到目录：{selected_for_status}\n📦 正在整组保存 {len(messages)} 个文件…",
-        )
-        if user and selected_for_status else
+        upload_status_messages.get(int(user.id))
+        if selected_for_status else
         await messages[0].reply_text(f"⏳ 收到一组媒体（{len(messages)} 个），正在整组保存…")
     )
     try:
@@ -1052,21 +1069,13 @@ async def _flush_album_upload(client, key):
                     )
         if not (await is_admin(user.id) and selected_category):
             category_catalog_cache["expires_at"] = 0
-        await status.edit_text(
-            f"✅ 相册整组保存完成\n📂 目录：{category}\n"
-            f"🗂 相册：1 组\n📦 文件：{saved} 个\n"
-            f"🖼 图片：{sum(1 for x in messages if x.photo)} 张\n"
-            f"🎬 视频：{sum(1 for x in messages if x.video)} 个\n"
-            + ("\n⚠️ 备份失败，已加入自动重试。" if backup_error else "")
-            + ("\n\n尚未对会员开放，全部上传后点击「结束上传」。" if await is_admin(user.id) and selected_category else "")
-        )
-        if await is_admin(user.id) and selected_category:
+        if not (await is_admin(user.id) and selected_category) and status is not None:
             await status.edit_text(
-                "📥 相册已保存到待发布批次。\n"
-                f"📂 上传目录：{category}\n"
-                f"🗂 相册：1 组 · 📦 文件：{saved} 个\n"
-                "可以继续发送文件；此提示会自动更新，不会逐个发送提醒。\n"
-                "全部发送完毕后，点击「✅ 结束上传」统一发布。"
+                f"✅ 相册整组保存完成\n📂 目录：{category}\n"
+                f"🗂 相册：1 组\n📦 文件：{saved} 个\n"
+                f"🖼 图片：{sum(1 for x in messages if x.photo)} 张\n"
+                f"🎬 视频：{sum(1 for x in messages if x.video)} 个"
+                + ("\n⚠️ 备份失败，已加入自动重试。" if backup_error else "")
             )
     except Exception as exc:
         log.exception("Grouped album upload failed")
@@ -1082,6 +1091,11 @@ async def upload_handler(client, message):
         return
     key = (int(user.id), int(message.chat.id), str(group_id))
     pending_album_uploads.setdefault(key, []).append(message)
+    if await is_admin(user.id):
+        active_batch = await db.get_upload_batch(user.id)
+        selected_category = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
+        if selected_category:
+            await update_admin_upload_progress(message, user.id, selected_category, increment=1)
     scheduled = pending_album_uploads.get((key, "scheduled"))
     if scheduled and not scheduled.done():
         scheduled.cancel()
@@ -1414,13 +1428,12 @@ async def _upload_single_handler(client, message):
             await db.start_upload_batch(user.id, category)
     is_admin_batch = bool(await is_admin(user.id) and selected_category)
     status = (
-        await get_upload_status_message(
-            message, user.id,
-            f"⏳ 正在上传到目录：{category}\n📦 正在保存文件，请继续发送；完成后点击「✅ 结束上传」。",
-        )
+        upload_status_messages.get(int(user.id))
         if is_admin_batch else
         await message.reply_text("⏳ 正在检查频道权限并保存文件…")
     )
+    if is_admin_batch:
+        await update_admin_upload_progress(message, user.id, category, increment=1)
     primary_id = None
     backup_id = 0
     step = "检查主频道权限"
@@ -1497,12 +1510,6 @@ async def _upload_single_handler(client, message):
             return
 
         if is_admin_batch:
-            await status.edit_text(
-                "📥 文件已保存到待发布批次。\n"
-                f"📂 上传目录：{category}\n"
-                "📦 可以继续发送文件；此提示会自动更新，不会逐个发送提醒。\n"
-                "全部发送完毕后，点击「✅ 结束上传」统一发布。"
-            )
             return
 
         step = "生成分享链接"
@@ -1790,6 +1797,7 @@ async def scanner_login_input_handler(client, message):
                     break
             await asyncio.gather(*album_tasks, return_exceptions=True)
         result = await db.publish_upload_batch(user.id)
+        progress_state = upload_progress_state.pop(int(user.id), {"received": 0})
         pending_upload_categories.pop(user.id, None)
         category_catalog_cache["expires_at"] = 0
         progress_message = upload_status_messages.pop(int(user.id), None)
@@ -1798,7 +1806,8 @@ async def scanner_login_input_handler(client, message):
                 await progress_message.edit_text(
                     "🎉 本批上传已结束并发布！\n"
                     f"📁 目录：{result['category']}\n"
-                    f"✅ 新增资源：{result['published']} 个\n"
+                    f"📥 收到文件：{progress_state.get('received', 0)} 个\n"
+                    f"✅ 成功入库：{result['published']} 个\n"
                     f"⚠️ 待补备份：{result['failed_backup']} 个"
                 )
             except Exception:
@@ -1809,7 +1818,8 @@ async def scanner_login_input_handler(client, message):
             await message.reply_text(
                 "🎉 本批上传已结束并发布！\n"
                 f"📁 目录：{result['category']}\n"
-                f"✅ 新增资源：{result['published']} 个\n"
+                f"📥 收到文件：{progress_state.get('received', 0)} 个\n"
+                f"✅ 成功入库：{result['published']} 个\n"
                 f"⚠️ 待补备份：{result['failed_backup']} 个",
                 reply_markup=admin_home_keyboard(),
             )
