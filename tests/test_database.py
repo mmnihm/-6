@@ -116,6 +116,11 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(progress["last_message_id"], 501)
         await self.db.mark_scan_completed(100)
         self.assertEqual((await self.db.get_scan_progress(100))["completed"], 1)
+        scanned_folder = next(
+            row for row in await self.db.list_categories()
+            if row["category"] == "电影"
+        )
+        self.assertEqual(scanned_folder["file_count"], 1)
 
     async def test_primary_only_scan_is_published_without_backup(self):
         created = "2026-10-30T10:00:00+00:00"
