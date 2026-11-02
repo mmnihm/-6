@@ -120,21 +120,23 @@ async def _show_upload_confirmation_after_idle(client, user_id):
         if not batch or not last_message:
             return
         received = int(upload_received_counts.get(uid, 0))
+        prompt_text = (
+            f"📥 已接收文件：{received} 个\n"
+            "⏳ 文件正在后台保存，不会因为显示此提示而中断。\n\n"
+            "请选择下一步："
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ 结束上传", callback_data="mc:uploadfinish"),
+             InlineKeyboardButton("➕ 继续上传", callback_data="mc:uploadcontinue")]
+        ])
         old = upload_confirmation_messages.get(uid)
         if old:
             try:
-                await old.delete()
-            except Exception:
-                pass
-        prompt = await last_message.reply_text(
-            f"📥 已接收文件：{received} 个\n"
-            "⏳ 文件正在后台保存，不会因为显示此提示而中断。\n\n"
-            "请选择下一步：",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ 结束上传", callback_data="mc:uploadfinish"),
-                 InlineKeyboardButton("➕ 继续上传", callback_data="mc:uploadcontinue")]
-            ]),
-        )
+                await old.edit_text(prompt_text, reply_markup=keyboard)
+                return
+            except Exception as exc:
+                log.debug("Could not edit existing upload confirmation for user %s: %s", uid, exc)
+        prompt = await last_message.reply_text(prompt_text, reply_markup=keyboard)
         upload_confirmation_messages[uid] = prompt
     except asyncio.CancelledError:
         return
@@ -150,14 +152,8 @@ def schedule_upload_confirmation(client, user_id, message):
     previous = pending_upload_confirmation_tasks.get(uid)
     if previous and not previous.done():
         previous.cancel()
-    old_prompt = upload_confirmation_messages.pop(uid, None)
-    if old_prompt:
-        async def _remove_old_prompt():
-            try:
-                await old_prompt.delete()
-            except Exception:
-                pass
-        asyncio.create_task(_remove_old_prompt())
+    # Keep the same confirmation message; after the next pause it will be edited
+    # with the cumulative count instead of deleting/reposting another message.
     upload_latest_messages[uid] = message
     pending_upload_confirmation_tasks[uid] = asyncio.create_task(
         _show_upload_confirmation_after_idle(client, uid)
@@ -1215,7 +1211,6 @@ async def upload_handler(client, message):
             selected_category = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
             if selected_category:
                 upload_received_counts[int(user.id)] = upload_received_counts.get(int(user.id), 0) + 1
-                await update_admin_upload_progress(message, user.id, selected_category, increment=1)
                 track_upload_task(user.id, asyncio.create_task(_run_single_upload_task(client, message)))
                 schedule_upload_confirmation(client, user.id, message)
                 return
@@ -1229,7 +1224,6 @@ async def upload_handler(client, message):
         selected_category = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
         if selected_category:
             upload_received_counts[int(user.id)] = upload_received_counts.get(int(user.id), 0) + 1
-            await update_admin_upload_progress(message, user.id, selected_category, increment=1)
     key = (int(user.id), int(message.chat.id), str(group_id))
     pending_album_uploads.setdefault(key, []).append(message)
     scheduled = pending_album_uploads.get((key, "scheduled"))
@@ -3178,7 +3172,6 @@ async def admin_callback_handler(client, query):
     action = query.data.split(":", 1)[1]
     message = query.message
     if action == "uploadcontinue":
-        upload_confirmation_messages.pop(int(user.id), None)
         await message.edit_text(
             f"📥 当前已收到：{upload_received_counts.get(int(user.id), 0)} 个文件。\n"
             "继续发送的文件仍加入当前文件夹和同一批次，不会发布或清空已有计数。",
