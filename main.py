@@ -702,7 +702,7 @@ async def cache_cangku_backup(client, file_key, source_chat_id, source_message_i
 async def send_catalog_file(client, user_id, file_key, return_message_id=False):
     record = await db.get_file(file_key)
     if not record:
-        return False, "文件不存在或已被移除。"
+        return (False, "文件不存在或已被移除。", None) if return_message_id else (False, "文件不存在或已被移除。")
 
     fingerprint = str(record["source_fingerprint"] or "")
     copied_message_id = None
@@ -745,11 +745,11 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
                     ))
         except Exception as exc:
             log.warning("Cangku source delivery failed for %s: %s", file_key, str(exc)[:300])
-            return False, "原频道资源暂时无法取回，请联系管理员检查机器人是否仍有原频道访问权限。"
+            return (False, "原频道资源暂时无法取回，请联系管理员检查机器人是否仍有原频道访问权限。", None) if return_message_id else (False, "原频道资源暂时无法取回，请联系管理员检查机器人是否仍有原频道访问权限。")
     else:
         primary_channel_id, backup_channel_id = await get_storage_channels()
         if not primary_channel_id:
-            return False, "管理员尚未绑定主存储频道。"
+            return (False, "管理员尚未绑定主存储频道。", None) if return_message_id else (False, "管理员尚未绑定主存储频道。")
         try:
             copied = await client.copy_message(
                 chat_id=user_id,
@@ -761,7 +761,7 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
             log.warning("Primary copy failed for %s; trying backup", file_key, exc_info=True)
             backup_message_id = int(record["backup_message_id"] or 0)
             if not backup_channel_id or backup_message_id <= 0:
-                return False, "主存储文件暂时无法取回，而且尚未建立备份副本。"
+                return (False, "主存储文件暂时无法取回，而且尚未建立备份副本。", None) if return_message_id else (False, "主存储文件暂时无法取回，而且尚未建立备份副本。")
             try:
                 copied = await client.copy_message(
                     chat_id=user_id,
@@ -771,7 +771,7 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
                 copied_message_id = copied.id
             except Exception:
                 log.exception("Both storage copies failed for %s", file_key)
-                return False, "文件暂时无法取回，请联系管理员检查存储频道。"
+                return (False, "文件暂时无法取回，请联系管理员检查存储频道。", None) if return_message_id else (False, "文件暂时无法取回，请联系管理员检查存储频道。")
 
     await db.record_history(user_id, file_key)
     if return_message_id:
