@@ -111,7 +111,7 @@ async def _show_upload_confirmation_after_idle(client, user_id):
     current = asyncio.current_task()
     try:
         # Wait for a quiet period so one multi-select send is counted as a whole.
-        await asyncio.sleep(6.0)
+        await asyncio.sleep(1.0)
         while True:
             tasks = list(pending_upload_tasks.get(uid, set()))
             if not tasks:
@@ -193,7 +193,7 @@ async def update_admin_upload_progress(message, user_id, category, increment=1, 
         await get_upload_status_message(
             message, uid,
             f"📂 上传目录：{category}\n📥 已接收 {received} 个文件，后台保存中…\n"
-            "全部发送完毕后点击「✅ 结束上传」。",
+            "发送暂停后会自动显示数量和确认按钮。",
         )
         state["last_shown"] = received
     return received
@@ -1088,7 +1088,7 @@ async def start_handler(client, message):
 
 
 async def _flush_album_upload(client, key):
-    await asyncio.sleep(3.0)
+    await asyncio.sleep(1.2)
     if pending_album_uploads.get((key, "scheduled")) is asyncio.current_task():
         pending_album_uploads.pop((key, "scheduled"), None)
     messages = pending_album_uploads.pop(key, [])
