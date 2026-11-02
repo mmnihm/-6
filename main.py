@@ -186,24 +186,46 @@ async def get_member_group_id():
     return int(value) if value else None
 
 async def telegram_bot_api(method: str, payload: dict, timeout=None):
-    """Call Telegram Bot API directly, avoiding Pyrogram user-peer cache lookups."""
+    """Call Telegram Bot API directly, retrying rate-limited media copies safely."""
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/{method}"
     session = telegram_http_session
     if session is None or session.closed:
         raise RuntimeError("Telegram HTTP session is not initialized")
-    try:
-        async with session.post(url, json=payload, timeout=timeout) as response:
-            data = await response.json(content_type=None)
-    except Exception as exc:
-        # Do not include the request URL: it contains the bot token.
-        raise RuntimeError(
-            f"Telegram {method} network error: {type(exc).__name__}"
-        ) from None
-    if not isinstance(data, dict) or not data.get("ok"):
+
+    # Telegram explicitly tells us when a 429 may be retried. Only retry copy
+    # operations used by file uploads; leave all other API behavior unchanged.
+    retry_copy = method in ("copyMessage", "copyMessages")
+    max_attempts = 6 if retry_copy else 1
+    for attempt in range(max_attempts):
+        try:
+            async with session.post(url, json=payload, timeout=timeout) as response:
+                data = await response.json(content_type=None)
+        except Exception as exc:
+            # Do not include the request URL: it contains the bot token.
+            raise RuntimeError(
+                f"Telegram {method} network error: {type(exc).__name__}"
+            ) from None
+
+        if isinstance(data, dict) and data.get("ok"):
+            return data.get("result")
+
         error_code = data.get("error_code", "unknown") if isinstance(data, dict) else "unknown"
         description = data.get("description", "invalid API response") if isinstance(data, dict) else "invalid API response"
+        if retry_copy and str(error_code) == "429" and attempt < max_attempts - 1:
+            parameters = data.get("parameters") if isinstance(data, dict) else None
+            retry_after = parameters.get("retry_after", 1) if isinstance(parameters, dict) else 1
+            try:
+                delay = max(1, int(retry_after))
+            except (TypeError, ValueError):
+                delay = 1
+            log.warning(
+                "Telegram %s rate limited; retrying in %ss (attempt %s/%s)",
+                method, delay, attempt + 1, max_attempts - 1,
+            )
+            await asyncio.sleep(delay)
+            continue
+
         raise RuntimeError(f"Telegram {method} failed ({error_code}): {description}")
-    return data.get("result")
 
 app = Client(
     "member_cloud_bot",
