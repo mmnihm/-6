@@ -3110,23 +3110,52 @@ async def admin_callback_handler(client, query):
         )
     elif action.startswith("dircontent:"):
         try:
-            index = int(action.split(":", 1)[1])
+            parts = action.split(":")
+            index = int(parts[1])
+            offset = max(0, int(parts[2])) if len(parts) > 2 else 0
             row = (await db.list_categories())[index]
         except (ValueError, IndexError):
             await message.edit_text("⚠️ 目录列表已更新，请重新打开目录管理。", reply_markup=back_keyboard())
             return
-        group_id = await get_member_group_id()
-        files = await db.list_category_files(row["category"], limit=20, offset=0)
-        category_row = dict(row)
-        category_row["category_index"] = index
-        await message.edit_text(
-            folder_detail_text(category_row, files, 0, group_id),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ 返回文件夹统计", callback_data=f"mc:directory:{index}")],
-                [InlineKeyboardButton("📁 文件夹列表", callback_data="mc:directories")],
-            ]),
-            disable_web_page_preview=True,
-        )
+        share_key = str(row["share_key"] or "")
+        if not share_key:
+            await message.reply_text("❌ 该目录暂时没有可用的领取标识。")
+            return
+        delivery_key = (int(user.id), share_key)
+        if delivery_key in category_delivery_in_progress:
+            await message.reply_text("⏳ 这个目录正在发送文件，请稍候。")
+            return
+        category_delivery_in_progress.add(delivery_key)
+        try:
+            total = int(row["file_count"] or 0)
+            saved_offset = await db.get_category_delivery_progress(user.id, share_key)
+            offset = max(offset, saved_offset)
+            batch = await db.list_category_files(row["category"], limit=20, offset=offset)
+            if not batch:
+                await message.reply_text(f"✅「{row['category']}」没有更多文件了。")
+                return
+            progress = await message.reply_text(
+                f"📥 正在发送「{row['category']}」第 {offset // 20 + 1} 组文件（最多20个）…"
+            )
+            sent, failed, next_offset = await send_catalog_batch(
+                client, user.id, share_key, offset, batch
+            )
+            result_text = (
+                f"📦「{row['category']}」本组发送完成\\n\\n"
+                f"成功：{sent} 个\\n失败：{failed} 个\\n"
+                f"已发送进度：{next_offset}/{total}"
+            )
+            buttons = []
+            if next_offset < total:
+                buttons.append([InlineKeyboardButton(
+                    "📥 继续发送下一组（最多20个）",
+                    callback_data=f"mc:dircontent:{index}:{next_offset}",
+                )])
+            buttons.append([InlineKeyboardButton("📁 返回文件夹统计", callback_data=f"mc:directory:{index}")])
+            buttons.append([InlineKeyboardButton("📋 文件夹列表", callback_data="mc:directories")])
+            await progress.edit_text(result_text, reply_markup=InlineKeyboardMarkup(buttons))
+        finally:
+            category_delivery_in_progress.discard(delivery_key)
     elif action.startswith("dirrename:"):
         try:
             index = int(action.split(":", 1)[1])
