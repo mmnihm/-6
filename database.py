@@ -436,11 +436,15 @@ class Database:
                 "SELECT value FROM settings WHERE key='category_size_stats_v1'"
             )).fetchone()
             if not size_stats_migration:
-                existing_categories = await (await db.execute(
-                    "SELECT name FROM categories"
-                )).fetchall()
-                for item in existing_categories:
-                    await self._refresh_category_stats(db, str(item["name"]), create=False)
+                # The initial category_stats_v1 migration above already refreshed
+                # every category when it ran; only older installations need this
+                # one-time backfill for the newly added size columns.
+                if stats_migration:
+                    existing_categories = await (await db.execute(
+                        "SELECT name FROM categories"
+                    )).fetchall()
+                    for item in existing_categories:
+                        await self._refresh_category_stats(db, str(item["name"]), create=False)
                 await db.execute(
                     "INSERT INTO settings(key, value) VALUES('category_size_stats_v1', 'completed')"
                 )
