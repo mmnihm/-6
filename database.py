@@ -682,7 +682,6 @@ class Database:
                 ))
                 if cur.rowcount == 1:
                     published += 1
-                    await self._refresh_category_stats(db, item["category"])
                     if item["backup_error"]:
                         failed_backup += 1
                         now = iso_now()
@@ -698,6 +697,11 @@ class Database:
                             item["primary_message_id"], item["backup_channel_id"],
                             now, item["backup_error"], now, now,
                         ))
+            # Refresh the category summary once for the whole published batch,
+            # not once per file. This keeps large uploads from repeatedly scanning
+            # the same category rows inside one transaction.
+            if published:
+                await self._refresh_category_stats(db, category)
             await db.execute("DELETE FROM upload_batch_items WHERE owner_id=?", (int(owner_id),))
             await db.execute("DELETE FROM upload_batches WHERE owner_id=?", (int(owner_id),))
             await db.commit()
