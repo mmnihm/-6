@@ -109,6 +109,11 @@ async def _run_single_upload_task(client, message):
         await _upload_single_handler(client, message)
 
 
+async def _run_album_upload_task(client, key):
+    async with upload_copy_semaphore:
+        await _flush_album_upload(client, key)
+
+
 async def update_admin_upload_progress(message, user_id, category, increment=1, force=False):
     """Maintain one compact live counter instead of sending per-file/per-album notices."""
     uid = int(user_id)
@@ -1014,15 +1019,17 @@ async def _flush_album_upload(client, key):
         selected_for_status = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
     else:
         selected_for_status = None
-    # Admin progress is reported by the single shared counter message.
-    # Non-admin upload feedback remains unchanged.
-    status = None if is_admin_batch else await messages[0].reply_text(f"⏳ 收到一组媒体（{len(messages)} 个），正在整组保存…")
+    # Admin batch uploads stay completely silent; other uploads retain feedback.
     is_admin_batch = bool(selected_for_status)
+    status = None if is_admin_batch else await messages[0].reply_text(f"⏳ 收到一组媒体（{len(messages)} 个），正在整组保存…")
 
     try:
         primary_channel_id, backup_channel_id = await get_storage_channels()
         if not primary_channel_id or not backup_channel_id or primary_channel_id == backup_channel_id:
-            await status.edit_text("⚠️ 请管理员先正确绑定主、备份存储频道。")
+            if status is not None:
+                await status.edit_text("⚠️ 请管理员先正确绑定主、备份存储频道。")
+            else:
+                log.error("Upload batch has invalid primary/backup channel binding for user %s", user.id)
             return
         active_batch = await db.get_upload_batch(user.id) if await is_admin(user.id) else None
         selected_category = (
@@ -1140,7 +1147,7 @@ async def upload_handler(client, message):
     scheduled = pending_album_uploads.get((key, "scheduled"))
     if scheduled and not scheduled.done():
         scheduled.cancel()
-    task = asyncio.create_task(_flush_album_upload(client, key))
+    task = asyncio.create_task(_run_album_upload_task(client, key))
     pending_album_uploads[(key, "scheduled")] = task
     track_upload_task(user.id, task)
 
@@ -1457,10 +1464,16 @@ async def _upload_single_handler(client, message):
 
     primary_channel_id, backup_channel_id = await get_storage_channels()
     if not primary_channel_id or not backup_channel_id:
-        await message.reply_text("⚠️ 网盘尚未完成双频道绑定，请管理员先使用 /bindmain 和 /bindbackup。")
+        if is_admin_batch:
+            log.error("Upload batch missing primary/backup channel binding for user %s", user.id)
+        else:
+            await message.reply_text("⚠️ 网盘尚未完成双频道绑定，请管理员先使用 /bindmain 和 /bindbackup。")
         return
     if primary_channel_id == backup_channel_id:
-        await message.reply_text("❌ 主存储频道和备份频道不能是同一个频道，请管理员检查 /storage。")
+        if is_admin_batch:
+            log.error("Upload batch primary and backup channels are identical for user %s", user.id)
+        else:
+            await message.reply_text("❌ 主存储频道和备份频道不能是同一个频道，请管理员检查 /storage。")
         return
 
     category = str(selected_category or parse_category(message))[:120]
