@@ -42,7 +42,8 @@ pending_category_actions = {}
 pending_upload_categories = {}
 upload_status_messages = {}
 pending_album_uploads = {}
-pending_album_upload_tasks = {}
+pending_upload_tasks = {}
+upload_copy_semaphore = asyncio.Semaphore(4)
 upload_progress_state = {}
 pending_home_button_actions = {}
 pending_admin_actions = {}
@@ -85,6 +86,27 @@ async def get_upload_status_message(message, user_id, text):
         except Exception as exc:
             log.debug("Could not update upload progress message: %s", exc)
     return status
+
+
+def track_upload_task(user_id, task):
+    uid = int(user_id)
+    tasks = pending_upload_tasks.setdefault(uid, set())
+    tasks.add(task)
+    def _finished(completed):
+        tasks.discard(completed)
+        try:
+            error = completed.exception()
+        except asyncio.CancelledError:
+            return
+        if error:
+            log.error("Background upload task failed for user %s: %s", uid, error, exc_info=(type(error), error, error.__traceback__))
+    task.add_done_callback(_finished)
+    return task
+
+
+async def _run_single_upload_task(client, message):
+    async with upload_copy_semaphore:
+        await _upload_single_handler(client, message)
 
 
 async def update_admin_upload_progress(message, user_id, category, increment=1, force=False):
@@ -994,15 +1016,9 @@ async def _flush_album_upload(client, key):
         selected_for_status = None
     # Admin progress is reported by the single shared counter message.
     # Non-admin upload feedback remains unchanged.
-    status = (
-        upload_status_messages.get(int(user.id))
-        if selected_for_status else
-        await messages[0].reply_text(f"⏳ 收到一组媒体（{len(messages)} 个），正在整组保存…")
-    )
-    if selected_for_status:
-        await update_admin_upload_progress(
-            messages[0], user.id, selected_for_status, increment=0, force=True
-        )
+    status = None if is_admin_batch else await messages[0].reply_text(f"⏳ 收到一组媒体（{len(messages)} 个），正在整组保存…")
+    is_admin_batch = bool(selected_for_status)
+
     try:
         primary_channel_id, backup_channel_id = await get_storage_channels()
         if not primary_channel_id or not backup_channel_id or primary_channel_id == backup_channel_id:
@@ -1058,7 +1074,9 @@ async def _flush_album_upload(client, key):
             media_type, file_name, fingerprint = media_details(message)
             if not media_type:
                 continue
-            if fingerprint and await db.get_file_by_fingerprint(fingerprint):
+            if is_admin_batch:
+                fingerprint = f"upload:{messages[position].chat.id}:{messages[position].id}"
+            elif fingerprint and await db.get_file_by_fingerprint(fingerprint):
                 continue
             media_object = getattr(message, media_type, None)
             size = int(getattr(media_object, "file_size", 0) or 0)
@@ -1086,7 +1104,7 @@ async def _flush_album_upload(client, key):
                     )
         if not (await is_admin(user.id) and selected_category):
             category_catalog_cache["expires_at"] = 0
-        if not (await is_admin(user.id) and selected_category) and status is not None:
+        if not is_admin_batch and status is not None:
             await status.edit_text(
                 f"✅ 相册整组保存完成\n📂 目录：{category}\n"
                 f"🗂 相册：1 组\n📦 文件：{saved} 个\n"
@@ -1095,12 +1113,23 @@ async def _flush_album_upload(client, key):
                 + ("\n⚠️ 备份失败，已加入自动重试。" if backup_error else "")
             )
     except Exception as exc:
-        log.exception("Grouped album upload failed")
-        await status.edit_text(f"❌ 相册整组保存失败：{type(exc).__name__}: {str(exc)[:300]}")
+        log.exception("Grouped album upload failed for user %s", user.id)
+        if status is not None:
+            try:
+                await status.edit_text(f"❌ 相册整组保存失败：{type(exc).__name__}: {str(exc)[:300]}")
+            except Exception:
+                log.exception("Could not report album upload failure")
         
 async def upload_handler(client, message):
     group_id = getattr(message, "media_group_id", None)
     if not group_id:
+        user = message.from_user
+        if user and await is_admin(user.id):
+            active_batch = await db.get_upload_batch(user.id)
+            selected_category = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
+            if selected_category:
+                track_upload_task(user.id, asyncio.create_task(_run_single_upload_task(client, message)))
+                return
         await _upload_single_handler(client, message)
         return
     user = message.from_user
@@ -1108,22 +1137,12 @@ async def upload_handler(client, message):
         return
     key = (int(user.id), int(message.chat.id), str(group_id))
     pending_album_uploads.setdefault(key, []).append(message)
-    if await is_admin(user.id):
-        active_batch = await db.get_upload_batch(user.id)
-        selected_category = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
-        if selected_category:
-            await update_admin_upload_progress(message, user.id, selected_category, increment=1)
     scheduled = pending_album_uploads.get((key, "scheduled"))
     if scheduled and not scheduled.done():
         scheduled.cancel()
     task = asyncio.create_task(_flush_album_upload(client, key))
     pending_album_uploads[(key, "scheduled")] = task
-    tasks = pending_album_upload_tasks.setdefault(int(user.id), set())
-    tasks.add(task)
-    task.add_done_callback(
-        lambda completed, uid=int(user.id):
-            pending_album_upload_tasks.get(uid, set()).discard(completed)
-    )
+    track_upload_task(user.id, task)
 
 
 @app.on_message(
@@ -1421,11 +1440,19 @@ async def _upload_single_handler(client, message):
     if not media_type:
         return
 
-    if source_fingerprint and await db.get_file_by_fingerprint(source_fingerprint):
-        log.info(
-            "Silently skipped duplicate upload: user=%s file=%s",
-            user.id, file_name,
-        )
+    active_batch = await db.get_upload_batch(user.id) if await is_admin(user.id) else None
+    selected_category = (
+        active_batch["category"] if active_batch
+        else pending_upload_categories.get(user.id) if await is_admin(user.id)
+        else None
+    )
+    is_admin_batch = bool(await is_admin(user.id) and selected_category)
+    if is_admin_batch:
+        # Each Telegram message is a separate upload, even if its media bytes
+        # match another message sent earlier in the same batch.
+        source_fingerprint = f"upload:{message.chat.id}:{message.id}"
+    elif source_fingerprint and await db.get_file_by_fingerprint(source_fingerprint):
+        log.info("Silently skipped duplicate upload: user=%s file=%s", user.id, file_name)
         return
 
     primary_channel_id, backup_channel_id = await get_storage_channels()
@@ -1436,24 +1463,12 @@ async def _upload_single_handler(client, message):
         await message.reply_text("❌ 主存储频道和备份频道不能是同一个频道，请管理员检查 /storage。")
         return
 
-    active_batch = await db.get_upload_batch(user.id) if await is_admin(user.id) else None
-    selected_category = (
-        active_batch["category"] if active_batch
-        else pending_upload_categories.get(user.id) if await is_admin(user.id)
-        else None
-    )
     category = str(selected_category or parse_category(message))[:120]
     if await is_admin(user.id) and selected_category:
         if not active_batch:
             await db.start_upload_batch(user.id, category)
     is_admin_batch = bool(await is_admin(user.id) and selected_category)
-    status = (
-        upload_status_messages.get(int(user.id))
-        if is_admin_batch else
-        await message.reply_text("⏳ 正在检查频道权限并保存文件…")
-    )
-    if is_admin_batch and not getattr(message, "media_group_id", None):
-        await update_admin_upload_progress(message, user.id, category, increment=1)
+    status = None if is_admin_batch else await message.reply_text("⏳ 正在检查频道权限并保存文件…")
     primary_id = None
     backup_id = 0
     step = "检查主频道权限"
@@ -1523,10 +1538,11 @@ async def _upload_single_handler(client, message):
                 "Silently skipped concurrent duplicate upload: user=%s file=%s",
                 user.id, file_name,
             )
-            try:
-                await status.delete()
-            except Exception:
-                log.debug("Could not delete duplicate-upload status message")
+            if status is not None:
+                try:
+                    await status.delete()
+                except Exception:
+                    log.debug("Could not delete duplicate-upload status message")
             return
 
         if is_admin_batch:
@@ -1557,12 +1573,16 @@ async def _upload_single_handler(client, message):
         log.exception("Upload/store failed at step: %s", step)
         # Never delete a successfully stored channel copy on a later-stage error.
         detail = f"{type(exc).__name__}: {str(exc)[:350]}"
-        await status.edit_text(
-            f"❌ 文件保存失败（步骤：{step}）\n{detail}\n\n"
-            + (f"主频道消息已保存，消息 ID：{primary_id}。请管理员检查数据库/分享链接步骤；未删除该副本。"
-               if primary_id is not None else
-               "主频道尚未确认保存成功。请管理员检查频道管理员身份、发布消息权限及 Telegram 网络。")
-        )
+        if status is not None:
+            try:
+                await status.edit_text(
+                    f"❌ 文件保存失败（步骤：{step}）\n{detail}\n\n"
+                    + (f"主频道消息已保存，消息 ID：{primary_id}。请管理员检查数据库/分享链接步骤；未删除该副本。"
+                       if primary_id is not None else
+                       "主频道尚未确认保存成功。请管理员检查频道管理员身份、发布消息权限及 Telegram 网络。")
+                )
+            except Exception:
+                log.exception("Could not report single-file upload failure")
 
 
 @app.on_message(filters.private & filters.forwarded & pending_binding_filter)
@@ -1805,48 +1825,29 @@ async def scanner_login_input_handler(client, message):
         return
 
     if value == "✅ 结束上传":
-        # Finish all queued/in-flight album groups before publishing the batch.
-        # This prevents the user tapping the button while the final albums are
-        # still waiting for Telegram's remaining grouped messages or channel copies.
+        # Wait for both single-file and album jobs. Album jobs are registered
+        # before their quiet-period timer starts, so the final album is included.
         while True:
-            album_tasks = list(pending_album_upload_tasks.get(int(user.id), set()))
-            if not album_tasks:
-                await asyncio.sleep(0)
-                album_tasks = list(pending_album_upload_tasks.get(int(user.id), set()))
-                if not album_tasks:
+            upload_tasks = list(pending_upload_tasks.get(int(user.id), set()))
+            if not upload_tasks:
+                await asyncio.sleep(0.2)
+                upload_tasks = list(pending_upload_tasks.get(int(user.id), set()))
+                if not upload_tasks:
                     break
-            await asyncio.gather(*album_tasks, return_exceptions=True)
+            await asyncio.gather(*upload_tasks, return_exceptions=True)
         result = await db.publish_upload_batch(user.id)
-        progress_state = upload_progress_state.pop(int(user.id), {"received": 0})
+        upload_progress_state.pop(int(user.id), None)
         pending_upload_categories.pop(user.id, None)
         category_catalog_cache["expires_at"] = 0
-        progress_message = upload_status_messages.pop(int(user.id), None)
-        if result.get("category") is not None and progress_message is not None:
-            try:
-                await progress_message.edit_text(
-                    "🎉 本批上传已结束并发布！\n"
-                    f"📁 目录：{result['category']}\n"
-                    f"📥 收到文件：{progress_state.get('received', 0)} 个\n"
-                    f"✅ 成功入库：{result['published']} 个\n"
-                    f"⚠️ 待补备份：{result['failed_backup']} 个"
-                )
-            except Exception:
-                log.exception("Could not finalize upload progress message")
+        upload_status_messages.pop(int(user.id), None)
         if result.get("category") is None:
             await message.reply_text("目前没有待发布的上传批次。", reply_markup=admin_home_keyboard())
-        elif progress_message is None:
+        else:
+            # Exactly one completion notice; no progress messages are created or deleted.
             await message.reply_text(
-                "🎉 本批上传已结束并发布！\n"
-                f"📁 目录：{result['category']}\n"
-                f"📥 收到文件：{progress_state.get('received', 0)} 个\n"
-                f"✅ 成功入库：{result['published']} 个\n"
-                f"⚠️ 待补备份：{result['failed_backup']} 个",
+                f"✅ 成功入库：{result['published']} 个文件",
                 reply_markup=admin_home_keyboard(),
             )
-        else:
-            # The existing live progress message is the only completion notice.
-            # Keep the upload keyboard available for the next operation.
-            pass
         return
     if value == "📁 创建文件夹":
         pending_category_actions[user.id] = {"action": "create"}
