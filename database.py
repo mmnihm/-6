@@ -264,6 +264,10 @@ class Database:
                 accessed_at TEXT NOT NULL,
                 PRIMARY KEY(user_id, file_key)
             );
+            CREATE TABLE IF NOT EXISTS notification_subscriptions (
+                user_id BIGINT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS favorites (
                 user_id BIGINT NOT NULL,
                 file_key TEXT NOT NULL,
@@ -1106,6 +1110,31 @@ class Database:
                     await self._refresh_category_stats(db, current["category"], create=False)
             await db.commit()
             return cur.rowcount > 0
+
+    async def toggle_notification_subscription(self, user_id):
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT 1 FROM notification_subscriptions WHERE user_id=?",
+                (int(user_id),),
+            )).fetchone()
+            if row:
+                await db.execute("DELETE FROM notification_subscriptions WHERE user_id=?", (int(user_id),))
+                enabled = False
+            else:
+                await db.execute(
+                    "INSERT INTO notification_subscriptions(user_id, created_at) VALUES(?, ?) ON CONFLICT(user_id) DO NOTHING",
+                    (int(user_id), iso_now()),
+                )
+                enabled = True
+            await db.commit()
+            return enabled
+
+    async def list_notification_subscribers(self):
+        async with self.connect() as db:
+            rows = await (await db.execute(
+                "SELECT user_id FROM notification_subscriptions ORDER BY created_at"
+            )).fetchall()
+            return [int(row["user_id"]) for row in rows]
 
     async def list_user_ids(self):
         async with self.connect() as db:
