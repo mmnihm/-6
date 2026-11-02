@@ -134,11 +134,13 @@ async def _show_upload_confirmation_after_idle(client, user_id):
         ])
         old = upload_confirmation_messages.get(uid)
         if old:
+            # Editing an existing Telegram message does not change its position.
+            # Remove it first, then reply to the newest uploaded file so the
+            # single confirmation card always stays at the bottom of the chat.
             try:
-                await old.edit_text(prompt_text, reply_markup=keyboard)
-                return
+                await old.delete()
             except Exception as exc:
-                log.debug("Could not edit existing upload confirmation for user %s: %s", uid, exc)
+                log.debug("Could not delete previous upload confirmation for user %s: %s", uid, exc)
         prompt = await last_message.reply_text(prompt_text, reply_markup=keyboard)
         upload_confirmation_messages[uid] = prompt
     except asyncio.CancelledError:
