@@ -1543,6 +1543,46 @@ class Database:
                 LIMIT ? OFFSET ?
             """, (category, limit, offset))).fetchall()
 
+    async def complete_album_groups(self, rows):
+        """Expand any selected Telegram albums to their complete stored groups."""
+        selected = list(rows or [])
+        album_ids = list(dict.fromkeys(
+            str(row["album_group_id"])
+            for row in selected
+            if row["album_group_id"]
+        ))
+        if not album_ids:
+            return selected
+
+        placeholders = ",".join("?" for _ in album_ids)
+        async with self.connect() as db:
+            album_rows = await (await db.execute(f"""
+                SELECT file_key, file_name, media_type, category,
+                       album_group_id, album_position,
+                       (SELECT COUNT(*) FROM files grouped
+                        WHERE grouped.album_group_id=files.album_group_id) AS album_size
+                FROM files
+                WHERE album_group_id IN ({placeholders})
+                ORDER BY album_group_id, album_position
+            """, album_ids)).fetchall()
+
+        complete = {}
+        for row in album_rows:
+            complete.setdefault(str(row["album_group_id"]), []).append(row)
+
+        result = []
+        emitted = set()
+        for row in selected:
+            album_id = row["album_group_id"]
+            if album_id:
+                key = str(album_id)
+                if key not in emitted:
+                    result.extend(complete.get(key, [row]))
+                    emitted.add(key)
+            else:
+                result.append(row)
+        return result
+
     async def record_history(self, user_id, file_key):
         async with self.connect() as db:
             await db.execute("""
