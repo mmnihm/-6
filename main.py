@@ -2664,7 +2664,7 @@ async def user_catalog_callback_handler(client, query):
                 "text": f"{index + 1}. 📁 {row['category']}（{int(row['file_count'] or 0)}）",
                 "copy_text": {"text": str(row["category"])},
             }]
-            for row in selected
+            for index, row in enumerate(selected)
         ]
         for chunk_start in range(0, len(selected), 5):
             copy_rows.append([{
@@ -2722,7 +2722,7 @@ async def user_catalog_callback_handler(client, query):
         await message.edit_text(
             "\n".join(body),
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📂 查看内容", callback_data=f"uc:folder:{index}:0")],
+                [InlineKeyboardButton("📂 查看内容（直接发送文件）", callback_data=f"uc:getfolder:{category_row['share_key']}:0")],
                 [InlineKeyboardButton("📁 文件夹列表", callback_data=f"uc:folders:{page}")],
             ]),
         )
@@ -2985,7 +2985,7 @@ async def admin_callback_handler(client, query):
         rows = [[InlineKeyboardButton("➕ 新建目录", callback_data="mc:dirnew")]]
         for index, row in enumerate(selected, start_at):
             rows.append([InlineKeyboardButton(
-                f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
+                f"{index - start_at + 1}. 📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
                 callback_data=f"mc:directory:{index}",
             )])
         for chunk_start in range(0, len(selected), 5):
@@ -3009,9 +3009,9 @@ async def admin_callback_handler(client, query):
             "点击文件夹名称可复制名称；点击下方数字查看统计和管理。"
         )
         copy_rows = [[{"text": "➕ 新建目录", "callback_data": "mc:dirnew"}]]
-        for row in selected:
+        for index, row in enumerate(selected):
             copy_rows.append([{
-                "text": f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
+                "text": f"{index + 1}. 📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
                 "copy_text": {"text": str(row["category"])},
             }])
         for chunk_start in range(0, len(selected), 5):
