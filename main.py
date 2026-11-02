@@ -2832,6 +2832,7 @@ async def user_catalog_callback_handler(client, query):
                 )
                 rows.extend(extra)
 
+            rows = await db.complete_album_groups(rows)
             if not rows:
                 await message.reply_text("📭 暂时没有找到可发送的资源，请稍后重试。")
                 return
@@ -3181,6 +3182,7 @@ async def user_catalog_callback_handler(client, query):
             batch = await db.list_category_files(
                 category["name"], limit=min(20, remaining), offset=offset
             )
+            batch = await db.complete_album_groups(batch)
             if not batch:
                 await message.reply_text("📭 这个目录的资源已经领取完毕。")
                 return
@@ -3605,6 +3607,7 @@ async def admin_callback_handler(client, query):
             total = await db.count_category_files(row["category"])
             offset = min(offset, total)
             batch = await db.list_category_files(row["category"], limit=20, offset=offset)
+            batch = await db.complete_album_groups(batch)
             if not batch:
                 await message.reply_text(
                     f"📁「{row['category']}」当前实际资源：{total} 个。\n"
