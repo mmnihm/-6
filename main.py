@@ -2010,6 +2010,7 @@ async def scanner_login_input_handler(client, message):
                 )
             else:
                 pending_upload_categories[user.id] = new_category
+                upload_received_counts[int(user.id)] = 0
                 await message.reply_text(
                     f"✅ 已创建目录：{new_category}\n"
                     "📤 已自动选中这个目录，现在可以直接发送图片、视频或文件。\n\n"
@@ -3246,6 +3247,8 @@ async def admin_callback_handler(client, query):
             )
             return
         pending_upload_categories[user.id] = str(row["category"])
+        if not active_batch:
+            upload_received_counts[int(user.id)] = 0
         await message.edit_text(
             f"📤 已选择上传目录：{row['category']}\n\n"
             "现在直接向机器人发送图片、视频、音频或文件，都会保存到这个目录。\n"
