@@ -2968,17 +2968,14 @@ async def user_catalog_callback_handler(client, query):
                 [InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")],
                 [InlineKeyboardButton("🏠 返回主菜单", callback_data="uc:home")],
             ])
-            # Reply directly to the final delivered media so the completion
-            # notice appears immediately beneath the last file in Telegram.
-            if last_sent_message_id is not None:
-                await client.send_message(
-                    user.id,
-                    text_result,
-                    reply_to_message_id=last_sent_message_id,
-                    reply_markup=buttons,
-                )
-            else:
-                await message.reply_text(text_result, reply_markup=buttons)
+            # Send a standalone message only after the entire media batch has
+            # finished. Do not reply to an earlier message: Telegram clients may
+            # visually anchor/reposition reply previews away from the bottom.
+            await client.send_message(
+                user.id,
+                text_result,
+                reply_markup=buttons,
+            )
             return
         finally:
             category_delivery_in_progress.discard(delivery_key)
