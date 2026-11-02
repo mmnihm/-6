@@ -2931,7 +2931,9 @@ async def user_catalog_callback_handler(client, query):
             # Use the live file-row count for delivery decisions; the folder card
             # uses cached summary counters and must not hide newly added files.
             total = await db.count_category_files(category["name"])
-            saved_offset = await db.get_category_delivery_progress(user.id, share_key)
+            # Keep member delivery progress separate from legacy admin-send progress.
+            member_progress_key = f"member:{share_key}"
+            saved_offset = await db.get_category_delivery_progress(user.id, member_progress_key)
             # A stale button must never make a user receive already-delivered batches again.
             offset = max(offset, saved_offset)
             remaining = max(0, total - offset)
@@ -2945,7 +2947,7 @@ async def user_catalog_callback_handler(client, query):
             last_sent_message_id = None
             try:
                 sent, failed, next_offset, last_sent_message_id = await send_catalog_batch(
-                    client, user.id, share_key, offset, batch
+                    client, user.id, member_progress_key, offset, batch
                 )
                 text_result = (
                     f"📦 目录资源发送完成！\n\n"
