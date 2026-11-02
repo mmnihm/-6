@@ -3182,7 +3182,6 @@ async def admin_callback_handler(client, query):
     if action == "uploadfinish":
         uid = int(user.id)
         if uid in upload_finish_in_progress:
-            await query.answer("正在结束上传，请稍候。", show_alert=False)
             return
 
         upload_finish_in_progress.add(uid)
