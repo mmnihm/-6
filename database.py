@@ -1432,7 +1432,8 @@ class Database:
     async def get_category_by_share_key(self, share_key):
         async with self.connect() as db:
             return await (await db.execute(
-                "SELECT name, description, created_at, updated_at, share_key "
+                "SELECT name, description, created_at, updated_at, share_key, "
+                "COALESCE(file_count, 0) AS file_count "
                 "FROM categories WHERE share_key=?", (share_key,)
             )).fetchone()
 
