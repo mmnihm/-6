@@ -3195,7 +3195,7 @@ async def admin_callback_handler(client, query):
             # retries (FloodWait can legitimately take tens of seconds).
             try:
                 await message.edit_text(
-                    f"⏳ 正在结束上传……\\n📥 已接收：{upload_received_counts.get(uid, 0)} 个文件\\n"
+                    f"⏳ 正在结束上传……\n📥 已接收：{upload_received_counts.get(uid, 0)} 个文件\n"
                     "正在等待后台保存任务完成，请不要重复点击。"
                 )
             except Exception as exc:
@@ -3218,7 +3218,7 @@ async def admin_callback_handler(client, query):
                 log.exception("Could not publish upload batch for user %s", uid)
                 try:
                     await message.edit_text(
-                        "❌ 上传文件已完成后台保存，但发布入库失败。\\n"
+                        "❌ 上传文件已完成后台保存，但发布入库失败。\n"
                         "本次批次和接收数量已保留，请检查数据库/部署日志后重试。"
                     )
                 except Exception as edit_exc:
@@ -3238,9 +3238,9 @@ async def admin_callback_handler(client, query):
             else:
                 published = int(result.get("published", 0))
                 completion_text = (
-                    f"✅ 本次上传完成\\n📥 收到文件：{received_count} 个\\n"
+                    f"✅ 本次上传完成\n📥 收到文件：{received_count} 个\n"
                     f"📦 成功入库：{published} 个文件"
-                    + (f"\\n⚠️ 未成功入库：{max(0, received_count - published)} 个，请检查部署日志。" if received_count > published else "")
+                    + (f"\n⚠️ 未成功入库：{max(0, received_count - published)} 个，请检查部署日志。" if received_count > published else "")
                 )
             try:
                 await message.edit_text(completion_text, reply_markup=None)
