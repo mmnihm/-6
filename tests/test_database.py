@@ -271,6 +271,33 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["animations"], 1)
         self.assertEqual(stats["audios"], 1)
 
+    async def test_bulk_folder_stats_refresh_after_import(self):
+        await self.db.add_file(
+            "batch-import-1", 101, "one.mp4", "video", 11, 22,
+            "批量导入", source_fingerprint="batch-fingerprint-1",
+            file_size=100, refresh_stats=False
+        )
+        await self.db.add_file(
+            "batch-import-2", 101, "two.mp4", "video", 12, 23,
+            "批量导入", source_fingerprint="batch-fingerprint-2",
+            file_size=200, refresh_stats=False
+        )
+        before = next(
+            row for row in await self.db.list_categories()
+            if row["category"] == "批量导入"
+        )
+        self.assertEqual(before["file_count"], 0)
+
+        await self.db.refresh_category_stats({"批量导入"})
+        after = next(
+            row for row in await self.db.list_categories()
+            if row["category"] == "批量导入"
+        )
+        self.assertEqual(after["file_count"], 2)
+        self.assertEqual(after["video_count"], 2)
+        stats = await self.db.get_category_storage_stats("批量导入")
+        self.assertEqual(stats["video_size"], 300)
+
     async def test_folder_size_stats_are_cached_and_refreshed_on_insert(self):
         await self.db.add_file(
             "cached-video", 101, "movie.mp4", "video", 11, 22,
