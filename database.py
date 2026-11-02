@@ -826,7 +826,14 @@ class Database:
                           AND backup_message_id=0
                     """, (backup_id, fingerprint, primary_id))
             if inserted and primary:
-                await self._refresh_category_stats(db, primary["category"])
+                category_name = str(primary["category"] or "").strip()
+                if category_name:
+                    await db.execute(
+                        "INSERT INTO categories(name, created_at, description, updated_at, share_key) "
+                        "VALUES(?, ?, '', ?, ?) ON CONFLICT(name) DO NOTHING",
+                        (category_name, iso_now(), iso_now(),
+                         secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
+                    )
             await db.commit()
             return bool(other), inserted
 
@@ -898,6 +905,16 @@ class Database:
                 ON CONFLICT(channel_id) DO UPDATE SET
                     completed=1, updated_at=excluded.updated_at
             """, (channel_id, iso_now()))
+            # Aggregate each affected folder once after the history scan instead
+            # of rescanning its files after every single Telegram message.
+            changed_categories = await (await db.execute("""
+                SELECT DISTINCT f.category
+                FROM files f
+                JOIN scanner_messages s ON s.fingerprint=f.source_fingerprint
+                WHERE s.channel_id=? AND f.category IS NOT NULL AND f.category<>''
+            """, (int(channel_id),))).fetchall()
+            for item in changed_categories:
+                await self._refresh_category_stats(db, str(item["category"]))
             await db.commit()
 
     async def get_category_delivery_progress(self, user_id: int, share_key: str) -> int:
