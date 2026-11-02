@@ -3274,13 +3274,19 @@ async def admin_callback_handler(client, query):
                         "📥 继续发送下一组（最多20个）",
                         callback_data=f"mc:dircontent:{index}:{next_offset}",
                     )])
-                buttons.append([InlineKeyboardButton("📁 返回文件夹统计", callback_data=f"mc:directory:{index}")])
-                buttons.append([InlineKeyboardButton("📋 文件夹列表", callback_data="mc:directories")])
+                # Remove the temporary status message, then send the completion
+                # summary as a brand-new message after all media have been sent.
+                buttons.append([InlineKeyboardButton("📁 返回目录", callback_data="mc:directories")])
+                buttons.append([InlineKeyboardButton("🏠 返回主页", callback_data="mc:home")])
                 try:
-                    await progress.edit_text(result_text, reply_markup=InlineKeyboardMarkup(buttons))
+                    await progress.delete()
                 except Exception:
-                    log.exception("Could not edit admin delivery result; sending a new message")
-                    await message.reply_text(result_text, reply_markup=InlineKeyboardMarkup(buttons))
+                    log.warning("Could not delete admin delivery progress message")
+                await client.send_message(
+                    user.id,
+                    result_text,
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
             except Exception as exc:
                 log.exception(
                     "Admin directory delivery failed: user=%s category=%s offset=%s",
