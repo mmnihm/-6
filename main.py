@@ -127,8 +127,8 @@ async def _show_upload_confirmation_after_idle(client, user_id):
             except Exception:
                 pass
         prompt = await last_message.reply_text(
-            f"📥 已接收文件：{received} 个\\n"
-            "⏳ 文件正在后台保存，不会因为显示此提示而中断。\\n\\n"
+            f"📥 已接收文件：{received} 个\n"
+            "⏳ 文件正在后台保存，不会因为显示此提示而中断。\n\n"
             "请选择下一步：",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ 结束上传", callback_data="mc:uploadfinish"),
