@@ -1385,6 +1385,15 @@ class Database:
                 "FROM categories WHERE share_key=?", (share_key,)
             )).fetchone()
 
+    async def count_category_files(self, category):
+        """Return the live number of stored file rows in one category."""
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT COUNT(*) AS file_count FROM files WHERE category=?",
+                (str(category),),
+            )).fetchone()
+            return int(row["file_count"] or 0) if row else 0
+
     async def list_category_files(self, category, limit=8, offset=0):
         async with self.connect() as db:
             return await (await db.execute("""
