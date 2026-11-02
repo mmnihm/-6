@@ -507,70 +507,62 @@ def guess_category(message, media_type, file_name):
     }.get(media_type, "其他")
 
 
-async def run_history_scan(primary_channel_id, backup_channel_id):
+async def run_history_scan(primary_channel_id, backup_channel_id=None):
+    """Index the primary storage channel only. Backup channel is not scanned."""
     global scan_task
     try:
-        # Backfill files already scanned by the older dual-match-only version.
-        backfilled = await db.publish_primary_catalog(primary_channel_id, config.ADMIN_ID)
-        if backfilled:
-            log.info("Published %s existing primary-channel files to catalog", backfilled)
-
-        for channel_id, other_channel_id in (
-            (primary_channel_id, backup_channel_id),
-            (backup_channel_id, primary_channel_id),
-        ):
-            progress = await db.get_scan_progress(channel_id)
-            if progress["completed"]:
-                continue
-            offset_id = progress["last_message_id"]
-            chat = await resolve_scanner_chat(channel_id)
+        progress = await db.get_scan_progress(primary_channel_id)
+        if not progress["completed"]:
+            chat = await resolve_scanner_chat(primary_channel_id)
             resolved_channel_id = int(chat.id)
+            offset_id = int(progress["last_message_id"] or 0)
             log.info(
-                "History scan started for channel %s (%s) from offset %s",
+                "Primary history scan started: channel=%s title=%s offset=%s",
                 resolved_channel_id, getattr(chat, "title", ""), offset_id
             )
-            async for item in scanner.get_chat_history(resolved_channel_id, offset_id=offset_id):
+            async for item in scanner.get_chat_history(
+                resolved_channel_id, offset_id=offset_id
+            ):
                 media_type, file_name, fingerprint = media_details(item)
                 created_at = (
-                    item.date.isoformat() if getattr(item, "date", None) else
-                    datetime.now(timezone.utc).isoformat()
+                    item.date.isoformat() if getattr(item, "date", None)
+                    else datetime.now(timezone.utc).isoformat()
                 )
                 if media_type and fingerprint:
                     category = guess_category(item, media_type, file_name)
                     await db.save_scanned_message(
-                        channel_id, other_channel_id, primary_channel_id,
+                        primary_channel_id, None, primary_channel_id,
                         item.id, fingerprint, file_name, media_type, category,
                         created_at, config.ADMIN_ID,
                         secrets.token_urlsafe(9).replace("-", "").replace("_", ""),
                     )
                 else:
-                    await db.advance_scan_cursor(channel_id, item.id)
-            await db.mark_scan_completed(channel_id)
+                    await db.advance_scan_cursor(primary_channel_id, item.id)
+            await db.mark_scan_completed(primary_channel_id)
 
         category_catalog_cache["expires_at"] = 0
-        # Keep intentionally-created empty folders; refresh the folder catalog only.
-        await db.list_categories()
-
-        primary_progress = await db.get_scan_progress(primary_channel_id)
-        backup_progress = await db.get_scan_progress(backup_channel_id)
+        categories = await db.list_categories()
         _, total_files, _, _ = await db.stats()
+        primary_progress = await db.get_scan_progress(primary_channel_id)
         await app.send_message(
             config.ADMIN_ID,
-            "✅ 主备份频道历史扫描完成\n"
+            "✅ 主存储频道历史扫描完成\n"
             f"主频道已检查媒体：{primary_progress['scanned_count']}\n"
-            f"备份频道已检查媒体：{backup_progress['scanned_count']}\n"
-            f"当前目录文件总数：{total_files}\n\n"
-            "主频道资源可直接进入目录；备份频道中匹配到的副本会自动补全，取回时优先使用主频道。",
+            f"已建立目录：{len(categories)} 个\n"
+            f"目录资源总数：{total_files} 个\n\n"
+            "本次只读取主频道并建立索引；未扫描备份频道，未下载或删除原始文件。"
         )
     except asyncio.CancelledError:
-        await app.send_message(config.ADMIN_ID, "⏸️ 历史扫描已暂停。再次发送 /scan 可从上次进度继续。")
+        await app.send_message(
+            config.ADMIN_ID, "⏸️ 主频道扫描已暂停。再次发送 /scan 可从上次进度继续。"
+        )
         raise
     except Exception:
-        log.exception("History scan failed")
+        log.exception("Primary history scan failed")
         try:
             await app.send_message(
                 config.ADMIN_ID,
-                "⚠️ 历史扫描遇到错误，已保留进度。修复频道访问或稍后发送 /scan 继续。",
+                "⚠️ 主频道扫描遇到错误，已保留进度。修复频道访问后发送 /scan 继续。"
             )
         except Exception:
             log.exception("Could not notify admin about scan failure")
@@ -2088,7 +2080,7 @@ async def scanner_login_input_handler(client, message):
             "✅ 扫描账号登录成功！\n"
             f"账号 ID：{scanner_me.id}\n"
             "登录会话已保存在部署平台的数据目录中。\n\n"
-            "请确保平台的数据目录启用了持久化存储。现在可以发送 /scan 开始扫描主、备份频道。"
+            "请确保平台的数据目录启用了持久化存储。现在可以发送 /scan 只扫描主存储频道。"
         )
     except Exception:
         log.exception("Could not activate scanner after login")
@@ -2231,6 +2223,43 @@ async def build_info_handler(client, message):
     )
 
 
+@app.on_message(filters.private & filters.command("catalogreset"))
+async def catalog_reset_prompt_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    if scan_task and not scan_task.done():
+        await message.reply_text("⚠️ 请先发送 /scanstop 暂停扫描，再执行目录重建。")
+        return
+    await message.reply_text(
+        "⚠️ 即将清空旧资源索引并重新扫描主频道。\n\n"
+        "会清理：文件索引、目录、扫描记录、文件收藏及领取进度。\n"
+        "会保留：用户、会员、管理员、封禁名单、机器人设置及扫描账号登录会话。\n"
+        "不会删除 Telegram 主频道或备份频道里的任何原始消息。\n\n"
+        "确认执行请发送：/catalogresetconfirm\n"
+        "不执行则忽略本消息。"
+    )
+
+
+@app.on_message(filters.private & filters.command("catalogresetconfirm"))
+async def catalog_reset_confirm_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    if scan_task and not scan_task.done():
+        await message.reply_text("⚠️ 扫描正在运行，请先发送 /scanstop。")
+        return
+    await db.reset_catalog_for_rescan()
+    category_catalog_cache["expires_at"] = 0
+    category_catalog_cache["rows"] = []
+    await message.reply_text(
+        "✅ 旧资源索引和目录已清理。用户、会员、管理员及机器人设置均已保留。\n\n"
+        "现在发送 /scan，即可只从主存储频道重新建立资源目录。"
+    )
+
+
 @app.on_message(filters.private & filters.command("scancheck"))
 async def scan_check_handler(client, message):
     user = message.from_user
@@ -2240,25 +2269,15 @@ async def scan_check_handler(client, message):
     if scanner is None or not scanner.is_connected:
         await message.reply_text("⚠️ 扫描账号尚未登录或连接已断开。请先发送 /scanlogin 登录。")
         return
-
-    primary, backup = await get_storage_channels()
-    if not primary or not backup:
-        await message.reply_text("❌ 主频道或备份频道尚未绑定，请先检查 /storage。")
+    primary, _ = await get_storage_channels()
+    if not primary:
+        await message.reply_text("❌ 尚未绑定主存储频道，请先绑定主频道。")
         return
-
-    await message.reply_text("🔎 正在分别检查主频道、备份频道及历史读取权限……")
-    primary_result = await inspect_scan_channel(primary)
-    backup_result = await inspect_scan_channel(backup)
-    body = (
-        "🔎 扫描账号频道检查结果\n\n"
-        + format_scan_check(primary_result, "主存储频道")
-        + "\n\n"
-        + format_scan_check(backup_result, "备份存储频道")
-    )
-    if primary_result["ok"] and backup_result["ok"]:
-        body += "\n\n✅ 两个频道均可读取历史消息，可以发送 /scan 开始扫描。"
-    else:
-        body += "\n\n⚠️ 请根据上面的具体错误修复频道权限后，再运行 /scan。"
+    await message.reply_text("🔎 正在检查扫描账号读取主存储频道历史的权限……")
+    result = await inspect_scan_channel(primary)
+    body = "🔎 主频道扫描检查结果\n\n" + format_scan_check(result, "主存储频道")
+    body += "\n\n" + ("✅ 可以发送 /scan 开始扫描。" if result["ok"] else
+                         "⚠️ 请先修复扫描账号的主频道访问权限。")
     await message.reply_text(body)
 
 
@@ -2269,59 +2288,40 @@ async def scan_history_handler(client, message):
     if not user or not await is_admin(user.id):
         await reply_admin_only(message)
         return
-    if scanner is None:
+    if scanner is None or not scanner.is_connected:
         await message.reply_text(
-            "⚠️ 尚未登录历史扫描账号。\n"
-            "请先发送 /scanlogin，在机器人私聊中完成登录。"
+            "⚠️ 扫描账号尚未登录或连接已断开。请先发送 /scanlogin 登录。"
         )
         return
     if scan_task and not scan_task.done():
-        await message.reply_text("⏳ 历史扫描正在运行。发送 /scanstatus 查看进度。")
+        await message.reply_text("⏳ 主频道历史扫描正在运行。发送 /scanstatus 查看进度。")
         return
-    primary, backup = await get_storage_channels()
-    if not primary or not backup:
-        await message.reply_text("❌ 请先绑定主存储频道和备份频道。")
+    primary, _ = await get_storage_channels()
+    if not primary:
+        await message.reply_text("❌ 请先绑定主存储频道。")
         return
-    if not scanner.is_connected:
-        await message.reply_text("⚠️ 扫描账号连接已断开。请发送 /scanlogin 重新登录。")
-        return
-    checks = [
-        ("主存储频道", await inspect_scan_channel(primary)),
-        ("备份存储频道", await inspect_scan_channel(backup)),
-    ]
-    failed = [format_scan_check(result, label) for label, result in checks if not result["ok"]]
-    if failed:
-        log.error("Scanner channel check failed: %s", " | ".join(failed))
+    check = await inspect_scan_channel(primary)
+    if not check["ok"]:
         await message.reply_text(
-            "❌ 扫描未启动，以下频道检查未通过：\n\n"
-            + "\n\n".join(failed)
-            + "\n\n修复对应频道权限后，先运行 /scancheck 确认，再发送 /scan。"
+            "❌ 主频道检查未通过：\n\n" + format_scan_check(check, "主存储频道")
+            + "\n\n修复权限后先运行 /scancheck，再发送 /scan。"
         )
         return
-    p = await db.get_scan_progress(primary)
-    b = await db.get_scan_progress(backup)
-    backfilled = await db.publish_primary_catalog(primary, config.ADMIN_ID)
-    if backfilled:
-        category_catalog_cache["expires_at"] = 0
-    if p["completed"] and b["completed"]:
-        # A completed scan can still have legacy primary-channel records waiting
-        # to be published. Always finalize directory maintenance before returning.
-        cleaned_categories = await db.cleanup_empty_categories()
+    progress = await db.get_scan_progress(primary)
+    if progress["completed"]:
         categories = await db.list_categories()
         _, total_files, _, _ = await db.stats()
         await message.reply_text(
-            "✅ 两个频道的历史扫描已完成。\n"
-            f"本次从已保存的主频道扫描记录补入目录：{backfilled} 个文件。\n"
-            f"📁 当前有效文件夹：{len(categories)} 个\n"
-            f"🧹 本次清理空文件夹：{cleaned_categories} 个\n"
-            f"📦 当前目录资源总数：{total_files} 个\n\n"
-            "标签分类已同步建立目录索引和分享链接；已有文件及扫描进度均已保留。"
+            "✅ 主频道历史扫描已经完成。\n"
+            f"📁 当前目录：{len(categories)} 个\n"
+            f"📦 当前资源：{total_files} 个\n\n"
+            "如需重新建立索引，请先发送 /catalogreset，再发送 /scan。"
         )
         return
-    scan_task = asyncio.create_task(run_history_scan(primary, backup))
+    scan_task = asyncio.create_task(run_history_scan(primary))
     await message.reply_text(
-        "🚀 已启动主、备份频道历史扫描。\n"
-        "只读取文件信息并建立目录，不下载、不转发、不删除原消息。\n\n"
+        "🚀 已启动主存储频道历史扫描。\n"
+        "只读取主频道并建立数据库索引，不扫描备份频道、不下载或删除原始文件。\n\n"
         "发送 /scanstatus 查看进度；发送 /scanstop 可暂停，之后可继续。"
     )
 
@@ -2332,23 +2332,22 @@ async def scan_status_handler(client, message):
     if not user or not await is_admin(user.id):
         await reply_admin_only(message)
         return
-    primary, backup = await get_storage_channels()
-    if not primary or not backup:
-        await message.reply_text("主频道或备份频道尚未绑定。")
+    primary, _ = await get_storage_channels()
+    if not primary:
+        await message.reply_text("尚未绑定主存储频道。")
         return
-    p = await db.get_scan_progress(primary)
-    b = await db.get_scan_progress(backup)
+    progress = await db.get_scan_progress(primary)
     running = bool(scan_task and not scan_task.done())
-    def label(progress):
-        if progress["completed"]:
-            return "已完成"
-        if not progress["last_message_id"] and not progress["scanned_count"]:
-            return "未开始"
-        return f"待继续（最近消息 ID：{progress['last_message_id']}）"
+    if progress["completed"]:
+        state = "已完成"
+    elif not progress["last_message_id"] and not progress["scanned_count"]:
+        state = "未开始"
+    else:
+        state = f"待继续（最近消息 ID：{progress['last_message_id']}）"
     await message.reply_text(
-        f"📊 历史扫描状态：{'运行中' if running else '未运行'}\n\n"
-        f"主频道：{label(p)}\n已检查媒体：{p['scanned_count']}\n\n"
-        f"备份频道：{label(b)}\n已检查媒体：{b['scanned_count']}"
+        f"📊 主频道扫描状态：{'运行中' if running else '未运行'}\n"
+        f"进度：{state}\n已检查媒体：{progress['scanned_count']}\n\n"
+        "备份频道：不参与本次扫描。"
     )
 
 
@@ -3536,7 +3535,7 @@ async def admin_callback_handler(client, query):
             "📖 管理命令速查\n\n管理员名单：打开 /admin → 管理员管理（仅超级管理员）\n\n"
             "/bindgroup — 绑定会员群\n/membercheck [用户ID] — 检查会员群和成员权限\n/bindmain — 绑定主存储频道\n/bindbackup — 绑定备份频道\n/storage — 查看绑定状态\n"
             "/grant 用户ID 天数|永久 — 授权会员\n/revoke 用户ID — 取消授权\n/ban 用户ID 原因 — 封禁\n/unban 用户ID — 解封\n"
-            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scancheck — 分别检查主备份频道访问和历史读取权限\n/scan — 自动扫描主备份频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
+            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scancheck — 检查主存储频道访问和历史读取权限\n/catalogreset — 预览清理旧资源索引\n/catalogresetconfirm — 确认清理资源索引（保留用户会员设置）\n/scan — 只扫描主存储频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
             reply_markup=back_keyboard(),
         )
 
