@@ -43,6 +43,7 @@ pending_upload_categories = {}
 upload_status_messages = {}
 pending_album_uploads = {}
 pending_upload_tasks = {}
+upload_finish_in_progress = set()
 upload_copy_semaphore = asyncio.Semaphore(2)
 upload_received_counts = {}
 pending_upload_confirmation_tasks = {}
@@ -3179,31 +3180,78 @@ async def admin_callback_handler(client, query):
         )
         return
     if action == "uploadfinish":
-        timer = pending_upload_confirmation_tasks.get(int(user.id))
+        uid = int(user.id)
+        if uid in upload_finish_in_progress:
+            await query.answer("正在结束上传，请稍候。", show_alert=False)
+            return
+
+        upload_finish_in_progress.add(uid)
+        timer = pending_upload_confirmation_tasks.get(uid)
         if timer and not timer.done():
             timer.cancel()
-        while True:
-            tasks = list(pending_upload_tasks.get(int(user.id), set()))
-            if not tasks:
-                await asyncio.sleep(0.2)
-                tasks = list(pending_upload_tasks.get(int(user.id), set()))
+
+        try:
+            # Give immediate feedback before waiting for Telegram's channel-copy
+            # retries (FloodWait can legitimately take tens of seconds).
+            try:
+                await message.edit_text(
+                    f"⏳ 正在结束上传……\\n📥 已接收：{upload_received_counts.get(uid, 0)} 个文件\\n"
+                    "正在等待后台保存任务完成，请不要重复点击。"
+                )
+            except Exception as exc:
+                if type(exc).__name__ != "MessageNotModified":
+                    log.warning("Could not show upload-finish status for user %s: %s", uid, exc)
+
+            while True:
+                tasks = list(pending_upload_tasks.get(uid, set()))
                 if not tasks:
-                    break
-            await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
-        received_count = upload_received_counts.pop(int(user.id), 0)
-        result = await db.publish_upload_batch(user.id)
-        upload_progress_state.pop(int(user.id), None)
-        pending_upload_categories.pop(user.id, None)
-        category_catalog_cache["expires_at"] = 0
-        upload_status_messages.pop(int(user.id), None)
-        upload_confirmation_messages.pop(int(user.id), None)
-        upload_latest_messages.pop(int(user.id), None)
-        await message.edit_text(
-            f"✅ 本次上传完成\n📥 收到文件：{received_count} 个\n"
-            f"📦 成功入库：{result['published']} 个文件"
-            + (f"\n⚠️ 未成功入库：{max(0, received_count - result['published'])} 个，请检查日志。" if received_count > result["published"] else ""),
-            reply_markup=None,
-        )
+                    await asyncio.sleep(0.2)
+                    tasks = list(pending_upload_tasks.get(uid, set()))
+                    if not tasks:
+                        break
+                await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+
+            received_count = int(upload_received_counts.get(uid, 0))
+            try:
+                result = await db.publish_upload_batch(uid)
+            except Exception:
+                log.exception("Could not publish upload batch for user %s", uid)
+                try:
+                    await message.edit_text(
+                        "❌ 上传文件已完成后台保存，但发布入库失败。\\n"
+                        "本次批次和接收数量已保留，请检查数据库/部署日志后重试。"
+                    )
+                except Exception as edit_exc:
+                    log.warning("Could not show upload-publish error for user %s: %s", uid, edit_exc)
+                return
+
+            upload_received_counts.pop(uid, None)
+            upload_progress_state.pop(uid, None)
+            pending_upload_categories.pop(uid, None)
+            category_catalog_cache["expires_at"] = 0
+            upload_status_messages.pop(uid, None)
+            upload_confirmation_messages.pop(uid, None)
+            upload_latest_messages.pop(uid, None)
+
+            if result.get("category") is None:
+                completion_text = "目前没有待发布的上传批次。"
+            else:
+                published = int(result.get("published", 0))
+                completion_text = (
+                    f"✅ 本次上传完成\\n📥 收到文件：{received_count} 个\\n"
+                    f"📦 成功入库：{published} 个文件"
+                    + (f"\\n⚠️ 未成功入库：{max(0, received_count - published)} 个，请检查部署日志。" if received_count > published else "")
+                )
+            try:
+                await message.edit_text(completion_text, reply_markup=None)
+            except Exception as exc:
+                if type(exc).__name__ == "MessageNotModified":
+                    pass
+                else:
+                    log.warning("Could not edit upload-finish result for user %s: %s", uid, exc)
+                    await message.reply_text(completion_text, reply_markup=admin_home_keyboard())
+        finally:
+            upload_finish_in_progress.discard(uid)
         return
     if action == "home":
         users, files, members, banned = await db.stats()
