@@ -266,6 +266,38 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["animations"], 1)
         self.assertEqual(stats["audios"], 1)
 
+    async def test_folder_size_stats_are_cached_and_refreshed_on_insert(self):
+        await self.db.add_file(
+            "cached-video", 101, "movie.mp4", "video", 11, 22,
+            "缓存统计", file_size=1024
+        )
+        await self.db.add_file(
+            "cached-photo", 101, "cover.jpg", "photo", 12, 23,
+            "缓存统计", file_size=512
+        )
+
+        stats = await self.db.get_category_storage_stats("缓存统计")
+        self.assertEqual(stats["video_size"], 1024)
+        self.assertEqual(stats["image_size"], 512)
+        self.assertEqual(stats["other_size"], 0)
+        self.assertEqual(stats["sized_count"], 2)
+        self.assertEqual(stats["file_count"], 2)
+
+        folder = next(
+            row for row in await self.db.list_categories()
+            if row["category"] == "缓存统计"
+        )
+        shared = await self.db.get_category_by_share_key(folder["share_key"])
+        self.assertEqual(shared["file_count"], 2)
+
+        await self.db.add_file(
+            "cached-document", 101, "guide.pdf", "document", 13, 24,
+            "缓存统计", file_size=256
+        )
+        updated = await self.db.get_category_storage_stats("缓存统计")
+        self.assertEqual(updated["other_size"], 256)
+        self.assertEqual(updated["file_count"], 3)
+
     async def test_rename_category_keeps_files_and_empty_delete_is_safe(self):
         await self.db.save_category("待改名")
         await self.db.add_file(
