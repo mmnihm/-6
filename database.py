@@ -727,6 +727,26 @@ class Database:
             await db.commit()
             return cur.rowcount == 1
 
+
+    async def reset_catalog_for_rescan(self):
+        """Clear resource/catalog indexes only; preserve users, memberships, admins and settings."""
+        async with self.connect() as db:
+            # These tables contain only resource indexes, delivery state, or per-file history.
+            # User identities, membership grants, bans, admins and bot settings are untouched.
+            for table in (
+                "backup_retry_jobs",
+                "user_history",
+                "favorites",
+                "category_favorites",
+                "category_delivery_progress",
+                "files",
+                "categories",
+                "scanner_messages",
+                "scanner_progress",
+            ):
+                await db.execute(f"DELETE FROM {table}")
+            await db.commit()
+
     async def save_scanned_message(
         self, channel_id, other_channel_id, primary_channel_id,
         message_id, fingerprint, file_name, media_type, category,
