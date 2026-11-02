@@ -2384,7 +2384,7 @@ async def admin_directories_command(client, message):
     rows = [[InlineKeyboardButton("➕ 新建目录", callback_data="mc:dirnew")]]
     for index, row in enumerate(categories[:page_size]):
         rows.append([InlineKeyboardButton(
-            f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
+            f"{index + 1}. 📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
             callback_data=f"mc:directory:{index}",
         )])
     for chunk_start in range(0, min(len(categories), page_size), 5):
@@ -2402,7 +2402,7 @@ async def admin_directories_command(client, message):
     copy_rows = [[{"text": "➕ 新建目录", "callback_data": "mc:dirnew"}]]
     for row in categories[:page_size]:
         copy_rows.append([{
-            "text": f"📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
+            "text": f"{start_at + len(copy_rows)}. 📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
             "copy_text": {"text": str(row["category"])},
         }])
     for chunk_start in range(0, min(len(categories), page_size), 5):
@@ -2633,7 +2633,7 @@ async def user_catalog_callback_handler(client, query):
         selected = categories[start_at:start_at + page_size]
         rows = [
             [InlineKeyboardButton(
-                f"📁 {row['category']}（{int(row['file_count'] or 0)}）",
+                f"{index + 1}. 📁 {row['category']}（{int(row['file_count'] or 0)}）",
                 callback_data=f"uc:folderstats:{start_at + index}:{page}",
             )]
             for index, row in enumerate(selected)
@@ -2661,7 +2661,7 @@ async def user_catalog_callback_handler(client, query):
         )
         copy_rows = [
             [{
-                "text": f"📁 {row['category']}（{int(row['file_count'] or 0)}）",
+                "text": f"{index + 1}. 📁 {row['category']}（{int(row['file_count'] or 0)}）",
                 "copy_text": {"text": str(row["category"])},
             }]
             for row in selected
