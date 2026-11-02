@@ -2934,9 +2934,8 @@ async def user_catalog_callback_handler(client, query):
                 await query.answer("这个目录的资源已经领取完毕", show_alert=True)
                 return
             await query.answer(f"开始发送全部剩余资源，共 {len(batch)} 个文件")
-            progress = await message.reply_text(
-                f"📥 正在发送「{category['name']}」全部资源，共 {len(batch)} 个文件…"
-            )
+            # Do not post a status message before the files: the final
+            # delivery summary is sent only after every resource message.
             try:
                 sent, failed, next_offset = await send_catalog_batch(
                     client, user.id, share_key, offset, batch
@@ -2963,15 +2962,7 @@ async def user_catalog_callback_handler(client, query):
                 [InlineKeyboardButton("📁 返回文件夹", callback_data=f"uc:folderlink:{share_key}")],
                 [InlineKeyboardButton("🏠 返回主菜单", callback_data="uc:home")],
             ])
-            # Keep the progress message update best-effort; always send a separate
-            # final result message so the user receives a visible completion notice.
-            try:
-                await progress.edit_text("✅ 资源发送处理结束")
-            except Exception:
-                log.warning(
-                    "Could not update folder delivery progress message: user=%s share_key=%s",
-                    user.id, share_key, exc_info=True,
-                )
+            # This is deliberately the last message, after all delivered files.
             await message.reply_text(text_result, reply_markup=buttons)
             return
         finally:
