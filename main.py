@@ -1215,6 +1215,7 @@ async def upload_handler(client, message):
             selected_category = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
             if selected_category:
                 upload_received_counts[int(user.id)] = upload_received_counts.get(int(user.id), 0) + 1
+                await update_admin_upload_progress(message, user.id, selected_category, increment=1)
                 track_upload_task(user.id, asyncio.create_task(_run_single_upload_task(client, message)))
                 schedule_upload_confirmation(client, user.id, message)
                 return
@@ -1228,6 +1229,7 @@ async def upload_handler(client, message):
         selected_category = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
         if selected_category:
             upload_received_counts[int(user.id)] = upload_received_counts.get(int(user.id), 0) + 1
+            await update_admin_upload_progress(message, user.id, selected_category, increment=1)
     key = (int(user.id), int(message.chat.id), str(group_id))
     pending_album_uploads.setdefault(key, []).append(message)
     scheduled = pending_album_uploads.get((key, "scheduled"))
