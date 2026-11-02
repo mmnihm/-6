@@ -45,6 +45,9 @@ pending_album_uploads = {}
 pending_upload_tasks = {}
 upload_copy_semaphore = asyncio.Semaphore(2)
 upload_received_counts = {}
+pending_upload_confirmation_tasks = {}
+upload_confirmation_messages = {}
+upload_latest_messages = {}
 upload_progress_state = {}
 pending_home_button_actions = {}
 pending_admin_actions = {}
@@ -103,6 +106,71 @@ def track_upload_task(user_id, task):
             log.error("Background upload task failed for user %s: %s", uid, error, exc_info=(type(error), error, error.__traceback__))
     task.add_done_callback(_finished)
     return task
+
+async def _show_upload_confirmation_after_idle(client, user_id):
+    uid = int(user_id)
+    current = asyncio.current_task()
+    try:
+        # Wait for a quiet period so one multi-select send is counted as a whole.
+        await asyncio.sleep(6.0)
+        while True:
+            tasks = list(pending_upload_tasks.get(uid, set()))
+            if not tasks:
+                await asyncio.sleep(0.25)
+                tasks = list(pending_upload_tasks.get(uid, set()))
+                if not tasks:
+                    break
+            await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+        if pending_upload_confirmation_tasks.get(uid) is not current:
+            return
+        last_message = upload_latest_messages.get(uid)
+        batch = await db.get_upload_batch(uid)
+        if not batch or not last_message:
+            return
+        received = int(upload_received_counts.get(uid, 0))
+        saved = await db.count_upload_batch_items(uid)
+        old = upload_confirmation_messages.get(uid)
+        if old:
+            try:
+                await old.delete()
+            except Exception:
+                pass
+        prompt = await last_message.reply_text(
+            f"📥 本轮收到文件：{received} 个\n"
+            f"📦 已成功保存待发布：{saved} 个\n\n"
+            "请确认下一步：",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ 结束上传", callback_data="mc:uploadfinish"),
+                 InlineKeyboardButton("➕ 继续上传", callback_data="mc:uploadcontinue")]
+            ]),
+        )
+        upload_confirmation_messages[uid] = prompt
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.exception("Could not show upload confirmation for user %s", uid)
+    finally:
+        if pending_upload_confirmation_tasks.get(uid) is current:
+            pending_upload_confirmation_tasks.pop(uid, None)
+
+
+def schedule_upload_confirmation(client, user_id, message):
+    uid = int(user_id)
+    previous = pending_upload_confirmation_tasks.get(uid)
+    if previous and not previous.done():
+        previous.cancel()
+    old_prompt = upload_confirmation_messages.pop(uid, None)
+    if old_prompt:
+        async def _remove_old_prompt():
+            try:
+                await old_prompt.delete()
+            except Exception:
+                pass
+        asyncio.create_task(_remove_old_prompt())
+    upload_latest_messages[uid] = message
+    pending_upload_confirmation_tasks[uid] = asyncio.create_task(
+        _show_upload_confirmation_after_idle(client, uid)
+    )
 
 
 async def _run_single_upload_task(client, message):
@@ -1157,6 +1225,7 @@ async def upload_handler(client, message):
             if selected_category:
                 upload_received_counts[int(user.id)] = upload_received_counts.get(int(user.id), 0) + 1
                 track_upload_task(user.id, asyncio.create_task(_run_single_upload_task(client, message)))
+                schedule_upload_confirmation(client, user.id, message)
                 return
         await _upload_single_handler(client, message)
         return
@@ -1176,6 +1245,11 @@ async def upload_handler(client, message):
     task = asyncio.create_task(_run_album_upload_task(client, key))
     pending_album_uploads[(key, "scheduled")] = task
     track_upload_task(user.id, task)
+    if await is_admin(user.id):
+        active_batch = await db.get_upload_batch(user.id)
+        selected_category = active_batch["category"] if active_batch else pending_upload_categories.get(user.id)
+        if selected_category:
+            schedule_upload_confirmation(client, user.id, message)
 
 
 @app.on_message(
@@ -3110,6 +3184,41 @@ async def admin_callback_handler(client, query):
     await query.answer()
     action = query.data.split(":", 1)[1]
     message = query.message
+    if action == "uploadcontinue":
+        upload_confirmation_messages.pop(int(user.id), None)
+        await message.edit_text(
+            f"📥 当前已收到：{upload_received_counts.get(int(user.id), 0)} 个文件。\n"
+            "可以继续发送文件；机器人会在本轮发送完成后再次显示确认。",
+            reply_markup=None,
+        )
+        return
+    if action == "uploadfinish":
+        timer = pending_upload_confirmation_tasks.get(int(user.id))
+        if timer and not timer.done():
+            timer.cancel()
+        while True:
+            tasks = list(pending_upload_tasks.get(int(user.id), set()))
+            if not tasks:
+                await asyncio.sleep(0.2)
+                tasks = list(pending_upload_tasks.get(int(user.id), set()))
+                if not tasks:
+                    break
+            await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+        received_count = upload_received_counts.pop(int(user.id), 0)
+        result = await db.publish_upload_batch(user.id)
+        upload_progress_state.pop(int(user.id), None)
+        pending_upload_categories.pop(user.id, None)
+        category_catalog_cache["expires_at"] = 0
+        upload_status_messages.pop(int(user.id), None)
+        upload_confirmation_messages.pop(int(user.id), None)
+        upload_latest_messages.pop(int(user.id), None)
+        await message.edit_text(
+            f"✅ 本次上传完成\n📥 收到文件：{received_count} 个\n"
+            f"📦 成功入库：{result['published']} 个文件"
+            + (f"\n⚠️ 未成功入库：{max(0, received_count - result['published'])} 个，请检查日志。" if received_count > result["published"] else ""),
+            reply_markup=None,
+        )
+        return
     if action == "home":
         users, files, members, banned = await db.stats()
         group_id = await get_member_group_id()
