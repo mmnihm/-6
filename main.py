@@ -42,6 +42,7 @@ pending_category_actions = {}
 pending_upload_categories = {}
 upload_status_messages = {}
 pending_album_uploads = {}
+pending_album_upload_tasks = {}
 pending_home_button_actions = {}
 pending_admin_actions = {}
 directory_import_running = False
@@ -939,9 +940,12 @@ async def start_handler(client, message):
 
 
 async def _flush_album_upload(client, key):
-    await asyncio.sleep(2.0)
+    # Wait until this album has been quiet for 3 seconds. The scheduled task
+    # is reset whenever another message from the same Telegram album arrives.
+    await asyncio.sleep(3.0)
+    if pending_album_uploads.get((key, "scheduled")) is asyncio.current_task():
+        pending_album_uploads.pop((key, "scheduled"), None)
     messages = pending_album_uploads.pop(key, [])
-    pending_album_uploads.pop((key, "scheduled"), None)
     if not messages:
         return
     messages.sort(key=lambda item: item.id)
@@ -1079,9 +1083,16 @@ async def upload_handler(client, message):
     key = (int(user.id), int(message.chat.id), str(group_id))
     pending_album_uploads.setdefault(key, []).append(message)
     scheduled = pending_album_uploads.get((key, "scheduled"))
-    if not scheduled:
-        pending_album_uploads[(key, "scheduled")] = True
-        asyncio.create_task(_flush_album_upload(client, key))
+    if scheduled and not scheduled.done():
+        scheduled.cancel()
+    task = asyncio.create_task(_flush_album_upload(client, key))
+    pending_album_uploads[(key, "scheduled")] = task
+    tasks = pending_album_upload_tasks.setdefault(int(user.id), set())
+    tasks.add(task)
+    task.add_done_callback(
+        lambda completed, uid=int(user.id):
+            pending_album_upload_tasks.get(uid, set()).discard(completed)
+    )
 
 
 @app.on_message(
@@ -1767,6 +1778,17 @@ async def scanner_login_input_handler(client, message):
         return
 
     if value == "✅ 结束上传":
+        # Finish all queued/in-flight album groups before publishing the batch.
+        # This prevents the user tapping the button while the final albums are
+        # still waiting for Telegram's remaining grouped messages or channel copies.
+        while True:
+            album_tasks = list(pending_album_upload_tasks.get(int(user.id), set()))
+            if not album_tasks:
+                await asyncio.sleep(0)
+                album_tasks = list(pending_album_upload_tasks.get(int(user.id), set()))
+                if not album_tasks:
+                    break
+            await asyncio.gather(*album_tasks, return_exceptions=True)
         result = await db.publish_upload_batch(user.id)
         pending_upload_categories.pop(user.id, None)
         category_catalog_cache["expires_at"] = 0
