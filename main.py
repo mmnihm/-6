@@ -70,11 +70,11 @@ def admin_home_keyboard():
 
 
 def upload_active_keyboard():
-    # Keep the two essential admin actions visible throughout folder selection
-    # and upload: create another folder or finish the current upload batch.
+    # Keep the original two persistent admin shortcuts. Upload completion
+    # controls are shown inline beneath the received-file count instead.
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📁 创建文件夹"), KeyboardButton("✅ 结束上传")],
+            [KeyboardButton("📋 文件夹列表"), KeyboardButton("🛠 管理设置")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -2109,8 +2109,9 @@ async def scanner_login_input_handler(client, message):
                 await message.reply_text(
                     f"✅ 已创建目录：{new_category}\n"
                     "📤 已自动选中这个目录，现在可以直接发送图片、视频或文件。\n\n"
-                    "支持连续上传单文件和成组相册。全部发送完毕后，"
-                    "点击底部「✅ 结束上传」，资源才会正式显示给会员。",
+                    "支持连续上传单文件和成组相册。发送暂停后，"
+                    "机器人会在文件下方显示已接收数量，并提供内联「结束上传」按钮；"
+                    "确认数量无误后再点击发布。",
                     reply_markup=upload_active_keyboard(),
                 )
         elif pending_category["action"] == "rename":
@@ -3437,8 +3438,8 @@ async def admin_callback_handler(client, query):
         await message.edit_text(
             f"📤 已选择上传目录：{row['category']}\n\n"
             "现在直接向机器人发送图片、视频、音频或文件，都会保存到这个目录。\n"
-            "可以连续上传多个文件。发送暂停后，机器人会自动显示收到数量，并提供「结束上传」或「继续上传」按钮。\n"
-            "上传期间会员看不到本批文件。",
+            "可以连续上传多个文件。发送暂停后，机器人会在文件下方显示已接收数量，并提供内联「结束上传」或「继续上传」按钮。\n"
+            "确认接收数量无误后再结束上传；上传期间会员看不到本批文件。",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📁 选择其他目录", callback_data="mc:directories")],
                 [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
