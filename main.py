@@ -2761,7 +2761,12 @@ async def user_catalog_callback_handler(client, query):
             summary = f"🎲 随机发送完成：成功 {sent}/{len(rows)} 个文件。"
             if failed:
                 summary += f"\n\n⚠️ 有 {failed} 个文件未能发送，已自动跳过；其余资源不受影响。"
-            await message.reply_text(summary)
+            await message.reply_text(
+                summary,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🏠 返回主页", callback_data="uc:home")]
+                ]),
+            )
         except Exception:
             log.exception("Random exploration failed for user %s", user.id)
             await message.reply_text(
