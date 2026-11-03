@@ -1107,16 +1107,58 @@ async def start_handler(client, message):
 
 
 async def _flush_album_upload(client, key):
-    await asyncio.sleep(1.2)
+    # Telegram delivers album items as separate updates. Wait for the group to
+    # settle, then ask Telegram for the complete media group instead of trusting
+    # the locally received updates (which may still be incomplete).
+    await asyncio.sleep(2.0)
+    queued = list(pending_album_uploads.get(key, []))
+    if not queued:
+        return
+    queued.sort(key=lambda item: item.id)
+    anchor = queued[0]
+    try:
+        fetched = await client.get_media_group(
+            chat_id=anchor.chat.id,
+            message_id=anchor.id,
+        )
+    except Exception:
+        log.exception(
+            "Could not retrieve complete Telegram media group: chat=%s group=%s",
+            anchor.chat.id, key[2],
+        )
+        fetched = []
+
+    # Merge API results with updates already received; message IDs guarantee
+    # each album member is indexed exactly once and in Telegram's original order.
+    merged = {item.id: item for item in fetched}
+    for item in pending_album_uploads.get(key, []):
+        merged[item.id] = item
+    messages = sorted(merged.values(), key=lambda item: item.id)
+    if len(messages) < 2:
+        # A message carrying media_group_id must never fall back to the
+        # single-file path: doing so would publish a broken, partial album.
+        pending_album_uploads.pop(key, None)
+        if pending_album_uploads.get((key, "scheduled")) is asyncio.current_task():
+            pending_album_uploads.pop((key, "scheduled"), None)
+        log.error(
+            "Refusing to split incomplete album: user=%s chat=%s group=%s received=%s",
+            key[0], key[1], key[2], len(messages),
+        )
+        try:
+            await anchor.reply_text(
+                "⚠️ 这组相册没有完整读取，暂未入库。请重新发送整组相册，避免相册被拆分。"
+            )
+        except Exception:
+            log.exception("Could not notify user about incomplete album")
+        return
+
+    # Include any final updates that arrived while get_media_group was running.
+    for item in pending_album_uploads.get(key, []):
+        merged[item.id] = item
+    messages = sorted(merged.values(), key=lambda item: item.id)
+    pending_album_uploads.pop(key, None)
     if pending_album_uploads.get((key, "scheduled")) is asyncio.current_task():
         pending_album_uploads.pop((key, "scheduled"), None)
-    messages = pending_album_uploads.pop(key, [])
-    if not messages:
-        return
-    messages.sort(key=lambda item: item.id)
-    if len(messages) < 2:
-        await _upload_single_handler(client, messages[0])
-        return
 
     user = messages[0].from_user
     if not user or not await has_access(user.id):
