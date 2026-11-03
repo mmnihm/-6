@@ -447,7 +447,7 @@ async def notify_folder_subscribers(client, category, event="new_folder"):
         if not subscribers:
             return {"sent": 0, "failed": 0}
         rows = await db.list_categories(category=str(category))
-        if not rows or not rows[0].get("share_key"):
+        if not rows or not rows[0]["share_key"]:
             log.warning("Skip subscriber notification: folder link unavailable for %s", category)
             return {"sent": 0, "failed": len(subscribers)}
         row = rows[0]
