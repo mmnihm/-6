@@ -599,6 +599,18 @@ async def save_folder_list_page(user_id, page):
     )
 
 
+async def get_folder_list_sort(user_id):
+    value = str(await db.get_setting(f"folder_list_sort:{int(user_id)}") or "created")
+    return value if value in ("created", "name", "count") else "created"
+
+
+async def save_folder_list_sort(user_id, sort):
+    if sort not in ("created", "name", "count"):
+        sort = "created"
+    await db.set_setting(f"folder_list_sort:{int(user_id)}", sort)
+    return sort
+
+
 def folder_detail_keyboard(category_row, page, has_next, is_favorite):
     share_key = str(category_row["share_key"] or "")
     rows = []
@@ -3080,8 +3092,14 @@ async def user_catalog_callback_handler(client, query):
         )
         return
 
-    if action[1] == "folders":
+    if action[1] in ("folders", "foldersort"):
         await query.answer()
+        if action[1] == "foldersort":
+            folder_sort = await save_folder_list_sort(
+                user.id, str(action[2]) if len(action) > 2 else "created"
+            )
+        else:
+            folder_sort = await get_folder_list_sort(user.id)
         now = asyncio.get_running_loop().time()
         if category_catalog_cache["expires_at"] > now:
             categories = category_catalog_cache["rows"]
@@ -3090,9 +3108,23 @@ async def user_catalog_callback_handler(client, query):
             category_catalog_cache["rows"] = [dict(row) for row in categories]
             category_catalog_cache["expires_at"] = now + 30
             categories = category_catalog_cache["rows"]
+        # Sort cached folder summaries in memory; no extra catalog scan is needed.
+        categories = sorted(
+            categories,
+            key=lambda row: str(row["category"] or "").casefold(),
+        )
+        if folder_sort == "created":
+            categories.sort(
+                key=lambda row: str(row["created_at"] or ""), reverse=True
+            )
+        elif folder_sort == "count":
+            categories.sort(
+                key=lambda row: int(row["file_count"] or 0), reverse=True
+            )
+
         page_size = 10
         total_pages = (len(categories) + page_size - 1) // page_size
-        if len(action) > 2:
+        if action[1] == "folders" and len(action) > 2:
             try:
                 page = max(0, int(action[2]))
             except (TypeError, ValueError):
@@ -3125,11 +3157,29 @@ async def user_catalog_callback_handler(client, query):
             nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"uc:folders:{page - 1}"))
         if start_at + page_size < len(categories):
             nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"uc:folders:{page + 1}"))
+        sort_labels = {
+            "created": "最新创建",
+            "name": "名称排序",
+            "count": "资源数量",
+        }
+        sort_buttons = [
+            InlineKeyboardButton(
+                ("✅ " if folder_sort == key else "") + label,
+                callback_data=f"uc:foldersort:{key}",
+            )
+            for key, label in (
+                ("created", "最新创建"),
+                ("name", "名称排序"),
+                ("count", "资源数量"),
+            )
+        ]
+        rows.append(sort_buttons)
         if nav:
             rows.append(nav)
         rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
         list_text = (
-            f"🗂️ 文件夹列表（共 {len(categories)} 个，第 {page + 1} 页）\n\n"
+            f"🗂️ 文件夹列表（共 {len(categories)} 个，第 {page + 1} 页）\n"
+            f"↕️ 当前排序：{sort_labels[folder_sort]}\n\n"
             "点击文件夹名称可复制名称；点击下方数字查看目录统计。"
             if categories else "🗂️ 暂无文件夹分类。"
         )
@@ -3150,6 +3200,14 @@ async def user_catalog_callback_handler(client, query):
             nav_buttons.append({"text": "⬅️ 上一页", "callback_data": f"uc:folders:{page - 1}"})
         if start_at + page_size < len(categories):
             nav_buttons.append({"text": "下一页 ➡️", "callback_data": f"uc:folders:{page + 1}"})
+        copy_rows.append([{
+            "text": ("✅ " if folder_sort == key else "") + label,
+            "callback_data": f"uc:foldersort:{key}",
+        } for key, label in (
+            ("created", "最新创建"),
+            ("name", "名称排序"),
+            ("count", "资源数量"),
+        )])
         if nav_buttons:
             copy_rows.append(nav_buttons)
         copy_rows.append([{"text": "⬅️ 返回首页", "callback_data": "uc:home"}])
