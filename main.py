@@ -2146,8 +2146,6 @@ async def scanner_login_input_handler(client, message):
                 return
             if result.get("category") and int(result.get("published", 0)) > 0:
                 await notify_folder_subscribers(client, result["category"], "new_resources")
-            if result.get("category") and int(result.get("published", 0)) > 0:
-                await notify_folder_subscribers(client, result["category"], "new_resources")
             upload_received_counts.pop(uid, None)
             upload_progress_state.pop(uid, None)
             pending_upload_categories.pop(uid, None)
@@ -3545,6 +3543,8 @@ async def admin_callback_handler(client, query):
                     log.warning("Could not show upload-publish error for user %s: %s", uid, edit_exc)
                 return
 
+            if result.get("category") and int(result.get("published", 0)) > 0:
+                await notify_folder_subscribers(client, result["category"], "new_resources")
             upload_received_counts.pop(uid, None)
             upload_progress_state.pop(uid, None)
             pending_upload_categories.pop(uid, None)
