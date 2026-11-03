@@ -3227,15 +3227,30 @@ async def user_catalog_callback_handler(client, query):
         try:
             share_key = str(action[2])
             page = max(0, int(action[3])) if len(action) > 3 else 0
-            category_row = await db.get_category_by_share_key(share_key)
-            if not category_row and share_key.isdigit():
-                category_row = await db.get_category_by_index(int(share_key))
-            if not category_row:
+            category_ref = await db.get_category_by_share_key(share_key)
+            if not category_ref and share_key.isdigit():
+                category_ref = await db.get_category_by_index(int(share_key))
+            if not category_ref:
                 raise IndexError("folder no longer exists")
+
+            # get_category_by_share_key returns the compact DB row (name/file_count),
+            # while the folder detail view needs the complete cached summary fields.
+            category_rows = await db.list_categories(category=str(category_ref["name"]))
+            if not category_rows:
+                raise IndexError("folder summary no longer exists")
+            category_row = dict(category_rows[0])
             sizes = await db.get_category_storage_stats(category_row["category"])
         except (ValueError, IndexError):
             await query.answer("目录已更新，请重新打开列表", show_alert=True)
             return
+        except Exception:
+            log.exception(
+                "Could not load member folder details: user=%s share_key=%s",
+                user.id, share_key,
+            )
+            await message.reply_text("❌ 文件夹详情读取失败，请稍后重试。")
+            return
+
         total = int(category_row["file_count"] or 0)
         measured = int(sizes["sized_count"] or 0)
         body = [
