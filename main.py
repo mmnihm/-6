@@ -956,21 +956,21 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
     # Unrelated photos/videos are never merged into an artificial album.
     grouped = {}
     units = []
+    invalid_album_groups = set()
     for entry in prepared:
         album_id = entry[1]["album_group_id"]
-        if album_id and entry[3] is not None and entry[4] is not None:
+        if album_id:
             grouped.setdefault(str(album_id), []).append(entry)
         else:
             units.append([entry])
     for album_id, entries in grouped.items():
         entries.sort(key=lambda entry: int(entry[1]["album_position"] or 0))
         expected = int(entries[0][1]["album_size"] or len(entries))
-        if 2 <= len(entries) <= 10 and len(entries) == expected:
-            units.append(entries)
-        else:
-            # A group crossing a page boundary is delivered individually rather
-            # than sending a misleading partial album.
-            units.extend([[entry] for entry in entries])
+        if not 2 <= len(entries) <= 10 or len(entries) != expected:
+            invalid_album_groups.add(album_id)
+        # Keep the album as one delivery unit even if incomplete. It will be
+        # skipped as a whole below, never degraded into individual messages.
+        units.append(entries)
 
     units.sort(key=lambda unit: unit[0][0])
     completed = set()
@@ -983,9 +983,9 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
             await db.set_category_delivery_progress(user_id, share_key, next_offset)
 
     for unit in units:
-        is_album = len(unit) >= 2
+        is_album = bool(unit[0][1]["album_group_id"])
         delivered = False
-        if is_album:
+        if is_album and str(unit[0][1]["album_group_id"]) not in invalid_album_groups:
             album_entries = [
                 (entry[1], entry[2], entry[3], entry[4]) for entry in unit
             ]
@@ -995,7 +995,7 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 )
             except Exception as exc:
                 log.warning(
-                    "Grouped media send failed; falling back to individual files: "
+                    "Grouped media send failed; album skipped as a whole: "
                     "user=%s count=%s error=%s",
                     user_id, len(unit), str(exc)[:250],
                 )
@@ -1009,7 +1009,18 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
             await advance_progress()
             continue
 
-        # Single files and failed albums use the existing reliable copy path.
+        if is_album:
+            # Never split an album on delivery failure or incomplete storage.
+            failed += len(unit)
+            completed.update(entry[0] for entry in unit)
+            log.error(
+                "Album skipped without splitting: user=%s group=%s count=%s",
+                user_id, unit[0][1]["album_group_id"], len(unit),
+            )
+            await advance_progress()
+            continue
+
+        # Only genuine single files use the individual copy path.
         for entry in unit:
             position, item = entry[0], entry[1]
             ok, error_text, copied_message_id = await send_catalog_file(
@@ -1191,7 +1202,7 @@ async def _flush_album_upload(client, key):
     )
     is_admin_batch = bool(await is_admin(user.id) and selected_category)
     status = None if is_admin_batch else await messages[0].reply_text(
-        f"⏳ 收到一组媒体（{len(messages)} 个），正在逐个保存…"
+        f"⏳ 收到一组相册（{len(messages)} 个），正在整组保存…"
     )
     saved = 0
     failed = 0
