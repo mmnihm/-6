@@ -562,11 +562,16 @@ def folder_detail_keyboard(category_row, page, has_next, is_favorite):
         callback_data=f"uc:folderstar:{share_key}",
     )])
     nav = []
-    category_index = int(category_row["category_index"])
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"uc:folder:{category_index}:{max(0, page * 20 - 20)}"))
+        nav.append(InlineKeyboardButton(
+            "⬅️ 上一页",
+            callback_data=f"uc:folderkey:{share_key}:{max(0, page * 20 - 20)}",
+        ))
     if has_next:
-        nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"uc:folder:{category_index}:{(page + 1) * 20}"))
+        nav.append(InlineKeyboardButton(
+            "下一页 ➡️",
+            callback_data=f"uc:folderkey:{share_key}:{(page + 1) * 20}",
+        ))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton("⬅️ 文件夹列表", callback_data="uc:folders")])
@@ -3049,7 +3054,7 @@ async def user_catalog_callback_handler(client, query):
         rows = [
             [InlineKeyboardButton(
                 f"{index + 1}. 📁 {row['category']}（{int(row['file_count'] or 0)}）",
-                callback_data=f"uc:folderstats:{start_at + index}:{page}",
+                callback_data=f"uc:folderstats:{row['share_key']}:{page}",
             )]
             for index, row in enumerate(selected)
         ]
@@ -3108,11 +3113,13 @@ async def user_catalog_callback_handler(client, query):
 
     if action[1] == "folderstats" and len(action) >= 3:
         try:
-            index = int(action[2])
+            share_key = str(action[2])
             page = max(0, int(action[3])) if len(action) > 3 else 0
-            category_row = await db.get_category_by_index(index)
+            category_row = await db.get_category_by_share_key(share_key)
+            if not category_row and share_key.isdigit():
+                category_row = await db.get_category_by_index(int(share_key))
             if not category_row:
-                raise IndexError("folder index no longer exists")
+                raise IndexError("folder no longer exists")
             sizes = await db.get_category_storage_stats(category_row["category"])
         except (ValueError, IndexError):
             await query.answer("目录已更新，请重新打开列表", show_alert=True)
@@ -3143,14 +3150,20 @@ async def user_catalog_callback_handler(client, query):
         )
         return
 
-    if action[1] in ("folder", "folderresume") and len(action) >= 3:
+    if action[1] in ("folder", "folderkey", "folderresume") and len(action) >= 3:
         try:
-            index = int(action[2])
-            cached_rows = category_catalog_cache["rows"]
-            if category_catalog_cache["expires_at"] > asyncio.get_running_loop().time() and 0 <= index < len(cached_rows):
-                category_row = dict(cached_rows[index])
+            if action[1] == "folderkey":
+                category_row = await db.get_category_by_share_key(str(action[2]))
+                if not category_row:
+                    raise IndexError("folder no longer exists")
+                index = -1
             else:
-                category_row = await db.get_category_by_index(index)
+                index = int(action[2])
+                cached_rows = category_catalog_cache["rows"]
+                if category_catalog_cache["expires_at"] > asyncio.get_running_loop().time() and 0 <= index < len(cached_rows):
+                    category_row = dict(cached_rows[index])
+                else:
+                    category_row = await db.get_category_by_index(index)
             if not category_row:
                 raise IndexError("folder index no longer exists")
             category = category_row["category"]
