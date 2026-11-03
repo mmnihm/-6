@@ -1126,7 +1126,27 @@ async def _flush_album_upload(client, key):
             "Could not retrieve complete Telegram media group: chat=%s group=%s",
             anchor.chat.id, key[2],
         )
-        fetched = []
+        fetched = None
+
+    if not fetched or len(fetched) < 2 or any(
+        str(getattr(item, "media_group_id", "")) != str(key[2])
+        for item in fetched
+    ):
+        pending_album_uploads.pop(key, None)
+        if pending_album_uploads.get((key, "scheduled")) is asyncio.current_task():
+            pending_album_uploads.pop((key, "scheduled"), None)
+        log.error(
+            "Refusing album upload without Telegram-confirmed complete group: "
+            "user=%s chat=%s group=%s",
+            key[0], key[1], key[2],
+        )
+        try:
+            await anchor.reply_text(
+                "⚠️ Telegram 未能确认这组相册完整，暂未入库。请重新发送整组相册。"
+            )
+        except Exception:
+            log.exception("Could not notify user about incomplete album")
+        return
 
     # Merge API results with updates already received; message IDs guarantee
     # each album member is indexed exactly once and in Telegram's original order.
@@ -1196,63 +1216,93 @@ async def _flush_album_upload(client, key):
                 raise RuntimeError(f"{label}中机器人没有发布消息权限")
 
         album_group_id = secrets.token_urlsafe(12)
+        # Copy the Telegram album as one operation. copyMessages preserves the
+        # album grouping in the destination channel; copyMessage per item does not.
+        if not 2 <= len(messages) <= 10:
+            raise RuntimeError(f"相册数量异常（{len(messages)} 条），拒绝拆分入库")
+        prepared_items = []
         for position, message in enumerate(messages):
             media_type, file_name, fingerprint = media_details(message)
             if not media_type:
-                failed += 1
-                log.warning("Album item has unsupported media: user=%s message=%s", user.id, message.id)
-                continue
+                raise RuntimeError(f"相册第 {position + 1} 条不是支持的媒体，整组取消入库")
             if is_admin_batch:
                 fingerprint = f"upload:{message.chat.id}:{message.id}"
             elif fingerprint and await db.get_file_by_fingerprint(fingerprint):
-                continue
+                raise RuntimeError("相册中存在已入库的重复文件，整组取消，避免只保存部分相册")
             media_object = getattr(message, media_type, None)
             file_size = int(getattr(media_object, "file_size", 0) or 0)
-            try:
-                primary = await telegram_bot_api("copyMessage", {
-                    "chat_id": primary_channel_id,
-                    "from_chat_id": message.chat.id,
-                    "message_id": message.id,
-                })
-                primary_id = int(primary["message_id"])
-            except Exception:
-                failed += 1
-                log.exception("Album primary copy failed: user=%s source_message=%s", user.id, message.id)
-                continue
+            prepared_items.append((message, media_type, file_name, fingerprint, file_size))
 
-            backup_id = 0
-            backup_error = None
-            try:
-                backup = await telegram_bot_api("copyMessage", {
-                    "chat_id": backup_channel_id,
-                    "from_chat_id": message.chat.id,
-                    "message_id": message.id,
-                })
-                backup_id = int(backup["message_id"])
-            except Exception as exc:
-                backup_error = exc
-                backup_failed += 1
-                log.exception("Album backup copy failed; primary copy will be indexed: user=%s source_message=%s", user.id, message.id)
+        source_message_ids = [int(item[0].id) for item in prepared_items]
+        primary_result = await telegram_bot_api("copyMessages", {
+            "chat_id": primary_channel_id,
+            "from_chat_id": int(messages[0].chat.id),
+            "message_ids": source_message_ids,
+        })
+        if not isinstance(primary_result, list) or len(primary_result) != len(prepared_items):
+            raise RuntimeError(
+                f"主频道整组复制不完整（预期 {len(prepared_items)} 条），整组未入库"
+            )
+        primary_ids = [int(item["message_id"]) for item in primary_result]
 
+        backup_ids = [0] * len(prepared_items)
+        backup_error = None
+        try:
+            backup_result = await telegram_bot_api("copyMessages", {
+                "chat_id": backup_channel_id,
+                "from_chat_id": int(messages[0].chat.id),
+                "message_ids": source_message_ids,
+            })
+            if not isinstance(backup_result, list) or len(backup_result) != len(prepared_items):
+                raise RuntimeError("备份频道整组复制返回数量不完整")
+            backup_ids = [int(item["message_id"]) for item in backup_result]
+        except Exception as exc:
+            backup_error = exc
+            backup_failed = len(prepared_items)
+            log.exception(
+                "Album backup copy failed; primary album retained for retry: user=%s",
+                user.id,
+            )
+
+        album_group_id = secrets.token_urlsafe(12)
+        staged_rows = []
+        for position, item in enumerate(prepared_items):
+            message, media_type, file_name, fingerprint, file_size = item
             key_file = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
-            error_text = f"{type(backup_error).__name__}: {str(backup_error)[:400]}" if backup_error else ""
+            error_text = (
+                f"{type(backup_error).__name__}: {str(backup_error)[:400]}"
+                if backup_error else ""
+            )
+            staged_rows.append((
+                key_file, user.id, file_name, media_type, category,
+                primary_channel_id, primary_ids[position],
+                backup_channel_id, backup_ids[position],
+                fingerprint, file_size, error_text, album_group_id, position,
+            ))
+
+        # Keep the existing per-message file records for compatibility with
+        # catalog/search/history, but every row references the same album group.
+        for row in staged_rows:
+            (key_file, owner_id, file_name, media_type, category,
+             p_channel, p_id, b_channel, b_id, fingerprint, file_size,
+             error_text, group_id, position) = row
             if is_admin_batch:
                 inserted = await db.stage_upload_batch_item(
-                    key_file, user.id, file_name, media_type, category,
-                    primary_channel_id, primary_id, backup_channel_id, backup_id,
-                    fingerprint, file_size, error_text, album_group_id, position,
+                    key_file, owner_id, file_name, media_type, category,
+                    p_channel, p_id, b_channel, b_id, fingerprint, file_size,
+                    error_text, group_id, position,
                 )
             else:
                 inserted = await db.add_file(
-                    key_file, user.id, file_name, media_type,
-                    primary_id, backup_id, category, fingerprint, file_size,
-                    album_group_id=album_group_id, album_position=position,
+                    key_file, owner_id, file_name, media_type,
+                    p_id, b_id, category, fingerprint, file_size,
+                    album_group_id=group_id, album_position=position,
                 )
             if inserted:
                 saved += 1
                 if backup_error and not is_admin_batch:
                     await db.enqueue_backup_retry(
-                        key_file, primary_channel_id, primary_id, backup_channel_id, error_text
+                        key_file, p_channel, p_id, b_channel, error_text
                     )
 
         if not is_admin_batch:
