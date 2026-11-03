@@ -3062,7 +3062,7 @@ async def user_catalog_callback_handler(client, query):
             rows.append([
                 InlineKeyboardButton(
                     str(index + 1),
-                    callback_data=f"uc:folderstats:{start_at + index}:{page}",
+                    callback_data=f"uc:folderstats:{row['share_key']}:{page}",
                 )
                 for index in range(chunk_start, min(chunk_start + 5, len(selected)))
             ])
@@ -3089,7 +3089,7 @@ async def user_catalog_callback_handler(client, query):
         for chunk_start in range(0, len(selected), 5):
             copy_rows.append([{
                 "text": str(index + 1),
-                "callback_data": f"uc:folderstats:{start_at + index}:{page}",
+                "callback_data": f"uc:folderstats:{row['share_key']}:{page}",
             } for index in range(chunk_start, min(chunk_start + 5, len(selected)))])
         nav_buttons = []
         if page > 0:
