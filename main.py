@@ -3180,13 +3180,13 @@ async def user_catalog_callback_handler(client, query):
         list_text = (
             f"🗂️ 文件夹列表（共 {len(categories)} 个，第 {page + 1} 页）\n"
             f"↕️ 当前排序：{sort_labels[folder_sort]}\n\n"
-            "点击文件夹名称可复制名称；点击下方数字查看目录统计。"
+            "点击文件夹名称或下方数字即可打开目录。"
             if categories else "🗂️ 暂无文件夹分类。"
         )
         copy_rows = [
             [{
                 "text": f"{index + 1}. 📁 {row['category']}（{int(row['file_count'] or 0)}）",
-                "copy_text": {"text": str(row["category"])},
+                "callback_data": f"uc:folderstats:{row['share_key']}:{page}",
             }]
             for index, row in enumerate(selected)
         ]
