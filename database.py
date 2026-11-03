@@ -1395,7 +1395,7 @@ class Database:
         async with self.connect() as db:
             row = await (await db.execute("""
                 SELECT name AS category FROM categories
-                ORDER BY updated_at DESC, created_at DESC, lower(name)
+                ORDER BY created_at DESC
                 LIMIT 1 OFFSET ?
             """, (index,))).fetchone()
         if not row:
@@ -1424,7 +1424,7 @@ class Database:
                        c.share_key AS share_key
                 FROM categories c
                 WHERE (CAST(? AS TEXT) IS NULL OR c.name=CAST(? AS TEXT))
-                ORDER BY c.updated_at DESC, c.created_at DESC, lower(c.name)
+                ORDER BY c.created_at DESC
             """, (category, category))).fetchall()
 
     async def rename_category(self, old_name: str, new_name: str) -> bool:
