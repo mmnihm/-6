@@ -12,7 +12,7 @@ from pyrogram import Client, filters
 from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio,
-    KeyboardButton, ReplyKeyboardMarkup,
+    KeyboardButton, ReplyKeyboardMarkup, BotCommand,
 )
 from pyrogram.enums import ChatMemberStatus, ChatType
 from pyrogram.errors import (
@@ -4190,6 +4190,12 @@ async def main():
 
         await app.start()
         app_started = True
+        # Publish the Telegram chat command menu for all users.
+        # /admin remains protected by the existing is_admin() check.
+        await app.set_bot_commands([
+            BotCommand("start", "开始使用机器人"),
+            BotCommand("admin", "打开管理后台"),
+        ])
         telegram_http_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=12, connect=5, sock_read=10)
         )
