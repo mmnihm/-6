@@ -440,6 +440,56 @@ def folder_share_url(share_key: str) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=folder_{share_key}"
 
 
+async def notify_folder_subscribers(client, category, event="new_folder"):
+    """Send opt-in folder/resource notifications without interrupting publishing."""
+    try:
+        subscribers = await db.list_notification_subscribers()
+        if not subscribers:
+            return {"sent": 0, "failed": 0}
+        rows = await db.list_categories(category=str(category))
+        if not rows or not rows[0].get("share_key"):
+            log.warning("Skip subscriber notification: folder link unavailable for %s", category)
+            return {"sent": 0, "failed": len(subscribers)}
+        row = rows[0]
+        link = folder_share_url(str(row["share_key"]))
+        if event == "new_folder":
+            body = (
+                "📁 新文件夹上线\n\n"
+                f"目录：{row['category']}\n"
+                "新目录已经开放，点击下方按钮查看。"
+            )
+            button_text = "📂 查看新文件夹"
+        else:
+            body = (
+                "🔔 文件夹有新资源\n\n"
+                f"目录：{row['category']}\n"
+                "管理员已发布新资源，点击下方按钮进入目录。"
+            )
+            button_text = "📂 查看新资源"
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton(button_text, url=link)]
+        ])
+        sent = failed = 0
+        for subscriber_id in subscribers:
+            try:
+                await client.send_message(
+                    int(subscriber_id), body, reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+                sent += 1
+            except Exception as exc:
+                failed += 1
+                log.info("Folder notification failed for user %s: %s", subscriber_id, exc)
+        log.info(
+            "Folder notification finished: category=%s event=%s sent=%s failed=%s",
+            category, event, sent, failed,
+        )
+        return {"sent": sent, "failed": failed}
+    except Exception:
+        log.exception("Could not notify subscribers for folder %s", category)
+        return {"sent": 0, "failed": 0}
+
+
 def format_folder_size(value):
     size = max(0, int(value or 0))
     if size <= 0:
@@ -2094,6 +2144,10 @@ async def scanner_login_input_handler(client, message):
                     reply_markup=upload_active_keyboard(),
                 )
                 return
+            if result.get("category") and int(result.get("published", 0)) > 0:
+                await notify_folder_subscribers(client, result["category"], "new_resources")
+            if result.get("category") and int(result.get("published", 0)) > 0:
+                await notify_folder_subscribers(client, result["category"], "new_resources")
             upload_received_counts.pop(uid, None)
             upload_progress_state.pop(uid, None)
             pending_upload_categories.pop(uid, None)
@@ -2228,9 +2282,11 @@ async def scanner_login_input_handler(client, message):
                 await message.reply_text("❌ 文件夹名称不能为空，请重新发送名称。")
                 return
             active_batch = await db.get_upload_batch(user.id)
-            await db.save_category(new_category)
+            created_new = await db.save_category(new_category)
             category_catalog_cache["expires_at"] = 0
             pending_category_actions.pop(user.id, None)
+            if created_new:
+                await notify_folder_subscribers(client, new_category, "new_folder")
             if active_batch:
                 await message.reply_text(
                     f"✅ 已创建目录：{new_category}\n"
