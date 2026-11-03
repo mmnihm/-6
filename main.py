@@ -2133,6 +2133,7 @@ async def scanner_login_input_handler(client, message):
                 )
             else:
                 pending_upload_categories[user.id] = new_category
+                await db.start_upload_batch(user.id, new_category)
                 upload_received_counts[int(user.id)] = 0
                 await message.reply_text(
                     f"✅ 已创建目录：{new_category}\n"
@@ -3538,6 +3539,9 @@ async def admin_callback_handler(client, query):
             return
         pending_upload_categories[user.id] = str(row["category"])
         if not active_batch:
+            # Persist the selected directory before any file arrives. This keeps
+            # uploads in staged mode even if the bot restarts mid-session.
+            await db.start_upload_batch(user.id, str(row["category"]))
             upload_received_counts[int(user.id)] = 0
         await message.edit_text(
             f"📤 已选择上传目录：{row['category']}\n\n"
