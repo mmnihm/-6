@@ -1341,6 +1341,9 @@ class Database:
         now = iso_now()
         created = str(created_at or now)
         async with self.connect() as db:
+            existing = await (await db.execute(
+                "SELECT 1 FROM categories WHERE name=?", (name,)
+            )).fetchone()
             share_key = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]
             await db.execute(
                 "INSERT INTO categories(name, created_at, description, updated_at, share_key) "
@@ -1354,6 +1357,7 @@ class Database:
                 (name, created, str(description or "")[:1000], now, share_key),
             )
             await db.commit()
+            return existing is None
 
     async def refresh_category_stats(self, categories):
         """Refresh summaries for a set of changed folders in one database transaction."""
