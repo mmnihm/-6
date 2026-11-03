@@ -3145,12 +3145,13 @@ async def user_catalog_callback_handler(client, query):
             for index, row in enumerate(selected)
         ]
         for chunk_start in range(0, len(selected), 5):
+            chunk = selected[chunk_start:chunk_start + 5]
             rows.append([
                 InlineKeyboardButton(
                     str(index + 1),
                     callback_data=f"uc:folderstats:{row['share_key']}:{page}",
                 )
-                for index in range(chunk_start, min(chunk_start + 5, len(selected)))
+                for index, row in enumerate(chunk, start=chunk_start + 1)
             ])
         nav = []
         if page > 0:
@@ -3191,10 +3192,11 @@ async def user_catalog_callback_handler(client, query):
             for index, row in enumerate(selected)
         ]
         for chunk_start in range(0, len(selected), 5):
+            chunk = selected[chunk_start:chunk_start + 5]
             copy_rows.append([{
                 "text": str(index + 1),
                 "callback_data": f"uc:folderstats:{row['share_key']}:{page}",
-            } for index in range(chunk_start, min(chunk_start + 5, len(selected)))])
+            } for index, row in enumerate(chunk, start=chunk_start + 1)])
         nav_buttons = []
         if page > 0:
             nav_buttons.append({"text": "⬅️ 上一页", "callback_data": f"uc:folders:{page - 1}"})
