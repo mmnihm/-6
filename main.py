@@ -1396,10 +1396,14 @@ async def _flush_album_upload(client, key):
         log.exception("Grouped album upload failed for user %s", user.id)
         if status is not None:
             try:
-                await status.edit_text(
-                    f"❌ 相册处理异常：{type(exc).__name__}: {str(exc)[:300]}\n"
-                    f"已成功保存：{saved} 个；失败：{failed} 个"
-                )
+                if "相册中存在已入库的重复文件" in str(exc):
+                    await status.edit_text(
+                        "⚠️ 这组相册包含已保存的文件，本次未重复入库。请检查后再上传。"
+                    )
+                else:
+                    await status.edit_text(
+                        "❌ 相册处理失败，本组未能完整入库。请稍后重试或联系管理员。"
+                    )
             except Exception:
                 log.exception("Could not report album upload failure")
 
