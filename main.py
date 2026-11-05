@@ -54,6 +54,8 @@ pending_home_button_actions = {}
 pending_admin_actions = {}
 directory_import_running = False
 cangku_backup_in_progress = set()
+backup_retry_manual_requested = False
+backup_worker_running = False
 last_user_activity = 0.0
 category_delivery_in_progress = set()
 search_sessions = {}
@@ -217,6 +219,7 @@ async def admin_home_text():
 def admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🗄 双频道存储", callback_data="mc:storage")],
+        [InlineKeyboardButton("📦 自动备份管理", callback_data="mc:backup")],
         [InlineKeyboardButton("👥 绑定会员群", callback_data="mc:bindgroup")],
         [InlineKeyboardButton("👤 会员管理", callback_data="mc:members"), InlineKeyboardButton("📂 文件管理", callback_data="mc:files")],
         [InlineKeyboardButton("📁 目录管理", callback_data="mc:directories")],
@@ -1794,9 +1797,13 @@ async def directory_import_confirm_handler(client, message):
 
 async def backup_retry_worker(client):
     """Resume durable backup jobs and gradually queue old Cangku singles only while idle."""
-    global last_user_activity
+    global last_user_activity, backup_retry_manual_requested
     while True:
         try:
+            if await db.get_setting("backup_retry_enabled") == "0":
+                await asyncio.sleep(5)
+                continue
+            manual_requested = bool(backup_retry_manual_requested)
             loop = asyncio.get_running_loop()
             busy = (
                 directory_import_running
@@ -1807,11 +1814,13 @@ async def backup_retry_worker(client):
                 or bool(pending_album_uploads)
                 or any(tasks for tasks in pending_upload_tasks.values())
                 or upload_copy_semaphore._value < 2
-                or loop.time() - float(last_user_activity or 0) < 30
+                or (not manual_requested and loop.time() - float(last_user_activity or 0) < 30)
             )
             if busy:
                 await asyncio.sleep(5)
                 continue
+            if manual_requested:
+                backup_retry_manual_requested = False
 
             # Discover a few metadata-only Cangku records at a time. The
             # existing PostgreSQL retry table makes the queue restart-safe.
@@ -1845,7 +1854,10 @@ async def backup_retry_worker(client):
                     or bool(category_delivery_in_progress)
                     or bool(upload_finish_in_progress)
                     or any(tasks for tasks in pending_upload_tasks.values())
-                    or loop.time() - float(last_user_activity or 0) < 30
+                    or (
+                        not manual_requested
+                        and loop.time() - float(last_user_activity or 0) < 30
+                    )
                 ):
                     break
                 file_key = str(pending_job["file_key"])
@@ -1857,12 +1869,15 @@ async def backup_retry_worker(client):
                     if not record or int(record["backup_message_id"] or 0) > 0:
                         await db.complete_backup_retry(file_key)
                         continue
-                    copied = await client.copy_message(
-                        chat_id=int(job["backup_channel_id"]),
-                        from_chat_id=int(job["primary_channel_id"]),
-                        message_id=int(job["primary_message_id"]),
-                    )
-                    updated = await db.update_backup_message_id(file_key, copied.id)
+                    # Use Bot API copyMessage: unlike Pyrogram it does not need
+                    # a locally cached Peer/access_hash for private channel IDs.
+                    copied = await telegram_bot_api("copyMessage", {
+                        "chat_id": int(job["backup_channel_id"]),
+                        "from_chat_id": int(job["primary_channel_id"]),
+                        "message_id": int(job["primary_message_id"]),
+                    })
+                    copied_message_id = int(copied["message_id"])
+                    updated = await db.update_backup_message_id(file_key, copied_message_id)
                     if not updated:
                         latest = await db.get_file(file_key)
                         if not latest or int(latest["backup_message_id"] or 0) <= 0:
@@ -1870,7 +1885,7 @@ async def backup_retry_worker(client):
                     await db.complete_backup_retry(file_key)
                     log.info(
                         "Idle/durable backup completed for file %s (message %s)",
-                        file_key, copied.id,
+                        file_key, copied_message_id,
                     )
                 except Exception as exc:
                     await db.fail_backup_retry(file_key, f"{type(exc).__name__}: {str(exc)[:400]}")
@@ -3778,6 +3793,36 @@ async def user_catalog_callback_handler(client, query):
         return
 
 
+async def render_backup_admin(message, notice=""):
+    enabled = await db.get_setting("backup_retry_enabled") != "0"
+    counts = await db.backup_retry_stats()
+    _, backup_channel_id = await get_storage_channels()
+    state = "🟢 自动运行已开启" if enabled else "⏸ 自动备份已暂停"
+    worker = "运行中" if backup_worker_running else "尚未启动"
+    body = (
+        "📦 自动备份管理\\n\\n"
+        f"状态：{state}\\n"
+        f"后台任务：{worker}\\n"
+        f"备用频道：{backup_channel_id or '未绑定'}\\n\\n"
+        f"已备份 Cangku 单文件：{counts['backed']} 个\\n"
+        f"待发现资源：{counts['candidates']} 个\\n"
+        f"待处理任务：{counts['queued']} 个\\n"
+        f"失败待重试：{counts['failed']} 个"
+    )
+    if notice:
+        body = notice + "\\n\\n" + body
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("▶️ 开启自动备份", callback_data="mc:backupenable"),
+            InlineKeyboardButton("⏸ 暂停", callback_data="mc:backuppause"),
+        ],
+        [InlineKeyboardButton("⚡ 立即执行一轮", callback_data="mc:backuprun")],
+        [InlineKeyboardButton("🔄 刷新状态", callback_data="mc:backuprefresh")],
+        [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+    ])
+    await message.edit_text(body, reply_markup=keyboard)
+
+
 @app.on_callback_query(filters.regex(r"^mc:"))
 async def admin_callback_handler(client, query):
     user = query.from_user
@@ -3879,7 +3924,26 @@ async def admin_callback_handler(client, query):
         finally:
             upload_finish_in_progress.discard(uid)
         return
-    if action == "home":
+    if action == "backup":
+        await render_backup_admin(message)
+    elif action in ("backuprefresh", "backupenable", "backuppause", "backuprun"):
+        global backup_retry_manual_requested, last_user_activity
+        if action == "backupenable":
+            await db.set_setting("backup_retry_enabled", "1")
+            notice = "✅ 已开启自动备份。"
+        elif action == "backuppause":
+            await db.set_setting("backup_retry_enabled", "0")
+            backup_retry_manual_requested = False
+            notice = "⏸ 已暂停自动备份；已保存的任务不会删除。"
+        elif action == "backuprun":
+            await db.set_setting("backup_retry_enabled", "1")
+            backup_retry_manual_requested = True
+            last_user_activity = asyncio.get_running_loop().time() - 31
+            notice = "⚡ 已提交立即执行请求；正在进行的上传、扫描和会员发送会优先完成。"
+        else:
+            notice = ""
+        await render_backup_admin(message, notice)
+    elif action == "home":
         users, files, members, banned = await db.stats()
         group_id = await get_member_group_id()
         primary, backup = await get_storage_channels()
@@ -4668,7 +4732,7 @@ async def broadcast_handler(client, message):
 
 
 async def main():
-    global BOT_USERNAME, BOT_ID, telegram_http_session, scanner, last_user_activity
+    global BOT_USERNAME, BOT_ID, telegram_http_session, scanner, last_user_activity, backup_worker_running
     scanner_started = False
     app_started = False
     runner = None
@@ -4721,6 +4785,7 @@ async def main():
         log.info("Bot started: @%s", me.username)
 
         backup_retry_task = asyncio.create_task(backup_retry_worker(app))
+        backup_worker_running = True
         log.info("Durable backup retry worker started")
 
         runner = web.AppRunner(create_catalog_app(db, lambda: BOT_USERNAME))
@@ -4733,6 +4798,7 @@ async def main():
     finally:
         # Each resource is closed independently so one cleanup failure cannot
         # prevent the PostgreSQL pool from being closed.
+        backup_worker_running = False
         if backup_retry_task is not None:
             backup_retry_task.cancel()
             try:
