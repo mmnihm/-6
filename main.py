@@ -2337,18 +2337,30 @@ async def backup_retry_worker(client):
                             await db.complete_backup_retry(file_key)
                             continue
 
-                        copied = await telegram_bot_api("forwardMessages", {
-                            "chat_id": backup_chat_id,
-                            "from_chat_id": source_chat_id,
-                            "message_ids": source_message_ids,
-                        })
+                        # The scanner user account can read the primary channel;
+                        # the bot account may not be a member and would get
+                        # Bot API 400 "chat not found". Forward albums with the
+                        # same authorized scanner account used for history scans.
+                        if scanner is None or not scanner.is_connected:
+                            raise RuntimeError(
+                                "Scanner account is not connected; cannot forward source album"
+                            )
+                        copied = await scanner_api_call(
+                            scanner.forward_messages,
+                            chat_id=backup_chat_id,
+                            from_chat_id=source_chat_id,
+                            message_ids=source_message_ids,
+                        )
                         if not isinstance(copied, list) or len(copied) != len(source_message_ids):
                             raise RuntimeError(
                                 f"Complete album forward returned "
                                 f"{len(copied) if isinstance(copied, list) else 0} "
                                 f"messages for {len(source_message_ids)} source items"
                             )
-                        copied_ids = [int(item["message_id"]) for item in copied]
+                        copied_ids = [
+                            int(item.id if hasattr(item, "id") else item["message_id"])
+                            for item in copied
+                        ]
 
                         # Remove old standalone/partial copies only after the complete
                         # album has been forwarded successfully. A delete failure is
