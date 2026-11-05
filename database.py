@@ -1234,7 +1234,7 @@ class Database:
                          AND SUM(CASE WHEN grouped.source_fingerprint LIKE 'cangku:%'
                                       THEN 1 ELSE 0 END)=COUNT(*)
                          AND SUM(CASE WHEN COALESCE(grouped.backup_message_id, 0)=0
-                                      THEN 1 ELSE 0 END)=COUNT(*)
+                                      THEN 1 ELSE 0 END)>0
                          AND NOT EXISTS (
                              SELECT 1 FROM backup_retry_jobs jobs
                              JOIN files queued ON queued.file_key=jobs.file_key
