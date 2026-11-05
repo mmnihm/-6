@@ -4668,7 +4668,7 @@ async def broadcast_handler(client, message):
 
 
 async def main():
-    global BOT_USERNAME, BOT_ID, telegram_http_session, scanner
+    global BOT_USERNAME, BOT_ID, telegram_http_session, scanner, last_user_activity
     scanner_started = False
     app_started = False
     runner = None
