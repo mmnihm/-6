@@ -2101,15 +2101,18 @@ async def backup_retry_worker(client):
                         source_fingerprint = str(latest["source_fingerprint"] or "") if latest else ""
                         album_group_id = str(latest["album_group_id"] or "") if latest else ""
                         source_ids = []
+                        source_chat_id = int(job["primary_channel_id"])
                         if album_group_id.startswith("cangku:"):
                             failed_album_rows = await db.get_cangku_album_backup_group(album_group_id)
                             for album_row in failed_album_rows:
                                 parts = str(album_row["source_fingerprint"] or "").split(":", 2)
                                 if len(parts) == 3 and parts[0] == "cangku":
+                                    source_chat_id = int(parts[1])
                                     source_ids.append(int(parts[2]))
                         if not source_ids:
                             parts = source_fingerprint.split(":", 2)
                             if len(parts) == 3 and parts[0] == "cangku":
+                                source_chat_id = int(parts[1])
                                 source_ids = [int(parts[2])]
                         if not source_ids:
                             source_ids = [int(job["primary_message_id"])]
