@@ -277,15 +277,15 @@ async def get_member_group_id():
     return int(value) if value else None
 
 async def telegram_bot_api(method: str, payload: dict, timeout=None):
-    """Call Telegram Bot API directly, retrying rate-limited media copies safely."""
+    """Call Telegram Bot API directly, retrying rate-limited media transfers safely."""
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/{method}"
     session = telegram_http_session
     if session is None or session.closed:
         raise RuntimeError("Telegram HTTP session is not initialized")
 
-    # Telegram explicitly tells us when a 429 may be retried. Only retry copy
-    # operations used by file uploads; leave all other API behavior unchanged.
-    retry_copy = method in ("copyMessage", "copyMessages")
+    # Telegram explicitly tells us when a 429 may be retried. Retry both copy
+    # and forward operations so backup jobs survive rate limits.
+    retry_copy = method in ("copyMessage", "copyMessages", "forwardMessage", "forwardMessages")
     max_attempts = 6 if retry_copy else 1
     for attempt in range(max_attempts):
         try:
