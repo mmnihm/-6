@@ -883,6 +883,20 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
         raise
     except Exception as exc:
         error_detail = f"{type(exc).__name__}: {exc}"
+        # Revisit the message that raised the error on the next /scan.
+        # The file row may already have been saved before a later album-metadata
+        # update failed, so retrying this one message is intentionally idempotent.
+        if current_message_id is not None:
+            try:
+                await db.advance_scan_cursor(
+                    primary_channel_id, int(current_message_id) + 1
+                )
+                log.warning(
+                    "Scan checkpoint rewound to retry failed message %s",
+                    current_message_id,
+                )
+            except Exception:
+                log.exception("Could not rewind scan checkpoint after failure")
         log.exception(
             "Primary history scan failed: channel=%s message_id=%s offset_id=%s error=%s",
             primary_channel_id, current_message_id, current_offset_id, error_detail,
