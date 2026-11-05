@@ -4123,7 +4123,7 @@ async def user_catalog_callback_handler(client, query):
         return
 
 
-async async def render_backup_admin(message, notice=""):
+async def render_backup_admin(message, notice=""):
     enabled = await db.get_setting("backup_retry_enabled") != "0"
     counts = await db.backup_retry_stats()
     _, backup_channel_id = await get_storage_channels()
