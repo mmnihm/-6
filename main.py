@@ -1793,9 +1793,9 @@ async def directory_export_upload_handler(client, message):
                 "album_group_id": None,
                 "album_position": 0,
             })
-        # Preserve every known mediaGroupId. Complete consecutive 2-10 item
-        # albums are backup-eligible; incomplete groups are explicitly marked
-        # so neither the backup worker nor delivery path silently splits them.
+        # Preserve every known mediaGroupId. Telegram album members may have
+        # non-consecutive message IDs; group identity and member count determine
+        # eligibility, while the actual IDs are passed together to copyMessages.
         album_members = {}
         for resource in clean_resources:
             group_id = resource["media_group_id"]
@@ -1805,10 +1805,7 @@ async def directory_export_upload_handler(client, message):
         for group_key, members in album_members.items():
             members.sort(key=lambda row: int(row["message_id"]))
             message_ids = [int(row["message_id"]) for row in members]
-            complete_album = 2 <= len(members) <= 10 and all(
-                message_ids[index] == message_ids[0] + index
-                for index in range(len(message_ids))
-            )
+            complete_album = 2 <= len(members) <= 10 and len(set(message_ids)) == len(message_ids)
             prefix = "cangku:" if complete_album else "cangku-incomplete:"
             album_group_id = f"{prefix}{group_key}"
             for position, resource in enumerate(members):
@@ -1990,8 +1987,8 @@ async def discover_cangku_album_metadata(candidate):
             raise RuntimeError("Telegram did not return a complete, consistent source album")
         group = sorted(group, key=lambda item: int(item.id))
         ids = [int(item.id) for item in group]
-        if any(ids[i] != ids[0] + i for i in range(len(ids))):
-            raise RuntimeError("Source album message IDs are not consecutive")
+        if len(set(ids)) != len(ids):
+            raise RuntimeError("Telegram returned duplicate source album message IDs")
         # Repair incomplete legacy indexes from the Telegram-confirmed source album.
         # A missing imported row must not make every member of a real album permanently
         # unbackable. Insert only missing source fingerprints; existing file keys,
