@@ -1964,7 +1964,22 @@ async def backup_retry_worker(client):
                     if not record or int(record["backup_message_id"] or 0) > 0:
                         await db.complete_backup_retry(file_key)
                         continue
+                    source_fingerprint = str(record["source_fingerprint"] or "")
                     album_group_id = str(record["album_group_id"] or "")
+                    if source_fingerprint.startswith("cangku:") and not album_group_id:
+                        if scanner is None or not scanner.is_connected:
+                            raise RuntimeError(
+                                "Scanner login is required to verify whether this Cangku source is an album; refusing single-file backup"
+                            )
+                        await discover_cangku_album_metadata({
+                            "source_fingerprint": source_fingerprint
+                        })
+                        record = await db.get_file(file_key)
+                        if not record:
+                            raise RuntimeError("Cangku source index disappeared during album verification")
+                        album_group_id = str(record["album_group_id"] or "")
+                        if not album_group_id:
+                            raise RuntimeError("Cangku source album verification did not complete")
                     if album_group_id.startswith("cangku-incomplete:"):
                         raise RuntimeError(
                             "Cangku album metadata is incomplete; refusing to back it up as separate files"
