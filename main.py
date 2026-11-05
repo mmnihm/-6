@@ -241,6 +241,27 @@ async def get_storage_channels():
     backup = await db.get_setting("storage_backup_channel_id")
     return (int(primary) if primary else None, int(backup) if backup else None)
 
+async def validate_storage_chat(chat_id, role):
+    """Validate a configured Telegram storage destination without changing stored data."""
+    chat = await telegram_bot_api("getChat", {"chat_id": int(chat_id)})
+    chat_type = chat.get("type")
+    if role == "primary" and chat_type != "channel":
+        raise ValueError("主存储必须使用频道，不能使用群组。")
+    if role == "backup" and chat_type not in ("channel", "group", "supergroup"):
+        raise ValueError("备用存储只支持频道或群组。")
+
+    me = await telegram_bot_api("getMe", {})
+    bot_id = int(me["id"])
+    member = await telegram_bot_api("getChatMember", {
+        "chat_id": int(chat_id), "user_id": bot_id,
+    })
+    status = member.get("status")
+    if status not in ("administrator", "creator"):
+        raise ValueError("机器人必须先加入目标并设为管理员。")
+    if chat_type == "channel" and status == "administrator" and not member.get("can_post_messages", False):
+        raise ValueError("机器人在频道中没有“发布消息”权限。")
+    return chat
+
 
 async def get_member_group_id():
     value = await db.get_setting("member_group_id")
@@ -1284,14 +1305,8 @@ async def _flush_album_upload(client, key):
         if not BOT_ID:
             me = await client.get_me()
             globals()["BOT_ID"] = me.id
-        for label, channel_id in (("主频道", primary_channel_id), ("备份频道", backup_channel_id)):
-            member = await telegram_bot_api("getChatMember", {
-                "chat_id": channel_id, "user_id": BOT_ID,
-            })
-            if member.get("status") not in ("administrator", "creator"):
-                raise RuntimeError(f"{label}中机器人不是管理员")
-            if member.get("status") == "administrator" and not member.get("can_post_messages", False):
-                raise RuntimeError(f"{label}中机器人没有发布消息权限")
+        await validate_storage_chat(primary_channel_id, "primary")
+        await validate_storage_chat(backup_channel_id, "backup")
 
         album_group_id = secrets.token_urlsafe(12)
         # Copy the Telegram album as one operation. copyMessages preserves the
@@ -1785,16 +1800,8 @@ async def _upload_single_handler(client, message):
         bot_id = BOT_ID
         if not bot_id:
             raise RuntimeError("机器人身份尚未初始化，请稍后重试")
-        for label, channel_id in (("主频道", primary_channel_id), ("备份频道", backup_channel_id)):
-            member = await telegram_bot_api("getChatMember", {
-                "chat_id": channel_id,
-                "user_id": bot_id,
-            })
-            member_status = member.get("status") if isinstance(member, dict) else None
-            if member_status not in ("administrator", "creator"):
-                raise RuntimeError(f"{label}中机器人不是管理员（当前状态：{member_status or '未知'}）")
-            if member_status == "administrator" and not member.get("can_post_messages", False):
-                raise RuntimeError(f"{label}中机器人没有“发布消息”权限")
+        await validate_storage_chat(primary_channel_id, "primary")
+        await validate_storage_chat(backup_channel_id, "backup")
 
         step = "保存主频道"
         primary = await telegram_bot_api("copyMessage", {
@@ -1902,43 +1909,45 @@ async def bind_channel_forward_handler(client, message):
         await message.reply_text("❌ 没识别到转发来源。请从对应的频道或会员群直接转发一条普通消息，不要复制粘贴。")
         return
     is_group_binding = setting_key == "member_group_id"
-    allowed_types = (ChatType.GROUP, ChatType.SUPERGROUP) if is_group_binding else (ChatType.CHANNEL,)
+    if is_group_binding:
+        allowed_types = (ChatType.GROUP, ChatType.SUPERGROUP)
+    elif setting_key == "storage_primary_channel_id":
+        allowed_types = (ChatType.CHANNEL,)
+    else:
+        allowed_types = (ChatType.CHANNEL, ChatType.GROUP, ChatType.SUPERGROUP)
     if source.type not in allowed_types:
-        expected = "会员群" if is_group_binding else "私有频道"
-        await message.reply_text(f"❌ 来源类型不正确，请直接转发一条{expected}消息。")
+        expected = "会员群" if is_group_binding else ("私有频道" if setting_key == "storage_primary_channel_id" else "频道或群组")
+        await message.reply_text(f"❌ 来源类型不正确，请转发{expected}中的普通消息。")
         return
 
-    me = await client.get_me()
-    try:
-        member = await client.get_chat_member(source.id, me.id)
-    except Exception:
-        await message.reply_text("❌ 机器人无法访问这个频道。请先把机器人添加为该频道管理员，再重新转发消息。")
-        return
-    valid_statuses = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER) if not is_group_binding else (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED)
-    if member.status not in valid_statuses:
-        await message.reply_text("❌ 机器人尚未加入这个群/频道，请先添加机器人后重新绑定。")
-        return
-
-    if not is_group_binding:
-        if member.status == ChatMemberStatus.ADMINISTRATOR:
-            privileges = getattr(member, "privileges", None)
-            if privileges is not None and not getattr(privileges, "can_post_messages", False):
-                await message.reply_text(
-                    "❌ 机器人虽然是频道管理员，但没有“发布消息”权限。\n"
-                    "请在频道管理权限中允许机器人发布消息后，再重新绑定。"
-                )
-                return
+    if setting_key in ("storage_primary_channel_id", "storage_backup_channel_id"):
+        try:
+            chat = await validate_storage_chat(source.id, "primary" if setting_key == "storage_primary_channel_id" else "backup")
+        except Exception as exc:
+            await message.reply_text(f"❌ 绑定验证失败：{str(exc)[:300]}")
+            return
         other_key = "storage_backup_channel_id" if setting_key == "storage_primary_channel_id" else "storage_primary_channel_id"
         other_id = await db.get_setting(other_key)
         if other_id and int(other_id) == source.id:
-            await message.reply_text("❌ 主存储频道和备份频道不能绑定为同一个频道。")
+            await message.reply_text("❌ 主存储和备用存储不能绑定为同一个群/频道。")
+            return
+    else:
+        me = await client.get_me()
+        try:
+            member = await client.get_chat_member(source.id, me.id)
+        except Exception:
+            await message.reply_text("❌ 机器人无法访问这个会员群，请先把机器人添加到群内。")
+            return
+        valid_statuses = (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED)
+        if member.status not in valid_statuses:
+            await message.reply_text("❌ 机器人尚未加入这个会员群，请先添加后重新绑定。")
             return
 
     await db.set_setting(setting_key, str(source.id))
     pending_channel_bindings.pop(user.id, None)
     labels = {
         "storage_primary_channel_id": "主存储频道",
-        "storage_backup_channel_id": "备份存储频道",
+        "storage_backup_channel_id": "备用存储（频道/群组）",
         "member_group_id": "会员群",
     }
     label = labels.get(setting_key, "目标群/频道")
@@ -1950,16 +1959,54 @@ async def bind_channel_forward_handler(client, message):
     )
 
 
+async def bind_storage_by_id(message, setting_key, raw_chat_id):
+    raw_chat_id = str(raw_chat_id or "").strip()
+    if not raw_chat_id or not raw_chat_id.lstrip("-").isdigit():
+        await message.reply_text("❌ Chat ID 格式不正确，请发送类似 -1001234567890 的数字 ID。")
+        return
+    chat_id = int(raw_chat_id)
+    if chat_id >= 0:
+        await message.reply_text("❌ 请填写 Telegram 群组/频道的负数 Chat ID（通常以 -100 开头）。")
+        return
+    if setting_key == "storage_primary_channel_id":
+        role = "primary"
+    else:
+        role = "backup"
+    try:
+        chat = await validate_storage_chat(chat_id, role)
+    except Exception as exc:
+        await message.reply_text(f"❌ 绑定验证失败：{str(exc)[:300]}\n请确认 ID 正确，并已将机器人设为管理员。")
+        return
+    other_key = "storage_backup_channel_id" if setting_key == "storage_primary_channel_id" else "storage_primary_channel_id"
+    other_id = await db.get_setting(other_key)
+    if other_id and int(other_id) == chat_id:
+        await message.reply_text("❌ 主存储和备用存储不能是同一个群/频道。")
+        return
+    await db.set_setting(setting_key, str(chat_id))
+    pending_channel_bindings.pop(message.from_user.id, None)
+    label = "主存储频道" if role == "primary" else "备用存储"
+    await message.reply_text(
+        f"✅ {label}绑定成功！\n名称：{chat.get('title') or '未命名'}\n"
+        f"类型：{chat.get('type')}\nChat ID：{chat_id}\n\n"
+        "可发送 /storage 查看绑定状态。"
+    )
+
+
 @app.on_message(filters.private & filters.command("bindmain"))
 async def bind_main_channel_handler(client, message):
     user = message.from_user
     if not user or not await is_admin(user.id):
         await reply_admin_only(message)
         return
+    args = message.command[1:] if len(message.command) > 1 else []
+    if args:
+        await bind_storage_by_id(message, "storage_primary_channel_id", args[0])
+        return
     pending_channel_bindings[user.id] = "storage_primary_channel_id"
     await message.reply_text(
-        "📥 请把主存储私有频道中的任意一条消息，直接转发到这里。\n"
-        "要求：机器人必须已经是该频道管理员。"
+        "📥 绑定主存储频道：\n"
+        "直接发送频道 Chat ID（例如 -1001234567890），或把频道普通消息转发给我。\n"
+        "机器人必须是该频道管理员并拥有发布消息权限。"
     )
 
 
@@ -1969,11 +2016,27 @@ async def bind_backup_channel_handler(client, message):
     if not user or not await is_admin(user.id):
         await reply_admin_only(message)
         return
+    args = message.command[1:] if len(message.command) > 1 else []
+    if args:
+        await bind_storage_by_id(message, "storage_backup_channel_id", args[0])
+        return
     pending_channel_bindings[user.id] = "storage_backup_channel_id"
     await message.reply_text(
-        "📥 请把备份存储私有频道中的任意一条消息，直接转发到这里。\n"
-        "要求：机器人必须已经是该频道管理员。"
+        "📥 绑定备用存储：\n"
+        "发送频道或群组 Chat ID（例如 -1001234567890），也可以直接转发其中一条普通消息。\n"
+        "机器人必须先加入目标并设为管理员。"
     )
+
+
+@app.on_message(filters.private & filters.text & ~filters.forwarded & pending_binding_filter)
+async def bind_storage_id_text_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        return
+    setting_key = pending_channel_bindings.get(user.id)
+    if setting_key not in ("storage_primary_channel_id", "storage_backup_channel_id"):
+        return
+    await bind_storage_by_id(message, setting_key, message.text)
 
 
 @app.on_message(filters.private & filters.command("bindgroup"))
@@ -3678,11 +3741,11 @@ async def admin_callback_handler(client, query):
     elif action in ("bindgroup", "bindmain", "bindbackup"):
         setting = {"bindgroup": "member_group_id", "bindmain": "storage_primary_channel_id", "bindbackup": "storage_backup_channel_id"}[action]
         pending_channel_bindings[user.id] = setting
-        label = {"bindgroup": "会员群", "bindmain": "主存储私有频道", "bindbackup": "备份私有频道"}[action]
+        label = {"bindgroup": "会员群", "bindmain": "主存储私有频道", "bindbackup": "备用存储频道或群组"}[action]
         await message.edit_text(
             f"📨 请把{label}中的任意一条普通消息直接转发给机器人。\n\n"
             "会员群：推荐直接在会员群内发送 /bindgroup，无需转发。\n"
-            "存储频道：仍可直接转发一条频道消息；机器人需要是频道管理员。",
+            "主存储：仅支持频道；备用存储：支持频道或群组。也可以直接发送 Chat ID（-100...）；机器人必须是目标管理员。",
             reply_markup=back_keyboard(),
         )
     elif action == "members":
@@ -4152,7 +4215,7 @@ async def admin_callback_handler(client, query):
     elif action == "commands":
         await message.edit_text(
             "📖 管理命令速查\n\n管理员名单：打开 /admin → 管理员管理（仅超级管理员）\n\n"
-            "/bindgroup — 绑定会员群\n/membercheck [用户ID] — 检查会员群和成员权限\n/bindmain — 绑定主存储频道\n/bindbackup — 绑定备份频道\n/storage — 查看绑定状态\n"
+            "/bindgroup — 绑定会员群\n/membercheck [用户ID] — 检查会员群和成员权限\n/bindmain [Chat ID] — 绑定主存储频道\n/bindbackup [Chat ID] — 绑定备用频道或群组\n/storage — 查看绑定状态\n"
             "/grant 用户ID 天数|永久 — 授权会员\n/revoke 用户ID — 取消授权\n/ban 用户ID 原因 — 封禁\n/unban 用户ID — 解封\n"
             "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scancheck — 检查主存储频道访问和历史读取权限\n/catalogreset — 预览清理旧资源索引\n/catalogresetconfirm — 确认清理资源索引（保留用户会员设置）\n/scan — 只扫描主存储频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
             reply_markup=back_keyboard(),
