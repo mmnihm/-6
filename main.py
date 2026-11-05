@@ -681,12 +681,12 @@ def folder_detail_keyboard(category_row, page, has_next, is_favorite):
 
 def parse_category(message) -> str:
     caption = (message.caption or "").strip()
-    # Only Chinese-only hashtags become automatic directory names.
+    # Manual uploads retain the existing explicit category behavior.
     for token in caption.split():
         if token.startswith("#"):
             category = token[1:].strip("，,。.!！?？:：;；()（）[]【】{}")
             if category and all(
-                "\u3400" <= char <= "\u4dbf" or "\u4e00" <= char <= "\u9fff"
+                "\\u3400" <= char <= "\\u4dbf" or "\\u4e00" <= char <= "\\u9fff"
                 for char in category
             ):
                 return category[:40]
@@ -696,35 +696,30 @@ def parse_category(message) -> str:
     return "未分类"
 
 
+def parse_chinese_album_category(messages) -> str:
+    """Return a directory only when a complete album contains a Chinese-only hashtag."""
+    for message in messages:
+        caption = (getattr(message, "caption", None) or "").strip()
+        for token in caption.split():
+            if not token.startswith("#"):
+                continue
+            category = token[1:].strip("，,。.!！?？:：;；()（）[]【】{}")
+            if category and all(
+                "\\u3400" <= char <= "\\u4dbf" or "\\u4e00" <= char <= "\\u9fff"
+                for char in category
+            ):
+                return category[:40]
+    return ""
+
+
 def guess_category(message, media_type, file_name):
-    explicit = parse_category(message)
-    if explicit != "未分类":
-        return explicit
-    name = (file_name or "").lower()
-    rules = (
-        ("电视剧", ("电视剧", "连续剧", "season", "episode", "第", "集")),
-        ("动漫", ("动漫", "动画", "番剧", "anime")),
-        ("电影", ("电影", "movie", "bluray", "web-dl")),
-        ("综艺", ("综艺", "真人秀", "variety")),
-        ("短视频", ("短视频", "短片", "reels", "tiktok")),
-        ("音乐", ("音乐", "歌曲", "专辑", "music", "album")),
-        ("教程", ("教程", "课程", "教学", "course", "lesson")),
-    )
-    for category, keywords in rules:
-        if any(word in name for word in keywords):
-            return category
-    return {
-        "video": "视频",
-        "photo": "图片",
-        "animation": "动图",
-        "audio": "音频",
-        "voice": "语音",
-        "document": "文档",
-    }.get(media_type, "其他")
+    # Kept for compatibility with any existing callers; automatic scanning
+    # no longer guesses categories from filenames or media types.
+    return parse_category(message)
 
 
 async def run_history_scan(primary_channel_id, backup_channel_id=None):
-    """Index the primary storage channel only. Backup channel is not scanned."""
+    """Index source messages while creating directories only for tagged albums."""
     global scan_task
     try:
         progress = await db.get_scan_progress(primary_channel_id)
@@ -736,24 +731,63 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                 "Primary history scan started: channel=%s title=%s offset=%s",
                 resolved_channel_id, getattr(chat, "title", ""), offset_id
             )
+            processed_album_ids = set()
             async for item in scanner.get_chat_history(
                 resolved_channel_id, offset_id=offset_id
             ):
-                media_type, file_name, fingerprint = media_details(item)
-                created_at = (
-                    item.date.isoformat() if getattr(item, "date", None)
-                    else datetime.now(timezone.utc).isoformat()
-                )
-                if media_type and fingerprint:
-                    category = guess_category(item, media_type, file_name)
-                    await db.save_scanned_message(
-                        primary_channel_id, None, primary_channel_id,
-                        item.id, fingerprint, file_name, media_type, category,
-                        created_at, config.ADMIN_ID,
-                        secrets.token_urlsafe(9).replace("-", "").replace("_", ""),
+                group_id = getattr(item, "media_group_id", None)
+                messages = [item]
+                if group_id:
+                    group_key = str(group_id)
+                    if group_key in processed_album_ids:
+                        continue
+                    processed_album_ids.add(group_key)
+                    try:
+                        fetched = await scanner.get_media_group(
+                            chat_id=resolved_channel_id,
+                            message_id=int(item.id),
+                        )
+                        if (
+                            fetched and 2 <= len(fetched) <= 10
+                            and all(
+                                str(getattr(member, "media_group_id", "")) == group_key
+                                for member in fetched
+                            )
+                        ):
+                            messages = sorted(fetched, key=lambda member: int(member.id), reverse=True)
+                        else:
+                            log.warning(
+                                "History scan could not verify complete album: channel=%s group=%s",
+                                resolved_channel_id, group_key,
+                            )
+                    except Exception:
+                        log.exception(
+                            "History scan album verification failed: channel=%s group=%s",
+                            resolved_channel_id, group_key,
+                        )
+
+                # Only a Telegram-confirmed album can receive a directory.
+                is_album = len(messages) >= 2 and bool(group_id)
+                category = parse_chinese_album_category(messages) if is_album else ""
+                album_key = f"source:{resolved_channel_id}:{group_id}" if is_album else None
+
+                for position, member in enumerate(messages):
+                    media_type, file_name, fingerprint = media_details(member)
+                    created_at = (
+                        member.date.isoformat() if getattr(member, "date", None)
+                        else datetime.now(timezone.utc).isoformat()
                     )
-                else:
-                    await db.advance_scan_cursor(primary_channel_id, item.id)
+                    if media_type and fingerprint:
+                        await db.save_scanned_message(
+                            primary_channel_id, None, primary_channel_id,
+                            member.id, fingerprint, file_name, media_type, category,
+                            created_at, config.ADMIN_ID,
+                            secrets.token_urlsafe(9).replace("-", "").replace("_", ""),
+                            album_group_id=album_key,
+                            album_position=position if is_album else 0,
+                        )
+                    else:
+                        await db.advance_scan_cursor(primary_channel_id, member.id)
             await db.mark_scan_completed(primary_channel_id)
 
         category_catalog_cache["expires_at"] = 0
@@ -766,7 +800,7 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
             f"主频道已检查媒体：{primary_progress['scanned_count']}\n"
             f"已建立目录：{len(categories)} 个\n"
             f"目录资源总数：{total_files} 个\n\n"
-            "本次只读取主频道并建立索引；未扫描备份频道，未下载或删除原始文件。"
+            "自动目录只从完整相册组的中文 #标签 建立；单条文件及无中文标签的相册不建立目录。"
         )
     except asyncio.CancelledError:
         await app.send_message(
@@ -784,7 +818,6 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
             log.exception("Could not notify admin about scan failure")
     finally:
         scan_task = None
-
 
 async def reply_admin_only(message):
     await message.reply_text("⛔ 仅管理员可使用此命令。")
