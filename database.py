@@ -1082,7 +1082,7 @@ class Database:
                 # Keep every file row, folder, user, and membership record intact.
                 result = await db.execute("""
                     UPDATE files
-                    SET backup_message_id=0, album_group_id=NULL, album_position=0
+                    SET backup_message_id=0
                     WHERE source_fingerprint LIKE 'cangku:%'
                 """)
                 reset_count = max(0, int(getattr(result, "rowcount", 0) or 0))
@@ -1178,7 +1178,7 @@ class Database:
                 SELECT f.file_key, f.source_fingerprint
                 FROM files f
                 WHERE COALESCE(f.backup_message_id, 0)=0
-                  AND (f.album_group_id IS NULL OR f.album_group_id LIKE 'cangku-single:%')
+                  AND (f.album_group_id IS NULL OR f.album_group_id LIKE 'cangku-single:%' OR f.album_group_id LIKE 'cangku-incomplete:%')
                   AND f.source_fingerprint LIKE 'cangku:%'
                   AND NOT EXISTS (
                       SELECT 1 FROM backup_retry_jobs j WHERE j.file_key=f.file_key
@@ -1302,7 +1302,7 @@ class Database:
             candidates = await (await db.execute("""
                 SELECT COUNT(*) AS n FROM files f
                 WHERE COALESCE(f.backup_message_id, 0)=0
-                  AND (f.album_group_id IS NULL OR f.album_group_id LIKE 'cangku-single:%')
+                  AND (f.album_group_id IS NULL OR f.album_group_id LIKE 'cangku-single:%' OR f.album_group_id LIKE 'cangku-incomplete:%')
                   AND f.source_fingerprint LIKE 'cangku:%'
                   AND NOT EXISTS (
                       SELECT 1 FROM backup_retry_jobs j WHERE j.file_key=f.file_key
