@@ -967,6 +967,69 @@ class Database:
             """, (user_id, share_key, max(0, int(next_offset)), iso_now()))
             await db.commit()
 
+    async def repair_category_delivery_progress_from_history(
+        self, user_id: int, share_key: str, category: str
+    ) -> int:
+        """One-time repair for cursors advanced by older releases after failed copies."""
+        marker = f"member_delivery_progress_repaired_v1:{int(user_id)}:{share_key}"
+        async with self.connect() as db:
+            marker_row = await (await db.execute(
+                "SELECT value FROM settings WHERE key=?", (marker,)
+            )).fetchone()
+            if marker_row:
+                current = await (await db.execute(
+                    "SELECT next_offset FROM category_delivery_progress "
+                    "WHERE user_id=? AND share_key=?",
+                    (int(user_id), str(share_key)),
+                )).fetchone()
+                return int(current["next_offset"] or 0) if current else 0
+
+            row = await (await db.execute("""
+                WITH ordered AS (
+                    SELECT f.file_key,
+                           ROW_NUMBER() OVER (
+                               ORDER BY
+                                   COALESCE(
+                                       (SELECT MAX(g.created_at) FROM files g
+                                        WHERE g.album_group_id=f.album_group_id),
+                                       f.created_at
+                                   ) DESC,
+                                   CASE WHEN f.album_group_id IS NOT NULL
+                                        THEN f.album_position ELSE 0 END,
+                                   f.file_key
+                           ) - 1 AS position
+                    FROM files f
+                    WHERE f.category=?
+                ),
+                first_missing AS (
+                    SELECT MIN(o.position) AS first_missing
+                    FROM ordered o
+                    LEFT JOIN user_history h
+                      ON h.user_id=? AND h.file_key=o.file_key
+                    WHERE h.file_key IS NULL
+                )
+                SELECT COALESCE(
+                    (SELECT first_missing FROM first_missing),
+                    (SELECT COUNT(*) FROM ordered),
+                    0
+                ) AS next_offset
+            """, (str(category), int(user_id)))).fetchone()
+            repaired = max(0, int(row["next_offset"] or 0))
+            await db.execute("""
+                INSERT INTO category_delivery_progress(user_id, share_key, next_offset, updated_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(user_id, share_key) DO UPDATE SET
+                    next_offset=excluded.next_offset,
+                    updated_at=excluded.updated_at
+            """, (int(user_id), str(share_key), repaired, iso_now()))
+            await db.execute(
+                "INSERT INTO settings(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (marker, str(repaired)),
+            )
+            await db.commit()
+            return repaired
+
     async def enqueue_backup_retry(
         self, file_key, primary_channel_id, primary_message_id,
         backup_channel_id, error=""
@@ -1543,7 +1606,8 @@ class Database:
                 FROM files WHERE category=?
                 ORDER BY COALESCE((SELECT MAX(g.created_at) FROM files g
                                    WHERE g.album_group_id=files.album_group_id), files.created_at) DESC,
-                         CASE WHEN files.album_group_id IS NOT NULL THEN files.album_position ELSE 0 END
+                         CASE WHEN files.album_group_id IS NOT NULL THEN files.album_position ELSE 0 END,
+                         files.file_key
                 LIMIT ? OFFSET ?
             """, (category, limit, offset))).fetchall()
 
@@ -1586,6 +1650,19 @@ class Database:
             else:
                 result.append(row)
         return result
+
+    async def get_user_history_keys(self, user_id, file_keys):
+        keys = list(dict.fromkeys(str(key) for key in file_keys))
+        if not keys:
+            return set()
+        placeholders = ",".join("?" for _ in keys)
+        async with self.connect() as db:
+            rows = await (await db.execute(
+                f"SELECT file_key FROM user_history "
+                f"WHERE user_id=? AND file_key IN ({placeholders})",
+                [int(user_id), *keys],
+            )).fetchall()
+            return {str(row["file_key"]) for row in rows}
 
     async def record_history(self, user_id, file_key):
         async with self.connect() as db:
