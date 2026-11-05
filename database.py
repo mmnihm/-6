@@ -806,7 +806,7 @@ class Database:
     async def save_scanned_message(
         self, channel_id, other_channel_id, primary_channel_id,
         message_id, fingerprint, file_name, media_type, category,
-        created_at, owner_id, file_key
+        created_at, owner_id, file_key, album_group_id=None, album_position=0
     ):
         async with self.connect() as db:
             await db.execute("""
@@ -846,14 +846,17 @@ class Database:
                 primary_id = primary["message_id"]
                 backup_id = backup["message_id"] if backup else 0
                 cur = await db.execute("""
-                    INSERT OR IGNORE INTO files(                        file_key, owner_id, file_name, media_type, category,
+                    INSERT OR IGNORE INTO files(
+                        file_key, owner_id, file_name, media_type, category,
                         primary_message_id, backup_message_id, created_at,
-                        source_fingerprint
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source_fingerprint, album_group_id, album_position
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     file_key, owner_id, primary["file_name"],
                     primary["media_type"], primary["category"],
-                    primary_id, backup_id, primary["created_at"], fingerprint
+                    primary_id, backup_id, primary["created_at"], fingerprint,
+                    str(album_group_id) if album_group_id else None,
+                    max(0, int(album_position or 0)),
                 ))
                 inserted = cur.rowcount == 1
                 if backup:
