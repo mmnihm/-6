@@ -250,10 +250,12 @@ async def validate_storage_chat(chat_id, role):
     if role == "backup" and chat_type not in ("channel", "group", "supergroup"):
         raise ValueError("备用存储只支持频道或群组。")
 
-    me = await telegram_bot_api("getMe", {})
-    bot_id = int(me["id"])
+    bot_id = BOT_ID
+    if not bot_id:
+        me = await telegram_bot_api("getMe", {})
+        bot_id = int(me["id"])
     member = await telegram_bot_api("getChatMember", {
-        "chat_id": int(chat_id), "user_id": bot_id,
+        "chat_id": int(chat_id), "user_id": int(bot_id),
     })
     status = member.get("status")
     if status not in ("administrator", "creator"):
