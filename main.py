@@ -1940,7 +1940,7 @@ async def discover_cangku_album_metadata(candidate):
 
 async def backup_retry_worker(client):
     """Resume durable jobs and queue Cangku singles/albums only while idle."""
-    global last_user_activity, backup_retry_manual_requested
+    global last_user_activity, backup_retry_manual_requested, scan_task
     while True:
         try:
             if await db.get_setting("backup_retry_enabled") == "0":
