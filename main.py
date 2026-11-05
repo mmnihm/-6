@@ -741,6 +741,7 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
             ):
                 group_id = getattr(item, "media_group_id", None)
                 messages = [item]
+                album_verified = False
                 if group_id:
                     group_key = str(group_id)
                     if group_key in processed_album_ids:
@@ -749,9 +750,9 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                         attempted_album_ids.add(group_key)
                         try:
                             fetched = await scanner.get_media_group(
-                            chat_id=resolved_channel_id,
-                            message_id=int(item.id),
-                        )
+                                chat_id=resolved_channel_id,
+                                message_id=int(item.id),
+                            )
                             if (
                                 fetched and 2 <= len(fetched) <= 10
                                 and all(
@@ -759,8 +760,9 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                                     for member in fetched
                                 )
                             ):
-                                messages = sorted(fetched, key=lambda member: int(member.id), reverse=True)
+                                messages = sorted(fetched, key=lambda member: int(member.id))
                                 processed_album_ids.add(group_key)
+                                album_verified = True
                             else:
                                 log.warning(
                                     "History scan could not verify complete album: channel=%s group=%s",
@@ -771,22 +773,32 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                                 "History scan album verification failed: channel=%s group=%s",
                                 resolved_channel_id, group_key,
                             )
+                    if not album_verified:
+                        # Never turn an unverified album member into a single-file backup.
+                        raise RuntimeError(
+                            f"Could not verify complete Telegram album {group_key}; scan stopped safely"
+                        )
 
                 # Only a Telegram-confirmed album can receive a directory.
-                is_album = len(messages) >= 2 and bool(group_id)
+                is_album = album_verified and len(messages) >= 2
                 category = parse_chinese_album_category(messages) if is_album else ""
-                album_key = f"source:{resolved_channel_id}:{group_id}" if is_album else None
+                album_key = (
+                    f"cangku:{resolved_channel_id}:{group_id}" if is_album else None
+                )
 
                 for position, member in enumerate(messages):
-                    media_type, file_name, fingerprint = media_details(member)
+                    media_type, file_name, media_unique_id = media_details(member)
                     created_at = (
                         member.date.isoformat() if getattr(member, "date", None)
                         else datetime.now(timezone.utc).isoformat()
                     )
-                    if media_type and fingerprint:
+                    if media_type:
+                        # Each source message gets its own stable pointer; the album
+                        # group key makes the entire group one backup job.
+                        source_fingerprint = f"cangku:{resolved_channel_id}:{int(member.id)}"
                         await db.save_scanned_message(
                             primary_channel_id, None, primary_channel_id,
-                            member.id, fingerprint, file_name, media_type, category,
+                            member.id, source_fingerprint, file_name, media_type, category,
                             created_at, config.ADMIN_ID,
                             secrets.token_urlsafe(9).replace("-", "").replace("_", ""),
                             album_group_id=album_key,
@@ -795,6 +807,8 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                     else:
                         await db.advance_scan_cursor(primary_channel_id, member.id)
             await db.mark_scan_completed(primary_channel_id)
+            if await db.get_setting("backup_full_scan_required") == "1":
+                await db.set_setting("backup_full_scan_required", "0")
 
         category_catalog_cache["expires_at"] = 0
         categories = await db.list_categories()
@@ -1949,21 +1963,33 @@ async def backup_retry_worker(client):
 
             # Discover a few metadata-only Cangku records at a time. The
             # existing PostgreSQL retry table makes the queue restart-safe.
-            _, backup_channel_id = await get_storage_channels()
+            primary_channel_id, backup_channel_id = await get_storage_channels()
             if backup_channel_id and await db.get_setting("backup_retry_full_restart_pending") == "1":
                 # Never erase saved backup pointers until Scanner is connected;
                 # otherwise a restart could reset IDs but enqueue no source messages.
                 if scanner is None or not scanner.is_connected:
                     log.warning("Full backup restart is waiting for Scanner login; no backup IDs were reset")
                 else:
+                    if not primary_channel_id:
+                        log.error("Full backup restart aborted: primary source channel is not bound")
+                        await asyncio.sleep(5)
+                        continue
                     reset_count = await db.restart_backup_retry_queue(
                         backup_channel_id, full_restart=True
                     )
+                    await db.reset_scan_progress_for_full_rescan(primary_channel_id)
+                    await db.set_setting("backup_full_scan_required", "1")
                     await db.set_setting("backup_retry_full_restart_pending", "0")
+                    if scan_task is None or scan_task.done():
+                        scan_task = asyncio.create_task(run_history_scan(primary_channel_id))
                     log.warning(
-                        "Full Cangku backup pass started: reset %s saved backup IDs and album metadata",
+                        "Full source-channel rescan started before backup: reset %s saved backup IDs",
                         reset_count,
                     )
+            # Do not copy a partial inventory if the full source scan failed or is still pending.
+            if await db.get_setting("backup_full_scan_required") == "1":
+                await asyncio.sleep(5)
+                continue
             if backup_channel_id and scanner is not None and scanner.is_connected:
                 # Resolve original Telegram media_group_id first. Without the
                 # scanner session we cannot safely distinguish a single file
@@ -4287,9 +4313,9 @@ async def admin_callback_handler(client, query):
                 backup_retry_manual_requested = True
                 last_user_activity = asyncio.get_running_loop().time() - 31
                 notice = (
-                    "⏳ 已提交从头备份任务，正在等待后台任务空闲。\n"
-                    "空闲后会重新识别所有单文件/相册，再从源频道完整复制；不会按旧备份 ID 跳过。\n"
-                    "目录、文件索引和旧备用频道消息都会保留。"
+                    "⏳ 已提交全量备份任务，正在等待后台任务空闲。\n"
+                    "将先重新扫描主存储频道全部历史消息，再按 Telegram 相册分组整组复制；单个文件单独复制。\n"
+                    "原有目录、文件索引和旧备用频道消息都会保留，不清空数据库。"
                 )
         elif action == "backupcontinue":
             await db.set_setting("backup_retry_enabled", "1")
