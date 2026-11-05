@@ -2115,10 +2115,6 @@ async def backup_retry_worker(client):
                             source_ids = [int(job["primary_message_id"])]
                         file_name = str(latest["file_name"] or file_key) if latest else file_key
                         category = str(latest["category"] or "") if latest else ""
-                        await db.record_backup_failure(
-                            file_key, file_name, category, source_fingerprint,
-                            album_group_id, source_ids, error_text,
-                        )
                         source_label = "相册整组" if album_group_id.startswith("cangku:") else "单条文件"
                         source_text = "、".join(str(value) for value in source_ids)
                         notice = (
@@ -2131,14 +2127,20 @@ async def backup_retry_worker(client):
                             f"失败原因：{error_text}\n\n"
                             "请管理员从原始来源手动转发到备用频道。"
                         )
+                        # Persist the failure before removing the retry job. If
+                        # the database write fails, leave the leased job to be retried
+                        # after its lease expires instead of silently losing the report.
+                        await db.record_backup_failure(
+                            file_key, file_name, category, source_fingerprint,
+                            album_group_id, source_ids, error_text,
+                        )
+                        await db.complete_backup_retry(file_key)
                         try:
                             await client.send_message(int(config.ADMIN_ID), notice, disable_web_page_preview=True)
                         except Exception:
                             log.exception("Could not notify admin about skipped backup file %s", file_key)
                     except Exception:
                         log.exception("Could not persist/report skipped backup file %s", file_key)
-                    finally:
-                        await db.complete_backup_retry(file_key)
                     log.warning("Backup retry skipped after failure: file=%s error=%s", file_key, error_text)
                 await asyncio.sleep(2.0)
         except asyncio.CancelledError:
