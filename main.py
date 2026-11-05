@@ -2145,7 +2145,7 @@ async def backup_retry_worker(client):
                             album_group_id
                         )
                         if not 2 <= len(album_rows) <= 10:
-                            raise RuntimeError("Album metadata is incomplete; refusing single-file backup")
+                            raise RuntimeError("Album metadata is incomplete; refusing to split the source group")
                         source_chat_ids = set()
                         source_message_ids = []
                         for album_row in album_rows:
@@ -2178,33 +2178,33 @@ async def backup_retry_worker(client):
                         ]
                         source_chat_id = source_chat_ids.pop()
                         if len(missing_source_ids) == len(source_message_ids):
-                            copied = await telegram_bot_api("copyMessages", {
+                            copied = await telegram_bot_api("forwardMessages", {
                                 "chat_id": int(job["backup_channel_id"]),
                                 "from_chat_id": source_chat_id,
                                 "message_ids": missing_source_ids,
                             })
                             if not isinstance(copied, list) or len(copied) != len(missing_source_ids):
                                 raise RuntimeError(
-                                    f"Album copy returned {len(copied) if isinstance(copied, list) else 0} "
+                                    f"Album forward returned {len(copied) if isinstance(copied, list) else 0} "
                                     f"messages for {len(missing_source_ids)} source items"
                                 )
                             copied_ids = [int(item["message_id"]) for item in copied]
                         elif len(missing_source_ids) == 1:
-                            copied_one = await telegram_bot_api("copyMessage", {
+                            copied_one = await telegram_bot_api("forwardMessage", {
                                 "chat_id": int(job["backup_channel_id"]),
                                 "from_chat_id": source_chat_id,
                                 "message_id": missing_source_ids[0],
                             })
                             copied_ids = [int(copied_one["message_id"])]
                         else:
-                            copied = await telegram_bot_api("copyMessages", {
+                            copied = await telegram_bot_api("forwardMessages", {
                                 "chat_id": int(job["backup_channel_id"]),
                                 "from_chat_id": source_chat_id,
                                 "message_ids": missing_source_ids,
                             })
                             if not isinstance(copied, list) or len(copied) != len(missing_source_ids):
                                 raise RuntimeError(
-                                    f"Remaining album copy returned {len(copied) if isinstance(copied, list) else 0} "
+                                    f"Remaining album forward returned {len(copied) if isinstance(copied, list) else 0} "
                                     f"messages for {len(missing_source_ids)} missing items"
                                 )
                             copied_ids = [int(item["message_id"]) for item in copied]
@@ -2217,8 +2217,8 @@ async def backup_retry_worker(client):
                             album_group_id, len(copied_ids),
                         )
                     else:
-                        # Singles keep the existing Bot API copyMessage path.
-                        copied = await telegram_bot_api("copyMessage", {
+                        # Singles use Telegram's forwardMessage API and retain the original source message.
+                        copied = await telegram_bot_api("forwardMessage", {
                             "chat_id": int(job["backup_channel_id"]),
                             "from_chat_id": int(job["primary_channel_id"]),
                             "message_id": int(job["primary_message_id"]),
