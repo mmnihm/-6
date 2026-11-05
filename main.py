@@ -2044,31 +2044,17 @@ async def backup_retry_worker(client):
             # existing PostgreSQL retry table makes the queue restart-safe.
             primary_channel_id, backup_channel_id = await get_storage_channels()
             if backup_channel_id and await db.get_setting("backup_retry_full_restart_pending") == "1":
-                # Never erase saved backup pointers until Scanner is connected;
-                # otherwise a restart could reset IDs but enqueue no source messages.
-                if scanner is None or not scanner.is_connected:
-                    log.warning("Full backup restart is waiting for Scanner login; no backup IDs were reset")
-                else:
-                    if not primary_channel_id:
-                        log.error("Full backup restart aborted: primary source channel is not bound")
-                        await asyncio.sleep(5)
-                        continue
-                    reset_count = await db.restart_backup_retry_queue(
-                        backup_channel_id, full_restart=True
-                    )
-                    await db.reset_scan_progress_for_full_rescan(primary_channel_id)
-                    await db.set_setting("backup_full_scan_required", "1")
-                    await db.set_setting("backup_retry_full_restart_pending", "0")
-                    if scan_task is None or scan_task.done():
-                        scan_task = asyncio.create_task(run_history_scan(primary_channel_id))
-                    log.warning(
-                        "Full source-channel rescan started before backup: reset %s saved backup IDs",
-                        reset_count,
-                    )
-            # Do not copy a partial inventory if the full source scan failed or is still pending.
-            if await db.get_setting("backup_full_scan_required") == "1":
-                await asyncio.sleep(5)
-                continue
+                # A full backup restart now uses the already indexed source pointers.
+                # It must not launch a user-account history scan or reset scan progress.
+                reset_count = await db.restart_backup_retry_queue(
+                    backup_channel_id, full_restart=True
+                )
+                await db.set_setting("backup_full_scan_required", "0")
+                await db.set_setting("backup_retry_full_restart_pending", "0")
+                log.warning(
+                    "Direct Bot API full backup restart queued from existing index: reset %s backup pointers; no scanner history scan",
+                    reset_count,
+                )
             if backup_channel_id:
                 # Bot API can forward every already-indexed, verified single
                 # directly by its original chat/message ID. No user-account
@@ -2142,39 +2128,13 @@ async def backup_retry_worker(client):
                         not album_group_id
                         or album_group_id.startswith("cangku-incomplete:")
                     ):
-                        # Imported Cangku JSON may contain only part of an album's
-                        # metadata. Re-check these rows against Telegram before
-                        # treating them as permanently unsafe; a complete source
-                        # album can repair the imported metadata, while a genuine
-                        # single is explicitly marked as such by the scanner.
-                        if scanner is None or not scanner.is_connected:
-                            await db.defer_backup_retry(
-                                file_key,
-                                "Waiting for Scanner login to verify legacy Cangku album metadata",
-                                delay_seconds=120,
-                            )
-                            log.warning(
-                                "Deferred Cangku backup until Scanner reconnects: file=%s",
-                                file_key,
-                            )
-                            continue
-                        verified = await discover_cangku_album_metadata({
-                            "source_fingerprint": source_fingerprint
-                        })
-                        if not verified:
-                            await db.defer_backup_retry(
-                                file_key,
-                                "Scanner could not verify the source message/album; cooling down before retry",
-                                delay_seconds=900,
-                            )
-                            log.warning("Deferred unverified Cangku source for 15 minutes: file=%s", file_key)
-                            continue
-                        record = await db.get_file(file_key)
-                        if not record:
-                            raise RuntimeError("Cangku source index disappeared during album verification")
-                        album_group_id = str(record["album_group_id"] or "")
-                        if not album_group_id:
-                            raise RuntimeError("Cangku source album verification did not complete")
+                        # Routine backup is Bot-API-only. An unclassified legacy
+                        # message is never guessed to be a single, because it may
+                        # be one member of an album. Report it instead of invoking
+                        # a personal scanner account in the background.
+                        raise RuntimeError(
+                            "Source album metadata is incomplete; skipped safely without personal scanner"
+                        )
                     if album_group_id.startswith("cangku-incomplete:"):
                         raise RuntimeError(
                             "Cangku album metadata is incomplete; refusing to back it up as separate files"
