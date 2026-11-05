@@ -2199,6 +2199,15 @@ async def backup_retry_worker(client):
 
             jobs = await db.list_due_backup_retries(limit=5)
             for pending_job in jobs:
+                # A full restart may be requested while this worker is already
+                # holding a batch of due jobs. Stop before claiming the next old
+                # job; the next loop will run the full scan/rebuild phase first.
+                if await db.get_setting("backup_retry_full_restart_pending") == "1":
+                    log.warning(
+                        "Stopping the old backup queue because a full restart was requested"
+                    )
+                    break
+
                 # Re-check activity before every copy so member requests always win.
                 loop = asyncio.get_running_loop()
                 if (
