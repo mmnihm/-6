@@ -1081,7 +1081,8 @@ class Database:
                 # A deliberate full-copy pass must not trust historical backup IDs.
                 # Keep every file row, folder, user, and membership record intact.
                 result = await db.execute("""
-                    UPDATE files SET backup_message_id=0
+                    UPDATE files
+                    SET backup_message_id=0, album_group_id=NULL, album_position=0
                     WHERE source_fingerprint LIKE 'cangku:%'
                 """)
                 reset_count = max(0, int(getattr(result, "rowcount", 0) or 0))
