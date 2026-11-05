@@ -2069,33 +2069,32 @@ async def backup_retry_worker(client):
             if await db.get_setting("backup_full_scan_required") == "1":
                 await asyncio.sleep(5)
                 continue
-            if backup_channel_id and scanner is not None and scanner.is_connected:
-                # Resolve original Telegram media_group_id first. Without the
-                # scanner session we cannot safely distinguish a single file
-                # from one member of an album, so never enqueue blind singles.
+            if backup_channel_id:
+                # Bot API can forward every already-indexed, verified single
+                # directly by its original chat/message ID. No user-account
+                # scanner session is needed for routine backup delivery.
                 candidates = await db.list_unbacked_cangku_files(limit=1)
                 for candidate in candidates:
-                    await discover_cangku_album_metadata(candidate)
-                    # Once Telegram confirms a legacy source is a true single,
-                    # queue it using its original chat/message pointer. Do not
-                    # pair a Cangku message ID with the newly bound primary channel.
-                    refreshed = await db.get_file(str(candidate["file_key"]))
-                    group_id = str(refreshed["album_group_id"] or "") if refreshed else ""
                     fingerprint = str(candidate["source_fingerprint"] or "")
                     parts = fingerprint.split(":", 2)
-                    if group_id.startswith("cangku-single:") and len(parts) == 3:
-                        try:
-                            await db.enqueue_backup_retry(
-                                str(candidate["file_key"]), int(parts[1]),
-                                int(parts[2]), int(backup_channel_id),
-                                "idle Cangku single backup",
-                            )
-                        except (TypeError, ValueError):
-                            log.exception("Invalid Cangku single source pointer: %s", candidate["file_key"])
+                    if len(parts) != 3:
+                        continue
+                    try:
+                        source_chat_id, source_message_id = int(parts[1]), int(parts[2])
+                    except ValueError:
+                        continue
+                    refreshed = await db.get_file(str(candidate["file_key"]))
+                    group_id = str(refreshed["album_group_id"] or "") if refreshed else ""
+                    if group_id.startswith("cangku-single:"):
+                        await db.enqueue_backup_retry(
+                            str(candidate["file_key"]), source_chat_id,
+                            source_message_id, int(backup_channel_id),
+                            "Bot API direct Cangku single backup",
+                        )
 
-                # Queue one durable job per complete Telegram album, not one
-                # job per photo/video. The representative row is the first
-                # original message; the worker expands it to the whole group.
+                # Complete album membership is already stored in PostgreSQL.
+                # Forward the full ordered message-ID list in one Bot API call.
+                # This path deliberately does not consult the user-account scanner.
                 album_candidates = await db.list_unbacked_cangku_albums(limit=1)
                 for candidate in album_candidates:
                     fingerprint = str(candidate["source_fingerprint"] or "")
@@ -2107,11 +2106,9 @@ async def backup_retry_worker(client):
                     except ValueError:
                         continue
                     await db.enqueue_backup_retry(
-                        str(candidate["file_key"]),
-                        source_chat_id,
-                        source_message_id,
-                        int(backup_channel_id),
-                        "idle Cangku album backup",
+                        str(candidate["file_key"]), source_chat_id,
+                        source_message_id, int(backup_channel_id),
+                        "Bot API direct Cangku album backup",
                     )
 
             jobs = await db.list_due_backup_retries(limit=5)
