@@ -2165,51 +2165,78 @@ async def backup_retry_worker(client):
                         existing_backup_ids = [
                             int(row["backup_message_id"] or 0) for row in album_rows
                         ]
+                        source_chat_id = source_chat_ids.pop()
+                        backup_chat_id = int(job["backup_channel_id"])
+
+                        # A partially completed legacy album must never be repaired
+                        # with forwardMessage: that would leave its final members as
+                        # standalone posts. Re-forward the complete source album in
+                        # one forwardMessages call, then replace every saved mapping.
+                        needs_album_repair = not all(value > 0 for value in existing_backup_ids)
                         if all(value > 0 for value in existing_backup_ids):
+                            # Verify existing destination messages when the scanner can
+                            # read them. If verification is unavailable, preserve the
+                            # existing mappings rather than creating duplicate backups.
+                            try:
+                                destination_group = await scanner.get_media_group(
+                                    chat_id=backup_chat_id,
+                                    message_id=existing_backup_ids[0],
+                                )
+                                destination_ids = {
+                                    int(item.id) for item in (destination_group or [])
+                                }
+                                needs_album_repair = not (
+                                    2 <= len(destination_group or []) <= 10
+                                    and set(existing_backup_ids).issubset(destination_ids)
+                                    and len({
+                                        str(getattr(item, "media_group_id", "") or "")
+                                        for item in destination_group
+                                    }) == 1
+                                    and bool(getattr(destination_group[0], "media_group_id", None))
+                                )
+                            except Exception:
+                                log.warning(
+                                    "Could not verify existing backup album; preserving mappings: group=%s",
+                                    album_group_id,
+                                    exc_info=True,
+                                )
+                                needs_album_repair = False
+
+                        if not needs_album_repair:
                             await db.complete_backup_retry(file_key)
                             continue
-                        # Some members may have been copied by the older single-file
-                        # worker before album metadata was discovered. Preserve those
-                        # valid mappings and copy only the missing source messages.
-                        missing_source_ids = [
-                            source_id for source_id, backup_id
-                            in zip(source_message_ids, existing_backup_ids)
-                            if backup_id <= 0
-                        ]
-                        source_chat_id = source_chat_ids.pop()
-                        if len(missing_source_ids) == len(source_message_ids):
-                            copied = await telegram_bot_api("forwardMessages", {
-                                "chat_id": int(job["backup_channel_id"]),
-                                "from_chat_id": source_chat_id,
-                                "message_ids": missing_source_ids,
-                            })
-                            if not isinstance(copied, list) or len(copied) != len(missing_source_ids):
-                                raise RuntimeError(
-                                    f"Album forward returned {len(copied) if isinstance(copied, list) else 0} "
-                                    f"messages for {len(missing_source_ids)} source items"
+
+                        copied = await telegram_bot_api("forwardMessages", {
+                            "chat_id": backup_chat_id,
+                            "from_chat_id": source_chat_id,
+                            "message_ids": source_message_ids,
+                        })
+                        if not isinstance(copied, list) or len(copied) != len(source_message_ids):
+                            raise RuntimeError(
+                                f"Complete album forward returned "
+                                f"{len(copied) if isinstance(copied, list) else 0} "
+                                f"messages for {len(source_message_ids)} source items"
+                            )
+                        copied_ids = [int(item["message_id"]) for item in copied]
+
+                        # Remove old standalone/partial copies only after the complete
+                        # album has been forwarded successfully. A delete failure is
+                        # non-fatal; the new complete album mapping is still saved.
+                        old_backup_ids = [value for value in existing_backup_ids if value > 0]
+                        if old_backup_ids:
+                            try:
+                                await telegram_bot_api("deleteMessages", {
+                                    "chat_id": backup_chat_id,
+                                    "message_ids": old_backup_ids,
+                                })
+                            except Exception:
+                                log.warning(
+                                    "Could not remove old standalone album copies: group=%s ids=%s",
+                                    album_group_id, old_backup_ids, exc_info=True,
                                 )
-                            copied_ids = [int(item["message_id"]) for item in copied]
-                        elif len(missing_source_ids) == 1:
-                            copied_one = await telegram_bot_api("forwardMessage", {
-                                "chat_id": int(job["backup_channel_id"]),
-                                "from_chat_id": source_chat_id,
-                                "message_id": missing_source_ids[0],
-                            })
-                            copied_ids = [int(copied_one["message_id"])]
-                        else:
-                            copied = await telegram_bot_api("forwardMessages", {
-                                "chat_id": int(job["backup_channel_id"]),
-                                "from_chat_id": source_chat_id,
-                                "message_ids": missing_source_ids,
-                            })
-                            if not isinstance(copied, list) or len(copied) != len(missing_source_ids):
-                                raise RuntimeError(
-                                    f"Remaining album forward returned {len(copied) if isinstance(copied, list) else 0} "
-                                    f"messages for {len(missing_source_ids)} missing items"
-                                )
-                            copied_ids = [int(item["message_id"]) for item in copied]
+
                         await db.update_album_backup_message_ids(
-                            album_group_id, copied_ids, missing_source_ids
+                            album_group_id, copied_ids, replace_existing=True
                         )
                         await db.complete_backup_retry(file_key)
                         log.info(
