@@ -2140,13 +2140,31 @@ async def backup_retry_worker(client):
                         source_chat_id, source_message_id = int(parts[1]), int(parts[2])
                     except ValueError:
                         continue
+                    # Re-check every legacy "single" against Telegram before
+                    # queueing copyMessage. Older scans/imports may have lost the
+                    # media_group_id; blindly copying here would split a real album.
                     refreshed = await db.get_file(str(candidate["file_key"]))
                     group_id = str(refreshed["album_group_id"] or "") if refreshed else ""
+                    if group_id.startswith("cangku-single:"):
+                        verified = await discover_cangku_album_metadata(candidate)
+                        if not verified:
+                            log.warning(
+                                "Backup candidate held until source media type/group is verified: file=%s",
+                                candidate["file_key"],
+                            )
+                            continue
+                        refreshed = await db.get_file(str(candidate["file_key"]))
+                        group_id = str(refreshed["album_group_id"] or "") if refreshed else ""
                     if group_id.startswith("cangku-single:"):
                         await db.enqueue_backup_retry(
                             str(candidate["file_key"]), source_chat_id,
                             source_message_id, int(backup_channel_id),
-                            "Bot API direct Cangku single backup",
+                            "Bot API direct Cangku single backup (source-verified)",
+                        )
+                    elif group_id.startswith("cangku:"):
+                        log.info(
+                            "Promoted legacy backup candidate to complete album group: file=%s group=%s",
+                            candidate["file_key"], group_id,
                         )
 
                 # Never queue a partial album while an oldest-first history scan
