@@ -782,13 +782,13 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
     try:
         scan_direction = await db.get_setting("history_scan_direction")
         if scan_direction != "newest_first_v1":
-            # Existing progress was written by newest-to-oldest scanning.
-            # Restart only the cursor (not indexed rows) so the new ascending
-            # pass can safely revisit existing messages and fill missing rows.
+            # Existing progress used the old custom pagination direction.
+            # Restart only the cursor (not indexed rows) so the reliable
+            # newest-to-oldest pass can revisit messages and fill missing rows.
             await db.reset_scan_progress_for_full_rescan(primary_channel_id)
             await db.set_setting("history_scan_direction", "newest_first_v1")
             log.warning(
-                "Migrated history scan to oldest-first mode; existing indexed data is preserved"
+                "Migrated history scan to newest-first mode; existing indexed data is preserved"
             )
         progress = await db.get_scan_progress(primary_channel_id)
         if not progress["completed"]:
