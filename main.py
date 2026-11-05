@@ -803,27 +803,47 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                                     if 2 <= len(matched) <= 10
                                     and int(item.id) in ids
                                     and len(ids) == len(set(ids))
-                                    and all(
-                                        ids[index] + 1 == ids[index + 1]
-                                        for index in range(len(ids) - 1)
-                                    )
                                     else None
                                 )
 
                             verified_messages = matching_album(fetched)
+                            fallback_ids = []
                             if not verified_messages:
                                 anchor_id = int(item.id)
+                                # First retry by message IDs. Missing IDs may be
+                                # returned as None, so matching_album filters them.
                                 nearby = await scanner_api_call(
                                     scanner.get_messages,
                                     chat_id=resolved_channel_id,
                                     message_ids=list(range(max(1, anchor_id - 9), anchor_id + 10)),
                                 )
                                 verified_messages = matching_album(nearby)
+                                fallback_ids = [
+                                    int(member.id) for member in (nearby or [])
+                                    if member is not None
+                                ]
+                                # Message IDs inside an album are not guaranteed
+                                # to be numerically consecutive. Read actual chat
+                                # history around the anchor and match the exact
+                                # Telegram media_group_id instead of assuming IDs.
+                                if not verified_messages:
+                                    history_nearby = []
+                                    async for candidate in scanner.get_chat_history(
+                                        resolved_channel_id,
+                                        offset_id=anchor_id + 1,
+                                        limit=30,
+                                    ):
+                                        history_nearby.append(candidate)
+                                    verified_messages = matching_album(history_nearby)
+                                    fallback_ids = [
+                                        int(member.id) for member in history_nearby
+                                    ]
                                 log.info(
                                     "History scan album fallback: channel=%s group=%s anchor=%s "
-                                    "returned=%s matched=%s ids=%s",
+                                    "get_media_group_count=%s nearby_ids=%s matched=%s matched_ids=%s",
                                     resolved_channel_id, group_key, anchor_id,
-                                    len(nearby or []), len(verified_messages or []),
+                                    len(fetched or []), fallback_ids,
+                                    len(verified_messages or []),
                                     [int(member.id) for member in (verified_messages or [])],
                                 )
 
