@@ -1993,10 +1993,10 @@ async def backup_retry_worker(client):
                                 delay_seconds=120,
                             )
                             log.warning(
-                                "Paused Cangku backup queue until Scanner reconnects: file=%s",
+                                "Deferred Cangku backup until Scanner reconnects: file=%s",
                                 file_key,
                             )
-                            break
+                            continue
                         await discover_cangku_album_metadata({
                             "source_fingerprint": source_fingerprint
                         })
