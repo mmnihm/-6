@@ -809,23 +809,35 @@ class Database:
         created_at, owner_id, file_key, album_group_id=None, album_position=0
     ):
         async with self.connect() as db:
-            await db.execute("""
+            inserted_message = await db.execute("""
                 INSERT OR IGNORE INTO scanner_messages(
                     channel_id, message_id, fingerprint, file_name,
                     media_type, category, created_at
                 ) VALUES(?, ?, ?, ?, ?, ?, ?)
             """, (channel_id, message_id, fingerprint, file_name,
                   media_type, category, created_at))
+            if album_group_id and not category:
+                existing_album_category = await (await db.execute("""
+                    SELECT category FROM files
+                    WHERE album_group_id=? AND category IS NOT NULL AND category<>''
+                    ORDER BY album_position LIMIT 1
+                """, (str(album_group_id),))).fetchone()
+                if existing_album_category:
+                    category = str(existing_album_category["category"] or "")
             await db.execute("""
                 INSERT INTO scanner_progress(
                     channel_id, last_message_id, scanned_count, completed, updated_at
-                ) VALUES(?, ?, 1, 0, ?)
+                ) VALUES(?, ?, ?, 0, ?)
                 ON CONFLICT(channel_id) DO UPDATE SET
                     last_message_id=excluded.last_message_id,
-                    scanned_count=scanner_progress.scanned_count + 1,
+                    scanned_count=scanner_progress.scanned_count + excluded.scanned_count,
                     completed=0,
                     updated_at=excluded.updated_at
-            """, (channel_id, message_id, iso_now()))
+            """, (
+                channel_id, message_id,
+                1 if inserted_message.rowcount == 1 else 0,
+                iso_now(),
+            ))
 
             current = await (await db.execute("""
                 SELECT message_id, file_name, media_type, category, created_at
@@ -942,13 +954,20 @@ class Database:
             await db.execute("""
                 INSERT INTO scanner_progress(
                     channel_id, last_message_id, scanned_count, completed, updated_at
-                ) VALUES(?, 0, 0, 0, ?)
+                ) VALUES(
+                    ?, 0,
+                    (SELECT COUNT(*) FROM scanner_messages WHERE channel_id=?),
+                    0, ?
+                )
                 ON CONFLICT(channel_id) DO UPDATE SET
                     last_message_id=0,
-                    scanned_count=0,
+                    scanned_count=(
+                        SELECT COUNT(*) FROM scanner_messages
+                        WHERE channel_id=excluded.channel_id
+                    ),
                     completed=0,
                     updated_at=excluded.updated_at
-            """, (int(channel_id), iso_now()))
+            """, (int(channel_id), int(channel_id), iso_now()))
             await db.commit()
 
     async def mark_scan_completed(self, channel_id):
@@ -1266,16 +1285,35 @@ class Database:
                 LIMIT ?
             """, (max(1, min(50, int(limit))),))).fetchall()
 
-    async def update_cangku_album_metadata(self, source_fingerprint, album_group_id, album_position):
-        """Attach album metadata to an already-imported Cangku index row without replacing it."""
+    async def update_cangku_album_metadata(
+        self, source_fingerprint, album_group_id, album_position, category=None
+    ):
+        """Attach Telegram album metadata and propagate a discovered album caption category."""
         async with self.connect() as db:
             await db.execute("""
-                UPDATE files SET album_group_id=?, album_position=?
+                UPDATE files
+                SET album_group_id=?, album_position=?,
+                    category=CASE
+                        WHEN ? IS NOT NULL AND ?<>'' THEN ?
+                        ELSE category
+                    END
                 WHERE source_fingerprint=?
             """, (
                 str(album_group_id), max(0, int(album_position)),
-                str(source_fingerprint),
+                category, category, category, str(source_fingerprint),
             ))
+            if category:
+                await db.execute("""
+                    UPDATE files SET category=?
+                    WHERE album_group_id=?
+                """, (str(category), str(album_group_id)))
+                await db.execute("""
+                    UPDATE scanner_messages
+                    SET category=?
+                    WHERE fingerprint IN (
+                        SELECT source_fingerprint FROM files WHERE album_group_id=?
+                    )
+                """, (str(category), str(album_group_id)))
             await db.commit()
 
     async def list_unbacked_cangku_albums(self, limit=5):
