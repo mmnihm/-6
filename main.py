@@ -2345,6 +2345,10 @@ async def backup_retry_worker(client):
                             raise RuntimeError(
                                 "Scanner account is not connected; cannot forward source album"
                             )
+                        # Warm the scanner account's private-channel peer cache for
+                        # the destination too. Knowing only the numeric channel ID is
+                        # insufficient for Pyrogram to address a private channel.
+                        await resolve_scanner_chat(backup_chat_id)
                         copied = await scanner_api_call(
                             scanner.forward_messages,
                             chat_id=backup_chat_id,
@@ -2394,9 +2398,13 @@ async def backup_retry_worker(client):
                             raise RuntimeError(
                                 "Scanner account is not connected; cannot forward source file"
                             )
+                        # Resolve the destination as well as the source so the
+                        # scanner session has the private channel access_hash cached.
+                        backup_chat_id = int(job["backup_channel_id"])
+                        await resolve_scanner_chat(backup_chat_id)
                         copied = await scanner_api_call(
                             scanner.forward_messages,
-                            chat_id=int(job["backup_channel_id"]),
+                            chat_id=backup_chat_id,
                             from_chat_id=int(job["primary_channel_id"]),
                             message_ids=int(job["primary_message_id"]),
                         )
