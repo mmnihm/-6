@@ -2126,10 +2126,18 @@ async def backup_retry_worker(client):
                     "Full backup scan completed; locked %s indexed source items into the durable copy queue",
                     reset_count,
                 )
+            # Strict two-phase backup: do not enqueue OR deliver any source item
+            # until the complete primary-channel history scan has finished.
+            # This also pauses previously queued jobs if a scan is resumed/interrupted.
+            if backup_channel_id and primary_channel_id:
+                source_scan_progress = await db.get_scan_progress(primary_channel_id)
+                if not source_scan_progress.get("completed"):
+                    await asyncio.sleep(5)
+                    continue
+
             if backup_channel_id:
-                # Bot API can forward every already-indexed, verified single
-                # directly by its original chat/message ID. No user-account
-                # scanner session is needed for routine backup delivery.
+                # Only after the full source manifest is complete may messages
+                # be forwarded to the backup channel with their original source.
                 candidates = await db.list_unbacked_cangku_files(limit=1)
                 for candidate in candidates:
                     fingerprint = str(candidate["source_fingerprint"] or "")
@@ -2312,7 +2320,7 @@ async def backup_retry_worker(client):
                             await db.complete_backup_retry(file_key)
                             continue
 
-                        copied = await telegram_bot_api("copyMessages", {
+                        copied = await telegram_bot_api("forwardMessages", {
                             "chat_id": backup_chat_id,
                             "from_chat_id": source_chat_id,
                             "message_ids": source_message_ids,
@@ -2350,8 +2358,8 @@ async def backup_retry_worker(client):
                             album_group_id, len(copied_ids),
                         )
                     else:
-                        # Singles use Telegram's forwardMessage API and retain the original source message.
-                        copied = await telegram_bot_api("copyMessage", {
+                        # Forward singles so Telegram displays the original source attribution.
+                        copied = await telegram_bot_api("forwardMessage", {
                             "chat_id": int(job["backup_channel_id"]),
                             "from_chat_id": int(job["primary_channel_id"]),
                             "message_id": int(job["primary_message_id"]),
@@ -4495,9 +4503,9 @@ async def admin_callback_handler(client, query):
                 last_user_activity = asyncio.get_running_loop().time() - 31
                 notice = (
                     "⏳ 已提交全量备份任务。\n"
-                    "第一阶段：扫描账号重新检查主存储频道全部历史，统计并补齐遗漏资源。\n"
-                    "第二阶段：扫描成功后锁定完整资源清单，再按原始消息 ID 顺序复制；相册整组复制。\n"
-                    "复制后不显示原频道转发来源。扫描未完成或中断时，不会提前开始备份。\n"
+                    "第一阶段：只扫描主存储频道全部历史，统计并补齐遗漏资源，不向备用频道发送内容。\n"
+                    "第二阶段：扫描全部完成后锁定完整资源清单，再按原始消息 ID 顺序转发；相册整组转发并保留来源。\n"
+                    "扫描未完成或中断时，不会提前开始备份。\n"
                     "原始频道文件、目录和会员数据均保留。"
                 )
         elif action == "backupcontinue":
