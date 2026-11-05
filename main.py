@@ -1827,6 +1827,59 @@ async def directory_import_confirm_handler(client, message):
         directory_import_running = False
 
 
+async def discover_cangku_album_metadata(candidate):
+    """Use the logged-in scanner account to identify source albums before any single copy."""
+    if scanner is None or not scanner.is_connected:
+        return False
+    fingerprint = str(candidate["source_fingerprint"] or "")
+    parts = fingerprint.split(":", 2)
+    if len(parts) != 3 or parts[0] != "cangku":
+        return False
+    try:
+        chat_id, message_id = int(parts[1]), int(parts[2])
+        source_message = await scanner.get_messages(chat_id, message_id)
+        if not source_message or getattr(source_message, "empty", False):
+            raise RuntimeError("Scanner could not read the original Cangku message")
+        group_id = getattr(source_message, "media_group_id", None)
+        if not group_id:
+            # Explicitly mark verified singles so future idle cycles do not re-read them.
+            await db.update_cangku_album_metadata(
+                fingerprint, f"cangku-single:{chat_id}:{message_id}", 0
+            )
+            return True
+        group = await scanner.get_media_group(chat_id, message_id)
+        if not 2 <= len(group) <= 10 or any(
+            str(getattr(item, "media_group_id", "")) != str(group_id)
+            for item in group
+        ):
+            raise RuntimeError("Telegram did not return a complete, consistent source album")
+        group = sorted(group, key=lambda item: int(item.id))
+        ids = [int(item.id) for item in group]
+        if any(ids[i] != ids[0] + i for i in range(len(ids))):
+            raise RuntimeError("Source album message IDs are not consecutive")
+        rows = []
+        for source_id in ids:
+            row = await db.get_file_by_fingerprint(f"cangku:{chat_id}:{source_id}")
+            if not row:
+                raise RuntimeError("Source album contains a message missing from the imported index")
+            rows.append((f"cangku:{chat_id}:{source_id}", source_id))
+        album_key = f"cangku:{chat_id}:{group_id}"
+        for position, (source_fp, _) in enumerate(rows):
+            await db.update_cangku_album_metadata(source_fp, album_key, position)
+        log.info("Discovered Cangku source album via scanner: group=%s files=%s", album_key, len(rows))
+        return True
+    except Exception:
+        log.exception("Could not safely identify Cangku source media group: %s", fingerprint)
+        # Do not let an unreadable/partial source fall through to copyMessage.
+        try:
+            await db.update_cangku_album_metadata(
+                fingerprint, f"cangku-incomplete:{parts[1]}:{parts[2]}", 0
+            )
+        except Exception:
+            log.exception("Could not mark unverified Cangku source as incomplete")
+        return False
+
+
 async def backup_retry_worker(client):
     """Resume durable jobs and queue Cangku singles/albums only while idle."""
     global last_user_activity, backup_retry_manual_requested
@@ -1857,24 +1910,13 @@ async def backup_retry_worker(client):
             # Discover a few metadata-only Cangku records at a time. The
             # existing PostgreSQL retry table makes the queue restart-safe.
             _, backup_channel_id = await get_storage_channels()
-            if backup_channel_id:
+            if backup_channel_id and scanner is not None and scanner.is_connected:
+                # Resolve original Telegram media_group_id first. Without the
+                # scanner session we cannot safely distinguish a single file
+                # from one member of an album, so never enqueue blind singles.
                 candidates = await db.list_unbacked_cangku_files(limit=5)
                 for candidate in candidates:
-                    fingerprint = str(candidate["source_fingerprint"] or "")
-                    parts = fingerprint.split(":", 2)
-                    if len(parts) != 3:
-                        continue
-                    try:
-                        source_chat_id, source_message_id = int(parts[1]), int(parts[2])
-                    except ValueError:
-                        continue
-                    await db.enqueue_backup_retry(
-                        str(candidate["file_key"]),
-                        source_chat_id,
-                        source_message_id,
-                        int(backup_channel_id),
-                        "idle Cangku source backup",
-                    )
+                    await discover_cangku_album_metadata(candidate)
 
                 # Queue one durable job per complete Telegram album, not one
                 # job per photo/video. The representative row is the first
