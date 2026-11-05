@@ -3141,7 +3141,7 @@ async def user_catalog_callback_handler(client, query):
             )
             summary = f"🎲 随机发送完成：成功 {sent}/{len(rows)} 个文件。"
             if failed:
-                summary += f"\n\n⚠️ 本次有 {failed} 个文件发送失败，领取进度没有越过失败位置；请修复存储来源后再次领取。"
+                summary += f"\n\n⚠️ 本次有 {failed} 个文件发送失败，失败资源没有记为已领取；请检查存储来源后再次尝试。"
             # Send the completion summary through the same direct Bot API
             # transport used by the reliable file-copy path. The raw JSON
             # reply_markup makes it explicit that Telegram receives buttons.
