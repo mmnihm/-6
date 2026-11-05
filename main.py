@@ -2040,19 +2040,48 @@ async def backup_retry_worker(client):
             if manual_requested:
                 backup_retry_manual_requested = False
 
-            # Discover a few metadata-only Cangku records at a time. The
-            # existing PostgreSQL retry table makes the queue restart-safe.
+            # A full restart is a two-phase operation: complete a fresh source
+            # history scan first, then freeze that indexed set into durable retry jobs.
             primary_channel_id, backup_channel_id = await get_storage_channels()
-            if backup_channel_id and await db.get_setting("backup_retry_full_restart_pending") == "1":
-                # A full backup restart now uses the already indexed source pointers.
-                # It must not launch a user-account history scan or reset scan progress.
+            full_restart_pending = (
+                backup_channel_id
+                and await db.get_setting("backup_retry_full_restart_pending") == "1"
+            )
+            if full_restart_pending:
+                if scanner is None or not scanner.is_connected:
+                    log.warning("Full backup restart is waiting for the scanner account to connect")
+                    await asyncio.sleep(5)
+                    continue
+                scan_started = await db.get_setting("backup_full_scan_started")
+                if scan_started != "1":
+                    if not primary_channel_id:
+                        log.error("Full backup restart cannot scan: primary channel is not bound")
+                        await asyncio.sleep(10)
+                        continue
+                    check = await inspect_scan_channel(primary_channel_id)
+                    if not check["ok"]:
+                        log.error("Full backup restart is waiting for source channel access: %s", format_scan_check(check, "主存储频道"))
+                        await asyncio.sleep(10)
+                        continue
+                    await db.reset_scan_progress_for_full_rescan(primary_channel_id)
+                    await db.set_setting("backup_full_scan_started", "1")
+                    scan_task = asyncio.create_task(run_history_scan(primary_channel_id))
+                    log.warning("Full backup restart: fresh complete source history scan started")
+                    await asyncio.sleep(2)
+                    continue
+                scan_progress = await db.get_scan_progress(primary_channel_id)
+                if not scan_progress["completed"]:
+                    # A failed/paused scan never becomes a partial backup manifest.
+                    await asyncio.sleep(5)
+                    continue
                 reset_count = await db.restart_backup_retry_queue(
                     backup_channel_id, full_restart=True
                 )
                 await db.set_setting("backup_full_scan_required", "0")
+                await db.set_setting("backup_full_scan_started", "0")
                 await db.set_setting("backup_retry_full_restart_pending", "0")
                 log.warning(
-                    "Direct Bot API full backup restart queued from existing index: reset %s backup pointers; no scanner history scan",
+                    "Full backup scan completed; locked %s indexed source items into the durable copy queue",
                     reset_count,
                 )
             if backup_channel_id:
@@ -2206,7 +2235,7 @@ async def backup_retry_worker(client):
                             await db.complete_backup_retry(file_key)
                             continue
 
-                        copied = await telegram_bot_api("forwardMessages", {
+                        copied = await telegram_bot_api("copyMessages", {
                             "chat_id": backup_chat_id,
                             "from_chat_id": source_chat_id,
                             "message_ids": source_message_ids,
@@ -2245,7 +2274,7 @@ async def backup_retry_worker(client):
                         )
                     else:
                         # Singles use Telegram's forwardMessage API and retain the original source message.
-                        copied = await telegram_bot_api("forwardMessage", {
+                        copied = await telegram_bot_api("copyMessage", {
                             "chat_id": int(job["backup_channel_id"]),
                             "from_chat_id": int(job["primary_channel_id"]),
                             "message_id": int(job["primary_message_id"]),
@@ -4379,15 +4408,20 @@ async def admin_callback_handler(client, query):
                     "本次没有重置任何备份 ID，也没有改动原数据。"
                 )
             else:
-                # The worker performs the reset after any in-flight copy finishes.
+                # The worker first resets only the scan cursor, scans the entire
+                # original channel, and only then freezes the complete index into jobs.
+                await db.set_setting("backup_full_scan_started", "0")
+                await db.set_setting("backup_full_scan_required", "1")
                 await db.set_setting("backup_retry_full_restart_pending", "1")
                 await db.set_setting("backup_retry_enabled", "1")
                 backup_retry_manual_requested = True
                 last_user_activity = asyncio.get_running_loop().time() - 31
                 notice = (
-                    "⏳ 已提交全量备份任务，正在等待后台任务空闲。\n"
-                    "将先重新扫描主存储频道全部历史消息，再按 Telegram 相册分组整组复制；单个文件单独复制。\n"
-                    "原有目录、文件索引和旧备用频道消息都会保留，不清空数据库。"
+                    "⏳ 已提交全量备份任务。\n"
+                    "第一阶段：扫描账号重新检查主存储频道全部历史，统计并补齐遗漏资源。\n"
+                    "第二阶段：扫描成功后锁定完整资源清单，再按原始消息 ID 顺序复制；相册整组复制。\n"
+                    "复制后不显示原频道转发来源。扫描未完成或中断时，不会提前开始备份。\n"
+                    "原始频道文件、目录和会员数据均保留。"
                 )
         elif action == "backupcontinue":
             await db.set_setting("backup_retry_enabled", "1")
