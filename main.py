@@ -1953,7 +1953,7 @@ async def directory_import_confirm_handler(client, message):
         directory_import_running = False
 
 
-async def discover_cangku_album_metadata(candidate):
+async def discover_cangku_album_metadata(candidate, force=False):
     """Use the logged-in scanner account to identify source albums before any single copy."""
     if scanner is None or not scanner.is_connected:
         return False
@@ -1962,7 +1962,7 @@ async def discover_cangku_album_metadata(candidate):
     if len(parts) != 3 or parts[0] != "cangku":
         return False
     loop = asyncio.get_running_loop()
-    if scanner_metadata_cooldowns.get(fingerprint, 0.0) > loop.time():
+    if not force and scanner_metadata_cooldowns.get(fingerprint, 0.0) > loop.time():
         return False
     try:
         chat_id, message_id = int(parts[1]), int(parts[2])
@@ -2246,7 +2246,7 @@ async def backup_retry_worker(client):
                         # Repair legacy/missing album metadata with the already
                         # logged-in personal scanner before deciding whether this
                         # source is a single message or a media group. Never guess.
-                        verified = await discover_cangku_album_metadata(record)
+                        verified = await discover_cangku_album_metadata(record, force=True)
                         if not verified:
                             raise RuntimeError(
                                 "Source album metadata could not be verified; waiting for scanner access"
