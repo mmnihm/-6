@@ -1657,7 +1657,30 @@ async def directory_export_upload_handler(client, message):
                 "source_fingerprint": source_key,
                 "file_size": file_size,
                 "created_at": resource_created_at,
+                "media_group_id": str(item.get("mediaGroupId") or "").strip(),
+                "album_group_id": None,
+                "album_position": 0,
             })
+        # Cangku exports preserve Telegram's original mediaGroupId. Only mark
+        # a group as an album when all 2-10 source messages are present and
+        # consecutive; incomplete groups remain single-file references.
+        album_members = {}
+        for resource in clean_resources:
+            group_id = resource["media_group_id"]
+            if group_id:
+                group_key = f'{resource["chat_id"]}:{group_id}'
+                album_members.setdefault(group_key, []).append(resource)
+        for group_key, members in album_members.items():
+            members.sort(key=lambda row: int(row["message_id"]))
+            message_ids = [int(row["message_id"]) for row in members]
+            if 2 <= len(members) <= 10 and all(
+                message_ids[index] == message_ids[0] + index
+                for index in range(len(message_ids))
+            ):
+                album_group_id = f"cangku:{group_key}"
+                for position, resource in enumerate(members):
+                    resource["album_group_id"] = album_group_id
+                    resource["album_position"] = position
         if not clean_resources:
             raise ValueError("文件中没有可迁移的媒体资源。")
         # Source-linked directory import does not require destination storage channels.
@@ -1743,8 +1766,16 @@ async def directory_import_confirm_handler(client, message):
                     file_key, user.id, item["file_name"], item["media_type"],
                     0, 0, item["category"], fingerprint,
                     item.get("file_size", 0), item.get("created_at"),
+                    album_group_id=item.get("album_group_id"),
+                    album_position=item.get("album_position", 0),
                     refresh_stats=False,
                 )
+                # Re-importing an updated export enriches existing rows with
+                # album metadata without replacing their keys or other data.
+                if item.get("album_group_id"):
+                    await db.update_cangku_album_metadata(
+                        fingerprint, item["album_group_id"], item["album_position"]
+                    )
                 if inserted:
                     changed_categories.add(item["category"])
                     success += 1
@@ -1844,6 +1875,27 @@ async def backup_retry_worker(client):
                         "idle Cangku source backup",
                     )
 
+                # Queue one durable job per complete Telegram album, not one
+                # job per photo/video. The representative row is the first
+                # original message; the worker expands it to the whole group.
+                album_candidates = await db.list_unbacked_cangku_albums(limit=5)
+                for candidate in album_candidates:
+                    fingerprint = str(candidate["source_fingerprint"] or "")
+                    parts = fingerprint.split(":", 2)
+                    if len(parts) != 3:
+                        continue
+                    try:
+                        source_chat_id, source_message_id = int(parts[1]), int(parts[2])
+                    except ValueError:
+                        continue
+                    await db.enqueue_backup_retry(
+                        str(candidate["file_key"]),
+                        source_chat_id,
+                        source_message_id,
+                        int(backup_channel_id),
+                        "idle Cangku album backup",
+                    )
+
             jobs = await db.list_due_backup_retries(limit=5)
             for pending_job in jobs:
                 # Re-check activity before every copy so member requests always win.
@@ -1869,24 +1921,73 @@ async def backup_retry_worker(client):
                     if not record or int(record["backup_message_id"] or 0) > 0:
                         await db.complete_backup_retry(file_key)
                         continue
-                    # Use Bot API copyMessage: unlike Pyrogram it does not need
-                    # a locally cached Peer/access_hash for private channel IDs.
-                    copied = await telegram_bot_api("copyMessage", {
-                        "chat_id": int(job["backup_channel_id"]),
-                        "from_chat_id": int(job["primary_channel_id"]),
-                        "message_id": int(job["primary_message_id"]),
-                    })
-                    copied_message_id = int(copied["message_id"])
-                    updated = await db.update_backup_message_id(file_key, copied_message_id)
-                    if not updated:
-                        latest = await db.get_file(file_key)
-                        if not latest or int(latest["backup_message_id"] or 0) <= 0:
-                            raise RuntimeError("Backup copy succeeded but database update was not confirmed")
-                    await db.complete_backup_retry(file_key)
-                    log.info(
-                        "Idle/durable backup completed for file %s (message %s)",
-                        file_key, copied_message_id,
-                    )
+                    if record["album_group_id"]:
+                        album_rows = await db.get_cangku_album_backup_group(
+                            str(record["album_group_id"])
+                        )
+                        if not 2 <= len(album_rows) <= 10:
+                            raise RuntimeError("Album metadata is incomplete; refusing single-file backup")
+                        source_chat_ids = set()
+                        source_message_ids = []
+                        for album_row in album_rows:
+                            source_fingerprint = str(album_row["source_fingerprint"] or "")
+                            source_parts = source_fingerprint.split(":", 2)
+                            if len(source_parts) != 3 or not source_fingerprint.startswith("cangku:"):
+                                raise RuntimeError("Album contains a missing or non-Cangku source pointer")
+                            source_chat_ids.add(int(source_parts[1]))
+                            source_message_ids.append(int(source_parts[2]))
+                        if len(source_chat_ids) != 1:
+                            raise RuntimeError("Album source messages belong to different chats")
+                        if any(
+                            source_message_ids[index] != source_message_ids[0] + index
+                            for index in range(len(source_message_ids))
+                        ):
+                            raise RuntimeError("Album source message IDs are not consecutive; refusing to split")
+                        existing_backup_ids = [
+                            int(row["backup_message_id"] or 0) for row in album_rows
+                        ]
+                        if all(value > 0 for value in existing_backup_ids):
+                            await db.complete_backup_retry(file_key)
+                            continue
+                        if any(value > 0 for value in existing_backup_ids):
+                            raise RuntimeError("Album has partial backup records; refusing to duplicate it")
+                        copied = await telegram_bot_api("copyMessages", {
+                            "chat_id": int(job["backup_channel_id"]),
+                            "from_chat_id": source_chat_ids.pop(),
+                            "message_ids": source_message_ids,
+                        })
+                        if not isinstance(copied, list) or len(copied) != len(album_rows):
+                            raise RuntimeError(
+                                f"Album copy returned {len(copied) if isinstance(copied, list) else 0} "
+                                f"messages for {len(album_rows)} source items"
+                            )
+                        copied_ids = [int(item["message_id"]) for item in copied]
+                        await db.update_album_backup_message_ids(
+                            str(record["album_group_id"]), copied_ids
+                        )
+                        await db.complete_backup_retry(file_key)
+                        log.info(
+                            "Idle/durable album backup completed: group=%s files=%s",
+                            record["album_group_id"], len(copied_ids),
+                        )
+                    else:
+                        # Singles keep the existing Bot API copyMessage path.
+                        copied = await telegram_bot_api("copyMessage", {
+                            "chat_id": int(job["backup_channel_id"]),
+                            "from_chat_id": int(job["primary_channel_id"]),
+                            "message_id": int(job["primary_message_id"]),
+                        })
+                        copied_message_id = int(copied["message_id"])
+                        updated = await db.update_backup_message_id(file_key, copied_message_id)
+                        if not updated:
+                            latest = await db.get_file(file_key)
+                            if not latest or int(latest["backup_message_id"] or 0) <= 0:
+                                raise RuntimeError("Backup copy succeeded but database update was not confirmed")
+                        await db.complete_backup_retry(file_key)
+                        log.info(
+                            "Idle/durable backup completed for file %s (message %s)",
+                            file_key, copied_message_id,
+                        )
                 except Exception as exc:
                     await db.fail_backup_retry(file_key, f"{type(exc).__name__}: {str(exc)[:400]}")
                     log.exception("Backup retry failed for file %s", file_key)
