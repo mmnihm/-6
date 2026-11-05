@@ -1160,9 +1160,7 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 "Album delivery failed and remains pending: user=%s group=%s count=%s",
                 user_id, unit[0][1]["album_group_id"], len(unit),
             )
-            if track_progress:
-                return sent, failed, next_offset, last_sent_message_id
-            continue
+            return sent, failed, next_offset, last_sent_message_id
 
         # Only genuine single files use the individual copy path.
         for entry in unit:
@@ -1182,8 +1180,7 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                     user_id, share_key, offset + position,
                     item["file_key"], error_text,
                 )
-                if track_progress:
-                    return sent, failed, next_offset, last_sent_message_id
+                return sent, failed, next_offset, last_sent_message_id
 
     return sent, failed, next_offset, last_sent_message_id
 
@@ -3144,7 +3141,7 @@ async def user_catalog_callback_handler(client, query):
             )
             summary = f"🎲 随机发送完成：成功 {sent}/{len(rows)} 个文件。"
             if failed:
-                summary += f"\n\n⚠️ 有 {failed} 个文件本次未能发送，没有删除资源或修改目录；可以再次尝试。"
+                summary += f"\n\n⚠️ 本次有 {failed} 个文件发送失败，领取进度没有越过失败位置；请修复存储来源后再次领取。"
             # Send the completion summary through the same direct Bot API
             # transport used by the reliable file-copy path. The raw JSON
             # reply_markup makes it explicit that Telegram receives buttons.
