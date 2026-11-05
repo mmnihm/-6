@@ -1098,7 +1098,8 @@ class Database:
                       SELECT grouped.album_group_id
                       FROM files grouped
                       GROUP BY grouped.album_group_id
-                      HAVING COUNT(*) BETWEEN 2 AND 10
+                      HAVING grouped.album_group_id LIKE 'cangku:%'
+                         AND COUNT(*) BETWEEN 2 AND 10
                          AND SUM(CASE WHEN grouped.source_fingerprint LIKE 'cangku:%'
                                       THEN 1 ELSE 0 END)=COUNT(*)
                          AND SUM(CASE WHEN COALESCE(grouped.backup_message_id, 0)=0
@@ -1174,7 +1175,7 @@ class Database:
                     SELECT grouped.album_group_id
                     FROM files grouped
                     GROUP BY grouped.album_group_id
-                    HAVING grouped.album_group_id IS NOT NULL
+                    HAVING grouped.album_group_id LIKE 'cangku:%'
                        AND COUNT(*) BETWEEN 2 AND 10
                        AND SUM(CASE WHEN grouped.source_fingerprint LIKE 'cangku:%'
                                     THEN 1 ELSE 0 END)=COUNT(*)
