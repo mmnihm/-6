@@ -1093,65 +1093,74 @@ class Database:
         reset_count = 0
         async with self.connect() as db:
             if full_restart:
-                # A deliberate full-copy pass resets only backup pointers, then
-                # queues every indexed, verified single and every complete album.
-                # No personal scanner or history rescan is required.
+                # Reset backup pointers, then enqueue only indexed singles and
+                # complete album groups. Parse source pointers in Python so this
+                # works with both PostgreSQL and SQLite; no user scanner needed.
                 result = await db.execute("""
-                    UPDATE files
-                    SET backup_message_id=0
+                    UPDATE files SET backup_message_id=0
                     WHERE source_fingerprint LIKE 'cangku:%'
                 """)
                 reset_count = max(0, int(getattr(result, "rowcount", 0) or 0))
                 await db.execute("DELETE FROM backup_retry_jobs")
-                await db.execute("""
-                    INSERT INTO backup_retry_jobs(
-                        file_key, primary_channel_id, primary_message_id,
-                        backup_channel_id, attempts, next_retry_at,
-                        last_error, created_at, updated_at
-                    )
-                    SELECT f.file_key,
-                           CAST(substr(f.source_fingerprint,
-                               instr(f.source_fingerprint, ':') + 1,
-                               instr(substr(f.source_fingerprint,
-                                   instr(f.source_fingerprint, ':') + 1), ':') - 1) AS INTEGER),
-                           CAST(substr(f.source_fingerprint,
-                               length(f.source_fingerprint) -
-                               instr(reverse(f.source_fingerprint), ':') + 2) AS INTEGER),
-                           ?, 0, ?, 'Full restart: direct Bot API', ?, ?
-                    FROM files f
-                    WHERE f.source_fingerprint LIKE 'cangku:%'
-                      AND f.album_group_id LIKE 'cangku-single:%'
-                """, (int(backup_channel_id), now, now, now))
-                await db.execute("""
-                    INSERT INTO backup_retry_jobs(
-                        file_key, primary_channel_id, primary_message_id,
-                        backup_channel_id, attempts, next_retry_at,
-                        last_error, created_at, updated_at
-                    )
-                    SELECT f.file_key,
-                           CAST(substr(f.source_fingerprint,
-                               instr(f.source_fingerprint, ':') + 1,
-                               instr(substr(f.source_fingerprint,
-                                   instr(f.source_fingerprint, ':') + 1), ':') - 1) AS INTEGER),
-                           CAST(substr(f.source_fingerprint,
-                               length(f.source_fingerprint) -
-                               instr(reverse(f.source_fingerprint), ':') + 2) AS INTEGER),
-                           ?, 0, ?, 'Full restart: direct Bot API album', ?, ?
-                    FROM files f
-                    WHERE f.album_group_id LIKE 'cangku:%'
-                      AND f.album_position=(
-                          SELECT MIN(x.album_position) FROM files x
-                          WHERE x.album_group_id=f.album_group_id
-                      )
-                      AND (SELECT COUNT(*) FROM files x
-                           WHERE x.album_group_id=f.album_group_id) BETWEEN 2 AND 10
-                      AND (SELECT COUNT(*) FROM files x
-                           WHERE x.album_group_id=f.album_group_id
-                             AND x.source_fingerprint LIKE 'cangku:%')=
-                          (SELECT COUNT(*) FROM files x
-                           WHERE x.album_group_id=f.album_group_id)
-                """, (int(backup_channel_id), now, now, now))
-
+                source_rows = await (await db.execute("""
+                    SELECT file_key, source_fingerprint, album_group_id,
+                           primary_message_id, album_position
+                    FROM files
+                    WHERE source_fingerprint LIKE 'cangku:%'
+                    ORDER BY created_at, file_key
+                """)).fetchall()
+                now_jobs = []
+                albums = {}
+                for row in source_rows:
+                    fingerprint = str(row["source_fingerprint"] or "")
+                    parts = fingerprint.split(":", 2)
+                    if len(parts) != 3 or parts[0] != "cangku":
+                        continue
+                    try:
+                        source_chat_id = int(parts[1])
+                        source_message_id = int(parts[2])
+                    except (TypeError, ValueError):
+                        continue
+                    group_id = str(row["album_group_id"] or "")
+                    if group_id.startswith("cangku-single:"):
+                        now_jobs.append((
+                            str(row["file_key"]), source_chat_id, source_message_id,
+                            int(backup_channel_id), now, "Full restart: direct Bot API single",
+                            now, now,
+                        ))
+                    elif group_id.startswith("cangku:"):
+                        albums.setdefault(group_id, []).append((
+                            row, source_chat_id, source_message_id
+                        ))
+                for group_id, members in albums.items():
+                    if not 2 <= len(members) <= 10:
+                        continue
+                    if len({member[1] for member in members}) != 1:
+                        continue
+                    members.sort(key=lambda member: (
+                        int(member[0]["album_position"] or 0),
+                        member[2],
+                    ))
+                    first_row, source_chat_id, source_message_id = members[0]
+                    now_jobs.append((
+                        str(first_row["file_key"]), source_chat_id, source_message_id,
+                        int(backup_channel_id), now, "Full restart: direct Bot API album",
+                        now, now,
+                    ))
+                for job in now_jobs:
+                    await db.execute("""
+                        INSERT INTO backup_retry_jobs(
+                            file_key, primary_channel_id, primary_message_id,
+                            backup_channel_id, attempts, next_retry_at,
+                            last_error, created_at, updated_at
+                        ) VALUES(?, ?, ?, ?, 0, ?, ?, ?, ?)
+                        ON CONFLICT(file_key) DO UPDATE SET
+                            primary_channel_id=excluded.primary_channel_id,
+                            primary_message_id=excluded.primary_message_id,
+                            backup_channel_id=excluded.backup_channel_id,
+                            attempts=0, next_retry_at=excluded.next_retry_at,
+                            last_error=excluded.last_error, updated_at=excluded.updated_at
+                    """, job)
             # Existing durable jobs are made immediately eligible for the selected
             # backup destination. Their source pointers and retry history remain.
             await db.execute("""
