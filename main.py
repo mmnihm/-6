@@ -1922,9 +1922,14 @@ async def backup_retry_worker(client):
                     if not record or int(record["backup_message_id"] or 0) > 0:
                         await db.complete_backup_retry(file_key)
                         continue
-                    if record["album_group_id"]:
+                    album_group_id = str(record["album_group_id"] or "")
+                    if album_group_id.startswith("cangku-incomplete:"):
+                        raise RuntimeError(
+                            "Cangku album metadata is incomplete; refusing to back it up as separate files"
+                        )
+                    if album_group_id.startswith("cangku:"):
                         album_rows = await db.get_cangku_album_backup_group(
-                            str(record["album_group_id"])
+                            album_group_id
                         )
                         if not 2 <= len(album_rows) <= 10:
                             raise RuntimeError("Album metadata is incomplete; refusing single-file backup")
@@ -1964,12 +1969,12 @@ async def backup_retry_worker(client):
                             )
                         copied_ids = [int(item["message_id"]) for item in copied]
                         await db.update_album_backup_message_ids(
-                            str(record["album_group_id"]), copied_ids
+                            album_group_id, copied_ids
                         )
                         await db.complete_backup_retry(file_key)
                         log.info(
                             "Idle/durable album backup completed: group=%s files=%s",
-                            record["album_group_id"], len(copied_ids),
+                            album_group_id, len(copied_ids),
                         )
                     else:
                         # Singles keep the existing Bot API copyMessage path.
