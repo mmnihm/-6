@@ -787,20 +787,51 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                                 chat_id=resolved_channel_id,
                                 message_id=int(item.id),
                             )
-                            if (
-                                fetched and 2 <= len(fetched) <= 10
-                                and all(
-                                    str(getattr(member, "media_group_id", "")) == group_key
-                                    for member in fetched
+                            # Some Telegram/Pyrogram responses return an empty or
+                            # partial media group even though history exposes the
+                            # media_group_id. Fall back to a bounded message-ID
+                            # window (Telegram albums contain at most 10 messages).
+                            def matching_album(candidate_messages):
+                                matched = [
+                                    member for member in (candidate_messages or [])
+                                    if str(getattr(member, "media_group_id", "") or "") == group_key
+                                ]
+                                matched.sort(key=lambda member: int(member.id))
+                                ids = [int(member.id) for member in matched]
+                                return (
+                                    matched
+                                    if 2 <= len(matched) <= 10
+                                    and int(item.id) in ids
+                                    and len(ids) == len(set(ids))
+                                    else None
                                 )
-                            ):
-                                messages = sorted(fetched, key=lambda member: int(member.id))
+
+                            verified_messages = matching_album(fetched)
+                            if not verified_messages:
+                                anchor_id = int(item.id)
+                                nearby = await scanner_api_call(
+                                    scanner.get_messages,
+                                    chat_id=resolved_channel_id,
+                                    message_ids=list(range(max(1, anchor_id - 9), anchor_id + 10)),
+                                )
+                                verified_messages = matching_album(nearby)
+                                log.info(
+                                    "History scan album fallback: channel=%s group=%s anchor=%s "
+                                    "returned=%s matched=%s ids=%s",
+                                    resolved_channel_id, group_key, anchor_id,
+                                    len(nearby or []), len(verified_messages or []),
+                                    [int(member.id) for member in (verified_messages or [])],
+                                )
+
+                            if verified_messages:
+                                messages = verified_messages
                                 processed_album_ids.add(group_key)
                                 album_verified = True
                             else:
                                 log.warning(
-                                    "History scan could not verify complete album: channel=%s group=%s",
-                                    resolved_channel_id, group_key,
+                                    "History scan could not verify complete album: channel=%s group=%s "
+                                    "anchor=%s get_media_group_count=%s",
+                                    resolved_channel_id, group_key, item.id, len(fetched or []),
                                 )
                         except Exception as exc:
                             album_error = f"{type(exc).__name__}: {exc}"
