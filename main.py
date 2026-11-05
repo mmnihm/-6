@@ -2012,21 +2012,48 @@ async def backup_retry_worker(client):
                         if all(value > 0 for value in existing_backup_ids):
                             await db.complete_backup_retry(file_key)
                             continue
-                        if any(value > 0 for value in existing_backup_ids):
-                            raise RuntimeError("Album has partial backup records; refusing to duplicate it")
-                        copied = await telegram_bot_api("copyMessages", {
-                            "chat_id": int(job["backup_channel_id"]),
-                            "from_chat_id": source_chat_ids.pop(),
-                            "message_ids": source_message_ids,
-                        })
-                        if not isinstance(copied, list) or len(copied) != len(album_rows):
-                            raise RuntimeError(
-                                f"Album copy returned {len(copied) if isinstance(copied, list) else 0} "
-                                f"messages for {len(album_rows)} source items"
-                            )
-                        copied_ids = [int(item["message_id"]) for item in copied]
+                        # Some members may have been copied by the older single-file
+                        # worker before album metadata was discovered. Preserve those
+                        # valid mappings and copy only the missing source messages.
+                        missing_source_ids = [
+                            source_id for source_id, backup_id
+                            in zip(source_message_ids, existing_backup_ids)
+                            if backup_id <= 0
+                        ]
+                        source_chat_id = source_chat_ids.pop()
+                        if len(missing_source_ids) == len(source_message_ids):
+                            copied = await telegram_bot_api("copyMessages", {
+                                "chat_id": int(job["backup_channel_id"]),
+                                "from_chat_id": source_chat_id,
+                                "message_ids": missing_source_ids,
+                            })
+                            if not isinstance(copied, list) or len(copied) != len(missing_source_ids):
+                                raise RuntimeError(
+                                    f"Album copy returned {len(copied) if isinstance(copied, list) else 0} "
+                                    f"messages for {len(missing_source_ids)} source items"
+                                )
+                            copied_ids = [int(item["message_id"]) for item in copied]
+                        elif len(missing_source_ids) == 1:
+                            copied_one = await telegram_bot_api("copyMessage", {
+                                "chat_id": int(job["backup_channel_id"]),
+                                "from_chat_id": source_chat_id,
+                                "message_id": missing_source_ids[0],
+                            })
+                            copied_ids = [int(copied_one["message_id"])]
+                        else:
+                            copied = await telegram_bot_api("copyMessages", {
+                                "chat_id": int(job["backup_channel_id"]),
+                                "from_chat_id": source_chat_id,
+                                "message_ids": missing_source_ids,
+                            })
+                            if not isinstance(copied, list) or len(copied) != len(missing_source_ids):
+                                raise RuntimeError(
+                                    f"Remaining album copy returned {len(copied) if isinstance(copied, list) else 0} "
+                                    f"messages for {len(missing_source_ids)} missing items"
+                                )
+                            copied_ids = [int(item["message_id"]) for item in copied]
                         await db.update_album_backup_message_ids(
-                            album_group_id, copied_ids
+                            album_group_id, copied_ids, missing_source_ids
                         )
                         await db.complete_backup_retry(file_key)
                         log.info(
