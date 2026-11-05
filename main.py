@@ -1016,6 +1016,12 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
     primary_channel_id, backup_channel_id = await get_storage_channels()
     records = await db.get_files_by_keys(item["file_key"] for item in batch)
     records_by_key = {row["file_key"]: row for row in records}
+    delivered_keys = (
+        await db.get_user_history_keys(
+            user_id, [item["file_key"] for item in batch]
+        )
+        if track_progress else set()
+    )
 
     prepared = []
     for index, item in enumerate(batch):
@@ -1025,9 +1031,19 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
             fingerprint = str(record["source_fingerprint"] or "")
             primary_id = int(record["primary_message_id"] or 0)
             backup_id = int(record["backup_message_id"] or 0)
-            # Prefer the primary channel for every catalog item, including
-            # legacy Cangku imports; use backup only when no primary copy exists.
-            if primary_channel_id and primary_id > 0:
+            # A legacy Cangku import may have its original source message ID
+            # in primary_message_id. Never pair that ID with the newly-bound
+            # primary storage channel unless it is a genuine primary copy.
+            legacy_source = None
+            if fingerprint.startswith("cangku:"):
+                parts = fingerprint.split(":", 2)
+                if len(parts) == 3:
+                    try:
+                        legacy_source = (int(parts[1]), int(parts[2]))
+                    except ValueError:
+                        legacy_source = None
+            legacy_pointer = bool(legacy_source and primary_id == legacy_source[1])
+            if primary_channel_id and primary_id > 0 and not legacy_pointer:
                 source_chat_id = int(primary_channel_id)
                 source_message_id = primary_id
             elif backup_channel_id and backup_id > 0:
@@ -1072,6 +1088,16 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
 
     for unit in units:
         is_album = bool(unit[0][1]["album_group_id"])
+        if track_progress:
+            unit_keys = [entry[1]["file_key"] for entry in unit]
+            # Albums are atomic: skip only when every member was previously
+            # delivered successfully. Individual files can be safely skipped.
+            if (is_album and all(key in delivered_keys for key in unit_keys)) or (
+                not is_album and unit_keys[0] in delivered_keys
+            ):
+                completed.update(entry[0] for entry in unit)
+                await advance_progress()
+                continue
         delivered = False
         if is_album and str(unit[0][1]["album_group_id"]) not in invalid_album_groups:
             album_records = [entry[2] for entry in unit]
@@ -3270,7 +3296,7 @@ async def user_catalog_callback_handler(client, query):
             chunk = selected[chunk_start:chunk_start + 5]
             rows.append([
                 InlineKeyboardButton(
-                    str(index + 1),
+                    str(index),
                     callback_data=f"uc:folderstats:{row['share_key']}:{page}",
                 )
                 for index, row in enumerate(chunk, start=chunk_start + 1)
@@ -3303,20 +3329,20 @@ async def user_catalog_callback_handler(client, query):
         list_text = (
             f"🗂️ 文件夹列表（共 {len(categories)} 个，第 {page + 1} 页）\n"
             f"↕️ 当前排序：{sort_labels[folder_sort]}\n\n"
-            "点击文件夹名称或下方数字即可打开目录。"
+            "点击文件夹名称复制目录名；点击下方数字打开目录详情。"
             if categories else "🗂️ 暂无文件夹分类。"
         )
         copy_rows = [
             [{
                 "text": f"{index + 1}. 📁 {row['category']}（{int(row['file_count'] or 0)}）",
-                "callback_data": f"uc:folderstats:{row['share_key']}:{page}",
+                "copy_text": {"text": str(row["category"])},
             }]
             for index, row in enumerate(selected)
         ]
         for chunk_start in range(0, len(selected), 5):
             chunk = selected[chunk_start:chunk_start + 5]
             copy_rows.append([{
-                "text": str(index + 1),
+                "text": str(index),
                 "callback_data": f"uc:folderstats:{row['share_key']}:{page}",
             } for index, row in enumerate(chunk, start=chunk_start + 1)])
         nav_buttons = []
@@ -3548,8 +3574,16 @@ async def user_catalog_callback_handler(client, query):
             # Keep member delivery progress separate from legacy admin-send progress.
             member_progress_key = f"member:{share_key}"
             saved_offset = await db.get_category_delivery_progress(user.id, member_progress_key)
-            # A stale button must never make a user receive already-delivered batches again.
-            offset = max(offset, saved_offset)
+            # Older releases advanced this cursor even when Telegram rejected a
+            # copy. Repair each existing member/folder cursor once from successful
+            # delivery history, without deleting that history or resetting users.
+            if saved_offset > 0:
+                saved_offset = await db.repair_category_delivery_progress_from_history(
+                    user.id, member_progress_key, category["name"]
+                )
+            # The database cursor is authoritative; stale Telegram buttons must
+            # not jump over resources that were never delivered.
+            offset = saved_offset
             remaining = max(0, total - offset)
             batch = await db.list_category_files(
                 category["name"], limit=min(20, remaining), offset=offset
