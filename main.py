@@ -752,12 +752,15 @@ def guess_category(message, media_type, file_name):
 async def run_history_scan(primary_channel_id, backup_channel_id=None):
     """Index source messages while creating directories only for tagged albums."""
     global scan_task
+    current_message_id = None
+    current_offset_id = None
     try:
         progress = await db.get_scan_progress(primary_channel_id)
         if not progress["completed"]:
             chat = await resolve_scanner_chat(primary_channel_id)
             resolved_channel_id = int(chat.id)
             offset_id = int(progress["last_message_id"] or 0)
+            current_offset_id = offset_id
             log.info(
                 "Primary history scan started: channel=%s title=%s offset=%s",
                 resolved_channel_id, getattr(chat, "title", ""), offset_id
@@ -767,6 +770,7 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
             async for item in scanner.get_chat_history(
                 resolved_channel_id, offset_id=offset_id
             ):
+                current_message_id = int(item.id)
                 group_id = getattr(item, "media_group_id", None)
                 messages = [item]
                 album_verified = False
@@ -776,6 +780,7 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                         continue
                     if group_key not in attempted_album_ids:
                         attempted_album_ids.add(group_key)
+                        album_error = None
                         try:
                             fetched = await scanner_api_call(
                                 scanner.get_media_group,
@@ -797,15 +802,21 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                                     "History scan could not verify complete album: channel=%s group=%s",
                                     resolved_channel_id, group_key,
                                 )
-                        except Exception:
+                        except Exception as exc:
+                            album_error = f"{type(exc).__name__}: {exc}"
                             log.exception(
-                                "History scan album verification failed: channel=%s group=%s",
-                                resolved_channel_id, group_key,
+                                "History scan album verification failed: channel=%s group=%s message_id=%s",
+                                resolved_channel_id, group_key, item.id,
                             )
                     if not album_verified:
                         # Never turn an unverified album member into a single-file backup.
+                        reason = album_error or (
+                            "Telegram returned an empty, incomplete, or mismatched media group"
+                        )
                         raise RuntimeError(
-                            f"Could not verify complete Telegram album {group_key}; scan stopped safely"
+                            f"Could not verify complete Telegram album {group_key} "
+                            f"at message_id={item.id}; reason={reason}. "
+                            "Scan stopped safely without splitting the album."
                         )
 
                 # Only a Telegram-confirmed album can receive a directory.
@@ -861,12 +872,20 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
             config.ADMIN_ID, "⏸️ 主频道扫描已暂停。再次发送 /scan 可从上次进度继续。"
         )
         raise
-    except Exception:
-        log.exception("Primary history scan failed")
+    except Exception as exc:
+        error_detail = f"{type(exc).__name__}: {exc}"
+        log.exception(
+            "Primary history scan failed: channel=%s message_id=%s offset_id=%s error=%s",
+            primary_channel_id, current_message_id, current_offset_id, error_detail,
+        )
         try:
             await app.send_message(
                 config.ADMIN_ID,
-                "⚠️ 主频道扫描遇到错误，已保留进度。修复频道访问后发送 /scan 继续。"
+                "⚠️ 主频道扫描失败，已保留进度。\n"
+                f"频道 ID：{primary_channel_id}\n"
+                f"出错消息 ID：{current_message_id or '尚未读取到'}\n"
+                f"错误：{error_detail[:900]}\n\n"
+                "修复对应问题后发送 /scan 继续；不要点击从头开始备份。"
             )
         except Exception:
             log.exception("Could not notify admin about scan failure")
