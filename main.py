@@ -2387,13 +2387,24 @@ async def backup_retry_worker(client):
                             album_group_id, len(copied_ids),
                         )
                     else:
-                        # Forward singles so Telegram displays the original source attribution.
-                        copied = await telegram_bot_api("forwardMessage", {
-                            "chat_id": int(job["backup_channel_id"]),
-                            "from_chat_id": int(job["primary_channel_id"]),
-                            "message_id": int(job["primary_message_id"]),
-                        })
-                        copied_message_id = int(copied["message_id"])
+                        # Use the same logged-in scanner account for source access
+                        # and forwarding. The bot account may not be a member of the
+                        # private primary channel, causing Bot API "chat not found".
+                        if scanner is None or not scanner.is_connected:
+                            raise RuntimeError(
+                                "Scanner account is not connected; cannot forward source file"
+                            )
+                        copied = await scanner_api_call(
+                            scanner.forward_messages,
+                            chat_id=int(job["backup_channel_id"]),
+                            from_chat_id=int(job["primary_channel_id"]),
+                            message_ids=int(job["primary_message_id"]),
+                        )
+                        if copied is None or not getattr(copied, "id", None):
+                            raise RuntimeError(
+                                "Scanner did not return a valid forwarded source message"
+                            )
+                        copied_message_id = int(copied.id)
                         updated = await db.update_backup_message_id(file_key, copied_message_id)
                         if not updated:
                             latest = await db.get_file(file_key)
