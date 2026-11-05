@@ -796,6 +796,11 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                         # Each source message gets its own stable pointer; the album
                         # group key makes the entire group one backup job.
                         source_fingerprint = f"cangku:{resolved_channel_id}:{int(member.id)}"
+                        await db.update_cangku_album_metadata(
+                            source_fingerprint,
+                            album_key if is_album else f"cangku-single:{resolved_channel_id}:{int(member.id)}",
+                            position if is_album else 0,
+                        )
                         await db.save_scanned_message(
                             primary_channel_id, None, primary_channel_id,
                             member.id, source_fingerprint, file_name, media_type, category,
