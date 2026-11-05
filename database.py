@@ -1257,7 +1257,8 @@ class Database:
             """, (str(album_group_id),))).fetchall()
 
     async def update_album_backup_message_ids(
-        self, album_group_id, copied_message_ids, source_message_ids=None
+        self, album_group_id, copied_message_ids, source_message_ids=None,
+        replace_existing=False,
     ):
         """Atomically fill backup IDs for all album rows or only explicitly mapped missing members."""
         ids = [int(value) for value in (copied_message_ids or [])]
@@ -1296,10 +1297,16 @@ class Database:
             if len(targets) != len(ids):
                 raise RuntimeError("Album backup result count does not match target members")
             for row, copied_id in zip(targets, ids):
-                result = await db.execute("""
-                    UPDATE files SET backup_message_id=?
-                    WHERE file_key=? AND COALESCE(backup_message_id, 0)=0
-                """, (copied_id, row["file_key"]))
+                if replace_existing:
+                    result = await db.execute("""
+                        UPDATE files SET backup_message_id=?
+                        WHERE file_key=?
+                    """, (copied_id, row["file_key"]))
+                else:
+                    result = await db.execute("""
+                        UPDATE files SET backup_message_id=?
+                        WHERE file_key=? AND COALESCE(backup_message_id, 0)=0
+                    """, (copied_id, row["file_key"]))
                 if getattr(result, "rowcount", 0) != 1:
                     raise RuntimeError("Could not atomically save every album backup message ID")
             await db.commit()
