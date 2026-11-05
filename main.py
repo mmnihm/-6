@@ -60,6 +60,33 @@ last_user_activity = 0.0
 category_delivery_in_progress = set()
 search_sessions = {}
 
+# One shared gate for all metadata reads made by the user-account scanner.
+# Telegram's channels.getMessages is especially sensitive to bursts of album lookups.
+scanner_api_lock = asyncio.Lock()
+scanner_api_next_at = 0.0
+
+
+async def scanner_api_call(method, *args, min_interval=1.5, **kwargs):
+    """Serialize scanner metadata requests and keep a small gap between calls."""
+    global scanner_api_next_at
+    async with scanner_api_lock:
+        loop = asyncio.get_running_loop()
+        wait_for = scanner_api_next_at - loop.time()
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        try:
+            return await method(*args, **kwargs)
+        except FloodWait as exc:
+            # Pyrogram may already auto-wait depending on sleep_threshold. Keep
+            # subsequent scanner calls cooled down as well, rather than letting
+            # other tasks immediately hit the same Telegram limit.
+            seconds = max(30, int(getattr(exc, "value", 0) or 0) + 3)
+            scanner_api_next_at = loop.time() + seconds
+            log.warning("Scanner shared cooldown activated for %s seconds", seconds)
+            raise
+        finally:
+            scanner_api_next_at = max(scanner_api_next_at, loop.time() + min_interval)
+
 
 def admin_home_keyboard():
     return ReplyKeyboardMarkup(
@@ -749,7 +776,8 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                     if group_key not in attempted_album_ids:
                         attempted_album_ids.add(group_key)
                         try:
-                            fetched = await scanner.get_media_group(
+                            fetched = await scanner_api_call(
+                                scanner.get_media_group,
                                 chat_id=resolved_channel_id,
                                 message_id=int(item.id),
                             )
@@ -1895,7 +1923,7 @@ async def discover_cangku_album_metadata(candidate):
         return False
     try:
         chat_id, message_id = int(parts[1]), int(parts[2])
-        source_message = await scanner.get_messages(chat_id, message_id)
+        source_message = await scanner_api_call(scanner.get_messages, chat_id, message_id)
         if not source_message or getattr(source_message, "empty", False):
             raise RuntimeError("Scanner could not read the original Cangku message")
         group_id = getattr(source_message, "media_group_id", None)
@@ -1905,7 +1933,7 @@ async def discover_cangku_album_metadata(candidate):
                 fingerprint, f"cangku-single:{chat_id}:{message_id}", 0
             )
             return True
-        group = await scanner.get_media_group(chat_id, message_id)
+        group = await scanner_api_call(scanner.get_media_group, chat_id, message_id)
         if not 2 <= len(group) <= 10 or any(
             str(getattr(item, "media_group_id", "")) != str(group_id)
             for item in group
@@ -2039,7 +2067,7 @@ async def backup_retry_worker(client):
                 # Resolve original Telegram media_group_id first. Without the
                 # scanner session we cannot safely distinguish a single file
                 # from one member of an album, so never enqueue blind singles.
-                candidates = await db.list_unbacked_cangku_files(limit=5)
+                candidates = await db.list_unbacked_cangku_files(limit=1)
                 for candidate in candidates:
                     await discover_cangku_album_metadata(candidate)
                     # Once Telegram confirms a legacy source is a true single,
@@ -2049,7 +2077,7 @@ async def backup_retry_worker(client):
                     group_id = str(refreshed["album_group_id"] or "") if refreshed else ""
                     fingerprint = str(candidate["source_fingerprint"] or "")
                     parts = fingerprint.split(":", 2)
-                    if (group_id.startswith("cangku-single:") or group_id.startswith("cangku-incomplete:")) and len(parts) == 3:
+                    if group_id.startswith("cangku-single:") and len(parts) == 3:
                         try:
                             await db.enqueue_backup_retry(
                                 str(candidate["file_key"]), int(parts[1]),
@@ -2062,7 +2090,7 @@ async def backup_retry_worker(client):
                 # Queue one durable job per complete Telegram album, not one
                 # job per photo/video. The representative row is the first
                 # original message; the worker expands it to the whole group.
-                album_candidates = await db.list_unbacked_cangku_albums(limit=5)
+                album_candidates = await db.list_unbacked_cangku_albums(limit=1)
                 for candidate in album_candidates:
                     fingerprint = str(candidate["source_fingerprint"] or "")
                     parts = fingerprint.split(":", 2)
@@ -2127,9 +2155,17 @@ async def backup_retry_worker(client):
                                 file_key,
                             )
                             continue
-                        await discover_cangku_album_metadata({
+                        verified = await discover_cangku_album_metadata({
                             "source_fingerprint": source_fingerprint
                         })
+                        if not verified:
+                            await db.defer_backup_retry(
+                                file_key,
+                                "Scanner could not verify the source message/album; cooling down before retry",
+                                delay_seconds=900,
+                            )
+                            log.warning("Deferred unverified Cangku source for 15 minutes: file=%s", file_key)
+                            continue
                         record = await db.get_file(file_key)
                         if not record:
                             raise RuntimeError("Cangku source index disappeared during album verification")
@@ -2178,7 +2214,8 @@ async def backup_retry_worker(client):
                             # read them. If verification is unavailable, preserve the
                             # existing mappings rather than creating duplicate backups.
                             try:
-                                destination_group = await scanner.get_media_group(
+                                destination_group = await scanner_api_call(
+                                    scanner.get_media_group,
                                     chat_id=backup_chat_id,
                                     message_id=existing_backup_ids[0],
                                 )
