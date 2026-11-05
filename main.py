@@ -3369,8 +3369,20 @@ async def user_catalog_callback_handler(client, query):
                 "reply_markup": {"inline_keyboard": copy_rows},
             })
         except Exception:
-            log.exception("Could not render folder copy buttons; using compatible keyboard")
-            await message.edit_text(list_text, reply_markup=InlineKeyboardMarkup(rows))
+            log.exception("Could not render folder copy buttons; showing selectable folder names")
+            fallback_names = "\n".join(
+                f"{start_at + index + 1}. {row['category']}（{int(row['file_count'] or 0)}）"
+                for index, row in enumerate(selected)
+            )
+            fallback_text = list_text + (
+                "\n\n" + fallback_names + "\n\n可长按上方目录名称复制。"
+                if fallback_names else ""
+            )
+            fallback_rows = rows[len(selected):]
+            await message.edit_text(
+                fallback_text,
+                reply_markup=InlineKeyboardMarkup(fallback_rows),
+            )
         return
 
     if action[1] == "folderstats" and len(action) >= 3:
@@ -3917,8 +3929,20 @@ async def admin_callback_handler(client, query):
                 "reply_markup": {"inline_keyboard": copy_rows},
             })
         except Exception:
-            log.exception("Could not render admin folder copy buttons; using compatible keyboard")
-            await message.edit_text(list_text, reply_markup=InlineKeyboardMarkup(rows))
+            log.exception("Could not render admin folder copy buttons; showing selectable folder names")
+            fallback_names = "\n".join(
+                f"{start_at + index + 1}. {row['category']}（{int(row['file_count'] or 0)}）"
+                for index, row in enumerate(selected)
+            )
+            fallback_text = list_text + (
+                "\n\n" + fallback_names + "\n\n可长按上方目录名称复制。"
+                if fallback_names else ""
+            )
+            fallback_rows = rows[:1] + rows[1 + len(selected):]
+            await message.edit_text(
+                fallback_text,
+                reply_markup=InlineKeyboardMarkup(fallback_rows),
+            )
     elif action == "dirnew":
         pending_category_actions[user.id] = {"action": "create"}
         await message.edit_text(
