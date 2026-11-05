@@ -64,6 +64,7 @@ search_sessions = {}
 # Telegram's channels.getMessages is especially sensitive to bursts of album lookups.
 scanner_api_lock = asyncio.Lock()
 scanner_api_next_at = 0.0
+scanner_metadata_cooldowns = {}
 
 
 async def scanner_api_call(method, *args, min_interval=1.5, **kwargs):
@@ -1921,6 +1922,9 @@ async def discover_cangku_album_metadata(candidate):
     parts = fingerprint.split(":", 2)
     if len(parts) != 3 or parts[0] != "cangku":
         return False
+    loop = asyncio.get_running_loop()
+    if scanner_metadata_cooldowns.get(fingerprint, 0.0) > loop.time():
+        return False
     try:
         chat_id, message_id = int(parts[1]), int(parts[2])
         source_message = await scanner_api_call(scanner.get_messages, chat_id, message_id)
@@ -1989,12 +1993,14 @@ async def discover_cangku_album_metadata(candidate):
                     )
                 repaired += 1
             await db.update_cangku_album_metadata(source_fp, album_key, position)
+        scanner_metadata_cooldowns.pop(fingerprint, None)
         log.info(
             "Discovered Cangku source album via scanner: group=%s files=%s repaired_index_rows=%s",
             album_key, len(ids), repaired,
         )
         return True
     except Exception:
+        scanner_metadata_cooldowns[fingerprint] = loop.time() + 900
         log.exception("Could not safely identify Cangku source media group: %s", fingerprint)
         # Do not let an unreadable/partial source fall through to copyMessage.
         try:
