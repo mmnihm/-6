@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 
 from aiohttp import web
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, raw, utils
 from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio,
@@ -87,6 +87,48 @@ async def scanner_api_call(method, *args, min_interval=1.5, **kwargs):
             raise
         finally:
             scanner_api_next_at = max(scanner_api_next_at, loop.time() + min_interval)
+
+async def iter_chat_history_oldest_first(chat_id, after_message_id=0, page_size=100):
+    """Yield Telegram history from the oldest message toward the newest.
+
+    Pyrogram 2.0.106 exposes reverse-chronological get_chat_history only.
+    Use Telegram's GetHistory offset window (the same strategy used by
+    reverse-history Pyrogram forks), then sort each page into ascending order.
+    """
+    cursor = max(0, int(after_message_id or 0))
+    peer = await scanner.resolve_peer(chat_id)
+    page_size = max(1, min(100, int(page_size or 100)))
+    while True:
+        # offset_id=1 anchors the first page at the beginning of the chat.
+        # Subsequent pages start immediately after the last processed ID.
+        offset_id = cursor + 1 if cursor else 1
+        response = await scanner_api_call(
+            scanner.invoke,
+            raw.functions.messages.GetHistory(
+                peer=peer,
+                offset_id=offset_id,
+                offset_date=0,
+                add_offset=-page_size,
+                limit=page_size,
+                max_id=0,
+                min_id=0,
+                hash=0,
+            ),
+            sleep_threshold=60,
+        )
+        page = await utils.parse_messages(scanner, response, replies=0)
+        page = sorted(
+            (message for message in (page or []) if int(message.id) > cursor),
+            key=lambda message: int(message.id),
+        )
+        if not page:
+            return
+        for message in page:
+            message_id = int(message.id)
+            if message_id <= cursor:
+                continue
+            cursor = message_id
+            yield message
 
 
 def admin_home_keyboard():
@@ -755,6 +797,16 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
     current_message_id = None
     current_offset_id = None
     try:
+        scan_direction = await db.get_setting("history_scan_direction")
+        if scan_direction != "oldest_first_v1":
+            # Existing progress was written by newest-to-oldest scanning.
+            # Restart only the cursor (not indexed rows) so the new ascending
+            # pass can safely revisit existing messages and fill missing rows.
+            await db.reset_scan_progress_for_full_rescan(primary_channel_id)
+            await db.set_setting("history_scan_direction", "oldest_first_v1")
+            log.warning(
+                "Migrated history scan to oldest-first mode; existing indexed data is preserved"
+            )
         progress = await db.get_scan_progress(primary_channel_id)
         if not progress["completed"]:
             chat = await resolve_scanner_chat(primary_channel_id)
@@ -765,147 +817,66 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                 "Primary history scan started: channel=%s title=%s offset=%s",
                 resolved_channel_id, getattr(chat, "title", ""), offset_id
             )
-            processed_album_ids = set()
-            attempted_album_ids = set()
-            async for item in scanner.get_chat_history(
-                resolved_channel_id, offset_id=offset_id
+            album_category_cache = {}
+            async for item in iter_chat_history_oldest_first(
+                resolved_channel_id, after_message_id=offset_id
             ):
                 current_message_id = int(item.id)
                 group_id = getattr(item, "media_group_id", None)
-                messages = [item]
-                album_verified = False
-                if group_id:
-                    group_key = str(group_id)
-                    if group_key in processed_album_ids:
-                        continue
-                    if group_key not in attempted_album_ids:
-                        attempted_album_ids.add(group_key)
-                        album_error = None
-                        try:
-                            fetched = await scanner_api_call(
-                                scanner.get_media_group,
-                                chat_id=resolved_channel_id,
-                                message_id=int(item.id),
-                            )
-                            # Some Telegram/Pyrogram responses return an empty or
-                            # partial media group even though history exposes the
-                            # media_group_id. Fall back to a bounded message-ID
-                            # window (Telegram albums contain at most 10 messages).
-                            def matching_album(candidate_messages):
-                                matched = [
-                                    member for member in (candidate_messages or [])
-                                    if str(getattr(member, "media_group_id", "") or "") == group_key
-                                ]
-                                matched.sort(key=lambda member: int(member.id))
-                                ids = [int(member.id) for member in matched]
-                                return (
-                                    matched
-                                    if 2 <= len(matched) <= 10
-                                    and int(item.id) in ids
-                                    and len(ids) == len(set(ids))
-                                    else None
-                                )
-
-                            verified_messages = matching_album(fetched)
-                            fallback_ids = []
-                            if not verified_messages:
-                                anchor_id = int(item.id)
-                                # First retry by message IDs. Missing IDs may be
-                                # returned as None, so matching_album filters them.
-                                nearby = await scanner_api_call(
-                                    scanner.get_messages,
-                                    chat_id=resolved_channel_id,
-                                    message_ids=list(range(max(1, anchor_id - 9), anchor_id + 10)),
-                                )
-                                verified_messages = matching_album(nearby)
-                                fallback_ids = [
-                                    int(member.id) for member in (nearby or [])
-                                    if member is not None
-                                ]
-                                # Message IDs inside an album are not guaranteed
-                                # to be numerically consecutive. Read actual chat
-                                # history around the anchor and match the exact
-                                # Telegram media_group_id instead of assuming IDs.
-                                if not verified_messages:
-                                    history_nearby = []
-                                    async for candidate in scanner.get_chat_history(
-                                        resolved_channel_id,
-                                        offset_id=anchor_id + 1,
-                                        limit=30,
-                                    ):
-                                        history_nearby.append(candidate)
-                                    verified_messages = matching_album(history_nearby)
-                                    fallback_ids = [
-                                        int(member.id) for member in history_nearby
-                                    ]
-                                log.info(
-                                    "History scan album fallback: channel=%s group=%s anchor=%s "
-                                    "get_media_group_count=%s nearby_ids=%s matched=%s matched_ids=%s",
-                                    resolved_channel_id, group_key, anchor_id,
-                                    len(fetched or []), fallback_ids,
-                                    len(verified_messages or []),
-                                    [int(member.id) for member in (verified_messages or [])],
-                                )
-
-                            if verified_messages:
-                                messages = verified_messages
-                                processed_album_ids.add(group_key)
-                                album_verified = True
-                            else:
-                                log.warning(
-                                    "History scan could not verify complete album: channel=%s group=%s "
-                                    "anchor=%s get_media_group_count=%s",
-                                    resolved_channel_id, group_key, item.id, len(fetched or []),
-                                )
-                        except Exception as exc:
-                            album_error = f"{type(exc).__name__}: {exc}"
-                            log.exception(
-                                "History scan album verification failed: channel=%s group=%s message_id=%s",
-                                resolved_channel_id, group_key, item.id,
-                            )
-                    if not album_verified:
-                        # Never turn an unverified album member into a single-file backup.
-                        reason = album_error or (
-                            "Telegram returned an empty, incomplete, or mismatched media group"
-                        )
-                        raise RuntimeError(
-                            f"Could not verify complete Telegram album {group_key} "
-                            f"at message_id={item.id}; reason={reason}. "
-                            "Scan stopped safely without splitting the album."
-                        )
-
-                # Only a Telegram-confirmed album can receive a directory.
-                is_album = album_verified and len(messages) >= 2
-                category = parse_chinese_album_category(messages) if is_album else ""
+                is_album_member = bool(group_id)
+                group_key = str(group_id) if is_album_member else None
                 album_key = (
-                    f"cangku:{resolved_channel_id}:{group_id}" if is_album else None
+                    f"cangku:{resolved_channel_id}:{group_key}"
+                    if is_album_member else None
                 )
 
-                for position, member in enumerate(messages):
-                    media_type, file_name, media_unique_id = media_details(member)
-                    created_at = (
-                        member.date.isoformat() if getattr(member, "date", None)
-                        else datetime.now(timezone.utc).isoformat()
-                    )
-                    if media_type:
-                        # Each source message gets its own stable pointer; the album
-                        # group key makes the entire group one backup job.
-                        source_fingerprint = f"cangku:{resolved_channel_id}:{int(member.id)}"
+                media_type, file_name, media_unique_id = media_details(item)
+                if not media_type:
+                    await db.advance_scan_cursor(primary_channel_id, current_message_id)
+                    continue
+
+                # Index each Telegram message independently. Members of the same
+                # album share media_group_id; no get_media_group verification is
+                # needed during history indexing.
+                fingerprint = f"cangku:{resolved_channel_id}:{current_message_id}"
+                caption_category = (
+                    parse_chinese_album_category([item]) if is_album_member else ""
+                )
+                if caption_category and album_key:
+                    album_category_cache[album_key] = caption_category
+                    category = caption_category
+                elif album_key:
+                    category = album_category_cache.get(album_key, "")
+                else:
+                    category = ""
+
+                created_at = (
+                    item.date.isoformat() if getattr(item, "date", None)
+                    else datetime.now(timezone.utc).isoformat()
+                )
+                await db.save_scanned_message(
+                    primary_channel_id, None, primary_channel_id,
+                    item.id, fingerprint, file_name, media_type, category,
+                    created_at, config.ADMIN_ID,
+                    secrets.token_urlsafe(9).replace("-", "").replace("_", ""),
+                    album_group_id=(
+                        album_key if album_key
+                        else f"cangku-single:{resolved_channel_id}:{current_message_id}"
+                    ),
+                    # The real Telegram message ID is a stable ordering key. Do
+                    # not assume album member IDs must be numerically consecutive.
+                    album_position=current_message_id if album_key else 0,
+                )
+                if album_key:
+                    if caption_category:
                         await db.update_cangku_album_metadata(
-                            source_fingerprint,
-                            album_key if is_album else f"cangku-single:{resolved_channel_id}:{int(member.id)}",
-                            position if is_album else 0,
-                        )
-                        await db.save_scanned_message(
-                            primary_channel_id, None, primary_channel_id,
-                            member.id, source_fingerprint, file_name, media_type, category,
-                            created_at, config.ADMIN_ID,
-                            secrets.token_urlsafe(9).replace("-", "").replace("_", ""),
-                            album_group_id=album_key,
-                            album_position=position if is_album else 0,
+                            fingerprint, album_key, current_message_id,
+                            category=caption_category,
                         )
                     else:
-                        await db.advance_scan_cursor(primary_channel_id, member.id)
+                        await db.update_cangku_album_metadata(
+                            fingerprint, album_key, current_message_id
+                        )
             await db.mark_scan_completed(primary_channel_id)
             if await db.get_setting("backup_full_scan_required") == "1":
                 await db.set_setting("backup_full_scan_required", "0")
@@ -2259,11 +2230,8 @@ async def backup_retry_worker(client):
                             source_message_ids.append(int(source_parts[2]))
                         if len(source_chat_ids) != 1:
                             raise RuntimeError("Album source messages belong to different chats")
-                        if any(
-                            source_message_ids[index] != source_message_ids[0] + index
-                            for index in range(len(source_message_ids))
-                        ):
-                            raise RuntimeError("Album source message IDs are not consecutive; refusing to split")
+                        if len(set(source_message_ids)) != len(source_message_ids):
+                            raise RuntimeError("Album source message IDs contain duplicates")
                         existing_backup_ids = [
                             int(row["backup_message_id"] or 0) for row in album_rows
                         ]
