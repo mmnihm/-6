@@ -1300,7 +1300,7 @@ async def _flush_album_upload(client, key):
     try:
         primary_channel_id, backup_channel_id = await get_storage_channels()
         if not primary_channel_id or not backup_channel_id or primary_channel_id == backup_channel_id:
-            raise RuntimeError("主、备份存储频道未正确绑定")
+            raise RuntimeError("主存储或备用存储未正确绑定")
         category = str(selected_category or parse_category(messages[0]))[:120]
         if is_admin_batch and not active_batch:
             await db.start_upload_batch(user.id, category)
@@ -1774,13 +1774,13 @@ async def _upload_single_handler(client, message):
         if is_admin_batch:
             log.error("Upload batch missing primary/backup channel binding for user %s", user.id)
         else:
-            await message.reply_text("⚠️ 网盘尚未完成双频道绑定，请管理员先使用 /bindmain 和 /bindbackup。")
+            await message.reply_text("⚠️ 网盘尚未完成主存储和备用存储绑定，请管理员先使用 /bindmain 和 /bindbackup。")
         return
     if primary_channel_id == backup_channel_id:
         if is_admin_batch:
             log.error("Upload batch primary and backup channels are identical for user %s", user.id)
         else:
-            await message.reply_text("❌ 主存储频道和备份频道不能是同一个频道，请管理员检查 /storage。")
+            await message.reply_text("❌ 主存储和备用存储不能是同一个群/频道，请管理员检查 /storage。")
         return
 
     category = str(selected_category or parse_category(message))[:120]
@@ -1788,7 +1788,7 @@ async def _upload_single_handler(client, message):
         if not active_batch:
             await db.start_upload_batch(user.id, category)
     is_admin_batch = bool(await is_admin(user.id) and selected_category)
-    status = None if is_admin_batch else await message.reply_text("⏳ 正在检查频道权限并保存文件…")
+    status = None if is_admin_batch else await message.reply_text("⏳ 正在检查存储权限并保存文件…")
     primary_id = None
     backup_id = 0
     step = "检查主频道权限"
@@ -1813,7 +1813,7 @@ async def _upload_single_handler(client, message):
         })
         primary_id = int(primary["message_id"])
 
-        step = "保存备份频道"
+        step = "保存备用存储"
         backup_error = None
         try:
             backup = await telegram_bot_api("copyMessage", {
@@ -3733,7 +3733,7 @@ async def admin_callback_handler(client, query):
         group_id = await get_member_group_id()
         await message.edit_text(
             "🗄 绑定设置\n\n"
-            f"会员群：{group_id or '未绑定'}\n主存储频道：{primary or '未绑定'}\n备份频道：{backup or '未绑定'}\n\n选择需要绑定或刷新状态：",
+            f"会员群：{group_id or '未绑定'}\n主存储频道：{primary or '未绑定'}\n备用存储（频道/群组）：{backup or '未绑定'}\n\n选择需要绑定或刷新状态：",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("👥 绑定会员群", callback_data="mc:bindgroup")],
                 [InlineKeyboardButton("📥 绑定主频道", callback_data="mc:bindmain"), InlineKeyboardButton("📥 绑定备份频道", callback_data="mc:bindbackup")],
