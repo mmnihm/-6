@@ -809,13 +809,6 @@ class Database:
         created_at, owner_id, file_key, album_group_id=None, album_position=0
     ):
         async with self.connect() as db:
-            inserted_message = await db.execute("""
-                INSERT OR IGNORE INTO scanner_messages(
-                    channel_id, message_id, fingerprint, file_name,
-                    media_type, category, created_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?)
-            """, (channel_id, message_id, fingerprint, file_name,
-                  media_type, category, created_at))
             if album_group_id and not category:
                 existing_album_category = await (await db.execute("""
                     SELECT category FROM files
@@ -824,6 +817,13 @@ class Database:
                 """, (str(album_group_id),))).fetchone()
                 if existing_album_category:
                     category = str(existing_album_category["category"] or "")
+            inserted_message = await db.execute("""
+                INSERT OR IGNORE INTO scanner_messages(
+                    channel_id, message_id, fingerprint, file_name,
+                    media_type, category, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            """, (channel_id, message_id, fingerprint, file_name,
+                  media_type, category, created_at))
             await db.execute("""
                 INSERT INTO scanner_progress(
                     channel_id, last_message_id, scanned_count, completed, updated_at
