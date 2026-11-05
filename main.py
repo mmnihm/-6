@@ -1827,7 +1827,7 @@ async def directory_import_confirm_handler(client, message):
 
 
 async def backup_retry_worker(client):
-    """Resume durable backup jobs and gradually queue old Cangku singles only while idle."""
+    """Resume durable jobs and queue Cangku singles/albums only while idle."""
     global last_user_activity, backup_retry_manual_requested
     while True:
         try:
