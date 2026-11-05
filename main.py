@@ -732,6 +732,7 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                 resolved_channel_id, getattr(chat, "title", ""), offset_id
             )
             processed_album_ids = set()
+            attempted_album_ids = set()
             async for item in scanner.get_chat_history(
                 resolved_channel_id, offset_id=offset_id
             ):
@@ -741,30 +742,32 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                     group_key = str(group_id)
                     if group_key in processed_album_ids:
                         continue
-                    processed_album_ids.add(group_key)
-                    try:
-                        fetched = await scanner.get_media_group(
+                    if group_key not in attempted_album_ids:
+                        attempted_album_ids.add(group_key)
+                        try:
+                            fetched = await scanner.get_media_group(
                             chat_id=resolved_channel_id,
                             message_id=int(item.id),
                         )
-                        if (
-                            fetched and 2 <= len(fetched) <= 10
-                            and all(
-                                str(getattr(member, "media_group_id", "")) == group_key
-                                for member in fetched
-                            )
-                        ):
-                            messages = sorted(fetched, key=lambda member: int(member.id), reverse=True)
-                        else:
-                            log.warning(
-                                "History scan could not verify complete album: channel=%s group=%s",
+                            if (
+                                fetched and 2 <= len(fetched) <= 10
+                                and all(
+                                    str(getattr(member, "media_group_id", "")) == group_key
+                                    for member in fetched
+                                )
+                            ):
+                                messages = sorted(fetched, key=lambda member: int(member.id), reverse=True)
+                                processed_album_ids.add(group_key)
+                            else:
+                                log.warning(
+                                    "History scan could not verify complete album: channel=%s group=%s",
+                                    resolved_channel_id, group_key,
+                                )
+                        except Exception:
+                            log.exception(
+                                "History scan album verification failed: channel=%s group=%s",
                                 resolved_channel_id, group_key,
                             )
-                    except Exception:
-                        log.exception(
-                            "History scan album verification failed: channel=%s group=%s",
-                            resolved_channel_id, group_key,
-                        )
 
                 # Only a Telegram-confirmed album can receive a directory.
                 is_album = len(messages) >= 2 and bool(group_id)
