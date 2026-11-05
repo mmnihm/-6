@@ -88,47 +88,30 @@ async def scanner_api_call(method, *args, min_interval=1.5, **kwargs):
         finally:
             scanner_api_next_at = max(scanner_api_next_at, loop.time() + min_interval)
 
-async def iter_chat_history_oldest_first(chat_id, after_message_id=0, page_size=100):
-    """Yield Telegram history from the oldest message toward the newest.
+async def iter_chat_history_newest_first(chat_id, before_message_id=0, page_size=500):
+    """Yield Telegram history newest-to-oldest in bounded, resumable pages.
 
-    Pyrogram 2.0.106 exposes reverse-chronological get_chat_history only.
-    Use Telegram's GetHistory offset window (the same strategy used by
-    reverse-history Pyrogram forks), then sort each page into ascending order.
+    Pyrogram's get_chat_history uses Telegram's normal exclusive offset_id
+    pagination. The previous custom GetHistory/add_offset window could return
+    an empty page prematurely on large channels, making a partial scan appear
+    complete. Keep each request bounded and resume strictly below the last
+    yielded message ID.
     """
-    cursor = max(0, int(after_message_id or 0))
-    peer = await scanner.resolve_peer(chat_id)
-    page_size = max(1, min(100, int(page_size or 100)))
+    cursor = max(0, int(before_message_id or 0))
+    page_size = max(1, min(500, int(page_size or 500)))
     while True:
-        # offset_id=1 anchors the first page at the beginning of the chat.
-        # Subsequent pages start immediately after the last processed ID.
-        offset_id = cursor + 1 if cursor else 1
-        response = await scanner_api_call(
-            scanner.invoke,
-            raw.functions.messages.GetHistory(
-                peer=peer,
-                offset_id=offset_id,
-                offset_date=0,
-                add_offset=-page_size,
-                limit=page_size,
-                max_id=0,
-                min_id=0,
-                hash=0,
-            ),
-            sleep_threshold=60,
-        )
-        page = await utils.parse_messages(scanner, response, replies=0)
-        page = sorted(
-            (message for message in (page or []) if int(message.id) > cursor),
-            key=lambda message: int(message.id),
-        )
-        if not page:
-            return
-        for message in page:
-            message_id = int(message.id)
-            if message_id <= cursor:
+        page_count = 0
+        async for message in scanner.get_chat_history(
+            chat_id, limit=page_size, offset_id=cursor
+        ):
+            message_id = int(getattr(message, "id", 0) or 0)
+            if not message_id or (cursor and message_id >= cursor):
                 continue
             cursor = message_id
+            page_count += 1
             yield message
+        if page_count == 0:
+            return
 
 
 def admin_home_keyboard():
@@ -798,12 +781,12 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
     current_offset_id = None
     try:
         scan_direction = await db.get_setting("history_scan_direction")
-        if scan_direction != "oldest_first_v1":
+        if scan_direction != "newest_first_v1":
             # Existing progress was written by newest-to-oldest scanning.
             # Restart only the cursor (not indexed rows) so the new ascending
             # pass can safely revisit existing messages and fill missing rows.
             await db.reset_scan_progress_for_full_rescan(primary_channel_id)
-            await db.set_setting("history_scan_direction", "oldest_first_v1")
+            await db.set_setting("history_scan_direction", "newest_first_v1")
             log.warning(
                 "Migrated history scan to oldest-first mode; existing indexed data is preserved"
             )
@@ -818,8 +801,8 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                 resolved_channel_id, getattr(chat, "title", ""), offset_id
             )
             album_category_cache = {}
-            async for item in iter_chat_history_oldest_first(
-                resolved_channel_id, after_message_id=offset_id
+            async for item in iter_chat_history_newest_first(
+                resolved_channel_id, before_message_id=offset_id
             ):
                 current_message_id = int(item.id)
                 group_id = getattr(item, "media_group_id", None)
