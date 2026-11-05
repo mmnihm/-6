@@ -803,6 +803,10 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                                     if 2 <= len(matched) <= 10
                                     and int(item.id) in ids
                                     and len(ids) == len(set(ids))
+                                    and all(
+                                        ids[index] + 1 == ids[index + 1]
+                                        for index in range(len(ids) - 1)
+                                    )
                                     else None
                                 )
 
