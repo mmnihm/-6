@@ -1978,7 +1978,7 @@ async def backup_retry_worker(client):
                     group_id = str(refreshed["album_group_id"] or "") if refreshed else ""
                     fingerprint = str(candidate["source_fingerprint"] or "")
                     parts = fingerprint.split(":", 2)
-                    if group_id.startswith("cangku-single:") and len(parts) == 3:
+                    if (group_id.startswith("cangku-single:") or group_id.startswith("cangku-incomplete:")) and len(parts) == 3:
                         try:
                             await db.enqueue_backup_retry(
                                 str(candidate["file_key"]), int(parts[1]),
