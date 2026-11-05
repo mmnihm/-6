@@ -1294,7 +1294,8 @@ class Database:
                 UPDATE files
                 SET album_group_id=?, album_position=?,
                     category=CASE
-                        WHEN ? IS NOT NULL AND ?<>'' THEN ?
+                        WHEN CAST(? AS TEXT) IS NOT NULL
+                             AND CAST(? AS TEXT)<>'' THEN CAST(? AS TEXT)
                         ELSE category
                     END
                 WHERE source_fingerprint=?
