@@ -54,6 +54,7 @@ pending_home_button_actions = {}
 pending_admin_actions = {}
 directory_import_running = False
 cangku_backup_in_progress = set()
+last_user_activity = 0.0
 category_delivery_in_progress = set()
 search_sessions = {}
 
@@ -327,6 +328,18 @@ scanner = (
     if os.path.exists(SCANNER_SESSION_PATH) else None
 )
 scan_task = None
+
+
+@app.on_message(filters.private, group=-100)
+async def mark_private_activity(client, message):
+    global last_user_activity
+    last_user_activity = asyncio.get_running_loop().time()
+
+
+@app.on_callback_query(group=-100)
+async def mark_callback_activity(client, query):
+    global last_user_activity
+    last_user_activity = asyncio.get_running_loop().time()
 
 WELCOME = (
     "☁️ 会员文件网盘\n\n"
@@ -1780,11 +1793,61 @@ async def directory_import_confirm_handler(client, message):
 
 
 async def backup_retry_worker(client):
-    """Resume durable backup jobs after restarts, with bounded exponential backoff."""
+    """Resume durable backup jobs and gradually queue old Cangku singles only while idle."""
+    global last_user_activity
     while True:
         try:
-            jobs = await db.list_due_backup_retries(limit=10)
+            loop = asyncio.get_running_loop()
+            busy = (
+                directory_import_running
+                or bool(scan_task and not scan_task.done())
+                or bool(category_delivery_in_progress)
+                or bool(cangku_backup_in_progress)
+                or bool(upload_finish_in_progress)
+                or bool(pending_album_uploads)
+                or any(tasks for tasks in pending_upload_tasks.values())
+                or upload_copy_semaphore._value < 2
+                or loop.time() - float(last_user_activity or 0) < 30
+            )
+            if busy:
+                await asyncio.sleep(5)
+                continue
+
+            # Discover a few metadata-only Cangku records at a time. The
+            # existing PostgreSQL retry table makes the queue restart-safe.
+            _, backup_channel_id = await get_storage_channels()
+            if backup_channel_id:
+                candidates = await db.list_unbacked_cangku_files(limit=5)
+                for candidate in candidates:
+                    fingerprint = str(candidate["source_fingerprint"] or "")
+                    parts = fingerprint.split(":", 2)
+                    if len(parts) != 3:
+                        continue
+                    try:
+                        source_chat_id, source_message_id = int(parts[1]), int(parts[2])
+                    except ValueError:
+                        continue
+                    await db.enqueue_backup_retry(
+                        str(candidate["file_key"]),
+                        source_chat_id,
+                        source_message_id,
+                        int(backup_channel_id),
+                        "idle Cangku source backup",
+                    )
+
+            jobs = await db.list_due_backup_retries(limit=5)
             for pending_job in jobs:
+                # Re-check activity before every copy so member requests always win.
+                loop = asyncio.get_running_loop()
+                if (
+                    directory_import_running
+                    or bool(scan_task and not scan_task.done())
+                    or bool(category_delivery_in_progress)
+                    or bool(upload_finish_in_progress)
+                    or any(tasks for tasks in pending_upload_tasks.values())
+                    or loop.time() - float(last_user_activity or 0) < 30
+                ):
+                    break
                 file_key = str(pending_job["file_key"])
                 job = await db.claim_backup_retry(file_key, lease_seconds=300)
                 if not job:
@@ -1806,13 +1869,13 @@ async def backup_retry_worker(client):
                             raise RuntimeError("Backup copy succeeded but database update was not confirmed")
                     await db.complete_backup_retry(file_key)
                     log.info(
-                        "Durable backup retry completed for file %s (message %s)",
+                        "Idle/durable backup completed for file %s (message %s)",
                         file_key, copied.id,
                     )
                 except Exception as exc:
                     await db.fail_backup_retry(file_key, f"{type(exc).__name__}: {str(exc)[:400]}")
-                    log.exception("Durable backup retry failed for file %s", file_key)
-                await asyncio.sleep(0.3)
+                    log.exception("Backup retry failed for file %s", file_key)
+                await asyncio.sleep(2.0)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -4651,6 +4714,7 @@ async def main():
                     scanner_started = False
                 scanner = None
 
+        last_user_activity = asyncio.get_running_loop().time()
         me = await app.get_me()
         BOT_USERNAME = me.username
         BOT_ID = me.id
