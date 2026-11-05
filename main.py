@@ -217,17 +217,20 @@ async def admin_home_text():
 
 
 def admin_keyboard():
+    # Compact two-column layout to keep the admin panel short on mobile.
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗄 双频道存储", callback_data="mc:storage")],
-        [InlineKeyboardButton("📦 自动备份管理", callback_data="mc:backup")],
-        [InlineKeyboardButton("👥 绑定会员群", callback_data="mc:bindgroup")],
-        [InlineKeyboardButton("👤 会员管理", callback_data="mc:members"), InlineKeyboardButton("📂 文件管理", callback_data="mc:files")],
-        [InlineKeyboardButton("📁 目录管理", callback_data="mc:directories")],
-        [InlineKeyboardButton("🔘 首页按钮设置", callback_data="mc:homebuttons")],
-        [InlineKeyboardButton("📢 群发广播", callback_data="mc:broadcast"), InlineKeyboardButton("📊 数据统计", callback_data="mc:stats")],
-        [InlineKeyboardButton("🔐 扫描账号登录", callback_data="mc:scannerlogin")],
-        [InlineKeyboardButton("🛡 管理员管理", callback_data="mc:admins")],
-        [InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
+        [InlineKeyboardButton("🗄 双频道存储", callback_data="mc:storage"),
+         InlineKeyboardButton("📦 自动备份", callback_data="mc:backup")],
+        [InlineKeyboardButton("👥 会员群绑定", callback_data="mc:bindgroup"),
+         InlineKeyboardButton("👤 会员管理", callback_data="mc:members")],
+        [InlineKeyboardButton("📂 文件管理", callback_data="mc:files"),
+         InlineKeyboardButton("📁 目录管理", callback_data="mc:directories")],
+        [InlineKeyboardButton("🔘 首页按钮", callback_data="mc:homebuttons"),
+         InlineKeyboardButton("📢 群发广播", callback_data="mc:broadcast")],
+        [InlineKeyboardButton("📊 数据统计", callback_data="mc:stats"),
+         InlineKeyboardButton("🔐 扫描账号", callback_data="mc:scannerlogin")],
+        [InlineKeyboardButton("🛡 管理员管理", callback_data="mc:admins"),
+         InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
     ])
 
 
@@ -1948,14 +1951,19 @@ async def backup_retry_worker(client):
             # existing PostgreSQL retry table makes the queue restart-safe.
             _, backup_channel_id = await get_storage_channels()
             if backup_channel_id and await db.get_setting("backup_retry_full_restart_pending") == "1":
-                reset_count = await db.restart_backup_retry_queue(
-                    backup_channel_id, full_restart=True
-                )
-                await db.set_setting("backup_retry_full_restart_pending", "0")
-                log.warning(
-                    "Full Cangku backup pass started: reset %s saved backup IDs",
-                    reset_count,
-                )
+                # Never erase saved backup pointers until Scanner is connected;
+                # otherwise a restart could reset IDs but enqueue no source messages.
+                if scanner is None or not scanner.is_connected:
+                    log.warning("Full backup restart is waiting for Scanner login; no backup IDs were reset")
+                else:
+                    reset_count = await db.restart_backup_retry_queue(
+                        backup_channel_id, full_restart=True
+                    )
+                    await db.set_setting("backup_retry_full_restart_pending", "0")
+                    log.warning(
+                        "Full Cangku backup pass started: reset %s saved backup IDs and album metadata",
+                        reset_count,
+                    )
             if backup_channel_id and scanner is not None and scanner.is_connected:
                 # Resolve original Telegram media_group_id first. Without the
                 # scanner session we cannot safely distinguish a single file
@@ -4115,41 +4123,38 @@ async def user_catalog_callback_handler(client, query):
         return
 
 
-async def render_backup_admin(message, notice=""):
+async async def render_backup_admin(message, notice=""):
     enabled = await db.get_setting("backup_retry_enabled") != "0"
     counts = await db.backup_retry_stats()
     _, backup_channel_id = await get_storage_channels()
+    restart_pending = await db.get_setting("backup_retry_full_restart_pending") == "1"
     state = "🟢 自动运行已开启" if enabled else "⏸ 自动备份已暂停"
     worker = "运行中" if backup_worker_running else "尚未启动"
+    restart_state = "⏳ 等待后台空闲后从头复制" if restart_pending else "可继续备份"
     body = (
         "📦 备份管理\n"
         "━━━━━━━━━━━━━━\n"
         f"⚙️ 自动备份：{state}\n"
         f"🖥 后台任务：{worker}\n"
         f"📍 备用频道：{backup_channel_id or '未绑定'}\n"
+        f"🔄 任务状态：{restart_state}\n"
         "━━━━━━━━━━━━━━\n"
-        "📊 本轮复制进度\n"
+        "📊 复制统计\n"
         f"✅ 已复制：{counts['backed']} 个资源\n"
         f"⏳ 待复制单文件：{counts['candidates']} 个\n"
         f"🖼 待复制相册组：{counts['album_candidates']} 组\n"
         f"📦 队列任务：{counts['queued']} 个\n"
-        f"⚠️ 失败待重试：{counts['failed']} 个\n"
-        "━━━━━━━━━━━━━━\n"
-        "从头开始会重新复制源资源，并保存新的备用消息 ID。"
+        f"⚠️ 失败待重试：{counts['failed']} 个"
     )
     if notice:
         body = notice + "\n\n" + body
     keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⏮️ 从头开始备份", callback_data="mc:backupstart"),
-            InlineKeyboardButton("⏯️ 继续上次备份", callback_data="mc:backupcontinue"),
-        ],
-        [
-            InlineKeyboardButton("⏸ 暂停备份", callback_data="mc:backuppause"),
-            InlineKeyboardButton("📊 查看进度", callback_data="mc:backuprefresh"),
-        ],
-        [InlineKeyboardButton("⚡ 立即执行一轮", callback_data="mc:backuprun")],
-        [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+        [InlineKeyboardButton("⏮️ 从头开始", callback_data="mc:backupstart"),
+         InlineKeyboardButton("⏯️ 继续上次", callback_data="mc:backupcontinue")],
+        [InlineKeyboardButton("⏸ 暂停备份", callback_data="mc:backuppause"),
+         InlineKeyboardButton("📊 刷新进度", callback_data="mc:backuprefresh")],
+        [InlineKeyboardButton("⚡ 立即执行一轮", callback_data="mc:backuprun"),
+         InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
     ])
     await message.edit_text(body, reply_markup=keyboard)
 
@@ -4263,17 +4268,22 @@ async def admin_callback_handler(client, query):
             _, backup_channel_id = await get_storage_channels()
             if not backup_channel_id:
                 notice = "❌ 请先绑定备用频道，再开始备份。"
+            elif scanner is None or not scanner.is_connected:
+                notice = (
+                    "❌ 暂时不能从头备份：扫描账号尚未连接。\n"
+                    "请先进入「扫描账号登录」完成登录，再回来点击从头开始。\n"
+                    "本次没有重置任何备份 ID，也没有改动原数据。"
+                )
             else:
-                # Defer the full reset to the single backup worker so an
-                # in-flight copy finishes before the new pass is prepared.
+                # The worker performs the reset after any in-flight copy finishes.
                 await db.set_setting("backup_retry_full_restart_pending", "1")
                 await db.set_setting("backup_retry_enabled", "1")
                 backup_retry_manual_requested = True
                 last_user_activity = asyncio.get_running_loop().time() - 31
                 notice = (
-                    "⏮️ 已启动从头复制。\n"
-                    "本轮会重新复制全部 Cangku 源资源，不按旧备份 ID 跳过。\n"
-                    "每次复制成功后，都会保存新的备用消息 ID；原目录和文件索引保留。"
+                    "⏳ 已提交从头备份任务，正在等待后台任务空闲。\n"
+                    "空闲后会重新识别所有单文件/相册，再从源频道完整复制；不会按旧备份 ID 跳过。\n"
+                    "目录、文件索引和旧备用频道消息都会保留。"
                 )
         elif action == "backupcontinue":
             await db.set_setting("backup_retry_enabled", "1")
