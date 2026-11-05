@@ -1055,6 +1055,22 @@ class Database:
             ))
             await db.commit()
 
+    async def list_unbacked_cangku_files(self, limit=10):
+        """Find accessible-source candidates for idle backup; never split Telegram albums."""
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT f.file_key, f.source_fingerprint
+                FROM files f
+                WHERE COALESCE(f.backup_message_id, 0)=0
+                  AND f.album_group_id IS NULL
+                  AND f.source_fingerprint LIKE 'cangku:%'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM backup_retry_jobs j WHERE j.file_key=f.file_key
+                  )
+                ORDER BY f.created_at, f.file_key
+                LIMIT ?
+            """, (max(1, min(50, int(limit))),))).fetchall()
+
     async def list_due_backup_retries(self, limit=10):
         async with self.connect() as db:
             return await (await db.execute("""
