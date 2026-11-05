@@ -1470,7 +1470,9 @@ class Database:
             return await (await db.execute("""
                 SELECT * FROM backup_retry_jobs
                 WHERE next_retry_at<=?
-                ORDER BY primary_channel_id ASC, primary_message_id ASC,
+                -- Full restarts must drain the oldest source message first.
+                -- Message ID is the primary ordering key; channel is only a tie-breaker.
+                ORDER BY primary_message_id ASC, primary_channel_id ASC,
                          next_retry_at ASC, created_at ASC, file_key ASC
                 LIMIT ?
             """, (iso_now(), max(1, min(50, int(limit)))))).fetchall()
