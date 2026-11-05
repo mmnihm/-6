@@ -1300,6 +1300,17 @@ class Database:
             await db.commit()
             return row
 
+    async def defer_backup_retry(self, file_key, error="", delay_seconds=120):
+        """Release a leased job for later without counting a shared prerequisite outage as a file failure."""
+        next_retry = (utc_now() + timedelta(seconds=max(30, int(delay_seconds)))).isoformat()
+        async with self.connect() as db:
+            await db.execute("""
+                UPDATE backup_retry_jobs
+                SET next_retry_at=?, last_error=?, updated_at=?
+                WHERE file_key=?
+            """, (next_retry, str(error or "")[:500], iso_now(), str(file_key)))
+            await db.commit()
+
     async def fail_backup_retry(self, file_key, error=""):
         async with self.connect() as db:
             row = await (await db.execute(
