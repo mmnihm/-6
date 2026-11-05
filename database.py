@@ -1071,6 +1071,60 @@ class Database:
             )
             await db.commit()
 
+    async def restart_backup_retry_queue(self, backup_channel_id):
+        """Restart the backup pass from the oldest pending source without duplicating saved backups."""
+        now = iso_now()
+        queued_failures = 0
+        async with self.connect() as db:
+            # Make already queued work immediately eligible again, but keep the
+            # durable jobs and their source pointers intact.
+            await db.execute("""
+                UPDATE backup_retry_jobs
+                SET backup_channel_id=?, attempts=0, next_retry_at=?,
+                    last_error='', updated_at=?
+            """, (int(backup_channel_id), now, now))
+
+            # Re-queue archived failures from their original Cangku source
+            # pointers. Keep the failure history until a later successful
+            # enqueue/copy path resolves it; never alter files or message IDs.
+            failures = await (await db.execute("""
+                SELECT failure.file_key, failure.source_fingerprint,
+                       files.backup_message_id
+                FROM backup_retry_failures failure
+                JOIN files ON files.file_key=failure.file_key
+                WHERE COALESCE(files.backup_message_id, 0)=0
+                  AND failure.source_fingerprint LIKE 'cangku:%'
+                ORDER BY failure.failed_at, failure.file_key
+            """)).fetchall()
+            for failure in failures:
+                parts = str(failure["source_fingerprint"] or "").split(":", 2)
+                if len(parts) != 3 or parts[0] != "cangku":
+                    continue
+                try:
+                    source_chat_id = int(parts[1])
+                    source_message_id = int(parts[2])
+                except (TypeError, ValueError):
+                    continue
+                await db.execute("""
+                    INSERT INTO backup_retry_jobs(
+                        file_key, primary_channel_id, primary_message_id,
+                        backup_channel_id, attempts, next_retry_at,
+                        last_error, created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, 0, ?, 'Restarted from backup manager', ?, ?)
+                    ON CONFLICT(file_key) DO UPDATE SET
+                        primary_channel_id=excluded.primary_channel_id,
+                        primary_message_id=excluded.primary_message_id,
+                        backup_channel_id=excluded.backup_channel_id,
+                        attempts=0, next_retry_at=excluded.next_retry_at,
+                        last_error='', updated_at=excluded.updated_at
+                """, (
+                    str(failure["file_key"]), source_chat_id, source_message_id,
+                    int(backup_channel_id), now, now, now,
+                ))
+                queued_failures += 1
+            await db.commit()
+        return queued_failures
+
     async def record_backup_failure(
         self, file_key, file_name, category, source_fingerprint,
         album_group_id, source_message_ids, error=""
