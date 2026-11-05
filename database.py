@@ -1071,6 +1071,86 @@ class Database:
                 LIMIT ?
             """, (max(1, min(50, int(limit))),))).fetchall()
 
+    async def update_cangku_album_metadata(self, source_fingerprint, album_group_id, album_position):
+        """Attach album metadata to an already-imported Cangku index row without replacing it."""
+        async with self.connect() as db:
+            await db.execute("""
+                UPDATE files SET album_group_id=?, album_position=?
+                WHERE source_fingerprint=?
+            """, (
+                str(album_group_id), max(0, int(album_position)),
+                str(source_fingerprint),
+            ))
+            await db.commit()
+
+    async def list_unbacked_cangku_albums(self, limit=5):
+        """Return one representative row per complete, still-unbacked Cangku album."""
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT f.file_key, f.source_fingerprint, f.album_group_id
+                FROM files f
+                WHERE f.album_group_id IS NOT NULL
+                  AND f.album_position=(
+                      SELECT MIN(first.album_position) FROM files first
+                      WHERE first.album_group_id=f.album_group_id
+                  )
+                  AND f.album_group_id IN (
+                      SELECT grouped.album_group_id
+                      FROM files grouped
+                      GROUP BY grouped.album_group_id
+                      HAVING COUNT(*) BETWEEN 2 AND 10
+                         AND SUM(CASE WHEN grouped.source_fingerprint LIKE 'cangku:%'
+                                      THEN 1 ELSE 0 END)=COUNT(*)
+                         AND SUM(CASE WHEN COALESCE(grouped.backup_message_id, 0)=0
+                                      THEN 1 ELSE 0 END)=COUNT(*)
+                         AND NOT EXISTS (
+                             SELECT 1 FROM backup_retry_jobs jobs
+                             JOIN files queued ON queued.file_key=jobs.file_key
+                             WHERE queued.album_group_id=grouped.album_group_id
+                         )
+                  )
+                ORDER BY f.created_at, f.file_key
+                LIMIT ?
+            """, (max(1, min(20, int(limit))),))).fetchall()
+
+    async def get_cangku_album_backup_group(self, album_group_id):
+        """Load all source pointers for one album in original Telegram message order."""
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT file_key, source_fingerprint, backup_message_id,
+                       album_group_id, album_position
+                FROM files
+                WHERE album_group_id=?
+                ORDER BY album_position, file_key
+            """, (str(album_group_id),))).fetchall()
+
+    async def update_album_backup_message_ids(self, album_group_id, copied_message_ids):
+        """Save every copied Telegram message ID together; partial album state is rejected."""
+        ids = [int(value) for value in (copied_message_ids or [])]
+        async with self.connect() as db:
+            rows = await (await db.execute("""
+                SELECT file_key, backup_message_id
+                FROM files WHERE album_group_id=?
+                ORDER BY album_position, file_key
+            """, (str(album_group_id),))).fetchall()
+            if len(rows) != len(ids) or not 2 <= len(rows) <= 10:
+                raise RuntimeError("Album backup result count does not match the complete source group")
+            existing = [int(row["backup_message_id"] or 0) for row in rows]
+            if all(value > 0 for value in existing):
+                await db.commit()
+                return True
+            if any(value > 0 for value in existing):
+                raise RuntimeError("Album already has partial backup IDs; refusing to duplicate or split it")
+            for row, copied_id in zip(rows, ids):
+                result = await db.execute("""
+                    UPDATE files SET backup_message_id=?
+                    WHERE file_key=? AND COALESCE(backup_message_id, 0)=0
+                """, (copied_id, row["file_key"]))
+                if getattr(result, "rowcount", 0) != 1:
+                    raise RuntimeError("Could not atomically save every album backup message ID")
+            await db.commit()
+            return True
+
     async def backup_retry_stats(self):
         """Return durable backup queue counters without modifying any records."""
         async with self.connect() as db:
