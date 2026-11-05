@@ -923,73 +923,64 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
         return (False, "文件不存在或已被移除。", None) if return_message_id else (False, "文件不存在或已被移除。")
 
     fingerprint = str(record["source_fingerprint"] or "")
+    primary_channel_id, backup_channel_id = await get_storage_channels()
     copied_message_id = None
+    primary_message_id = int(record["primary_message_id"] or 0)
+    backup_message_id = int(record["backup_message_id"] or 0)
+
+    # The primary storage channel is always the first retrieval source.
+    # The backup is the second choice; legacy Cangku source is kept as a
+    # final fallback for directory-only imports that have no primary copy yet.
+    candidates = []
+    if primary_channel_id and primary_message_id > 0:
+        candidates.append(("primary", int(primary_channel_id), primary_message_id))
+    if backup_channel_id and backup_message_id > 0:
+        candidates.append(("backup", int(backup_channel_id), backup_message_id))
+    cangku_source = None
     if fingerprint.startswith("cangku:"):
-        try:
-            parts = fingerprint.split(":", 2)
-            if len(parts) != 3:
-                raise ValueError("原始资源索引格式无效")
-            source_chat_id = int(parts[1])
-            source_message_id = int(parts[2])
-            _, backup_channel_id = await get_storage_channels()
-            backup_message_id = int(record["backup_message_id"] or 0)
-            if backup_channel_id and backup_message_id > 0:
-                try:
-                    copied = await telegram_bot_api(
-                        "copyMessage",
-                        {
-                            "chat_id": user_id,
-                            "from_chat_id": backup_channel_id,
-                            "message_id": backup_message_id,
-                        },
-                    )
-                    copied_message_id = int(copied["message_id"])
-                except Exception:
-                    log.warning("Cached backup failed for %s; falling back to Cangku", file_key)
-            if copied_message_id is None:
-                copied = await telegram_bot_api(
-                    "copyMessage",
-                    {
-                        "chat_id": user_id,
-                        "from_chat_id": source_chat_id,
-                        "message_id": source_message_id,
-                    },
-                )
-                copied_message_id = int(copied["message_id"])
-                if file_key not in cangku_backup_in_progress:
-                    cangku_backup_in_progress.add(file_key)
-                    asyncio.create_task(cache_cangku_backup(
-                        client, file_key, source_chat_id, source_message_id
-                    ))
-        except Exception as exc:
-            log.warning("Cangku source delivery failed for %s: %s", file_key, str(exc)[:300])
-            return (False, "原频道资源暂时无法取回，请联系管理员检查机器人是否仍有原频道访问权限。", None) if return_message_id else (False, "原频道资源暂时无法取回，请联系管理员检查机器人是否仍有原频道访问权限。")
-    else:
-        primary_channel_id, backup_channel_id = await get_storage_channels()
-        if not primary_channel_id:
-            return (False, "管理员尚未绑定主存储频道。", None) if return_message_id else (False, "管理员尚未绑定主存储频道。")
-        try:
-            copied = await client.copy_message(
-                chat_id=user_id,
-                from_chat_id=primary_channel_id,
-                message_id=record["primary_message_id"],
-            )
-            copied_message_id = copied.id
-        except Exception:
-            log.warning("Primary copy failed for %s; trying backup", file_key, exc_info=True)
-            backup_message_id = int(record["backup_message_id"] or 0)
-            if not backup_channel_id or backup_message_id <= 0:
-                return (False, "主存储文件暂时无法取回，而且尚未建立备份副本。", None) if return_message_id else (False, "主存储文件暂时无法取回，而且尚未建立备份副本。")
+        parts = fingerprint.split(":", 2)
+        if len(parts) == 3:
             try:
-                copied = await client.copy_message(
-                    chat_id=user_id,
-                    from_chat_id=backup_channel_id,
-                    message_id=backup_message_id,
-                )
-                copied_message_id = copied.id
-            except Exception:
-                log.exception("Both storage copies failed for %s", file_key)
-                return (False, "文件暂时无法取回，请联系管理员检查存储频道。", None) if return_message_id else (False, "文件暂时无法取回，请联系管理员检查存储频道。")
+                cangku_source = (int(parts[1]), int(parts[2]))
+            except ValueError:
+                cangku_source = None
+    if cangku_source:
+        candidates.append(("original", cangku_source[0], cangku_source[1]))
+
+    if not candidates:
+        reason = "主存储没有对应消息记录，备用存储也没有可用副本。"
+        return (False, reason, None) if return_message_id else (False, reason)
+
+    last_error = None
+    for source_name, source_chat_id, source_message_id in candidates:
+        try:
+            copied = await telegram_bot_api("copyMessage", {
+                "chat_id": int(user_id),
+                "from_chat_id": int(source_chat_id),
+                "message_id": int(source_message_id),
+            })
+            copied_message_id = int(copied["message_id"])
+            log.info(
+                "Delivered catalog file from %s storage: file=%s user=%s",
+                source_name, file_key, user_id,
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+            log.warning(
+                "Catalog source failed; trying next source: file=%s source=%s error=%s",
+                file_key, source_name, str(exc)[:220],
+            )
+
+    if copied_message_id is None:
+        reason = f"主存储及备用来源均无法取回文件：{str(last_error)[:180]}"
+        return (False, reason, None) if return_message_id else (False, reason)
+
+    if cangku_source and source_name == "original" and file_key not in cangku_backup_in_progress:
+        cangku_backup_in_progress.add(file_key)
+        asyncio.create_task(cache_cangku_backup(
+            client, file_key, cangku_source[0], cangku_source[1]
+        ))
 
     await db.record_history(user_id, file_key)
     if return_message_id:
@@ -1028,18 +1019,21 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
         source_chat_id = source_message_id = None
         if record:
             fingerprint = str(record["source_fingerprint"] or "")
-            if fingerprint.startswith("cangku:"):
+            primary_id = int(record["primary_message_id"] or 0)
+            backup_id = int(record["backup_message_id"] or 0)
+            # Prefer the primary channel for every catalog item, including
+            # legacy Cangku imports; use backup only when no primary copy exists.
+            if primary_channel_id and primary_id > 0:
+                source_chat_id = int(primary_channel_id)
+                source_message_id = primary_id
+            elif backup_channel_id and backup_id > 0:
+                source_chat_id = int(backup_channel_id)
+                source_message_id = backup_id
+            elif fingerprint.startswith("cangku:"):
                 parts = fingerprint.split(":", 2)
                 if len(parts) == 3:
                     source_chat_id = int(parts[1])
                     source_message_id = int(parts[2])
-                    backup_id = int(record["backup_message_id"] or 0)
-                    if backup_channel_id and backup_id > 0:
-                        source_chat_id = int(backup_channel_id)
-                        source_message_id = backup_id
-            elif primary_channel_id and record["primary_message_id"]:
-                source_chat_id = int(primary_channel_id)
-                source_message_id = int(record["primary_message_id"])
         prepared.append((index, item, record, source_chat_id, source_message_id))
 
     # Only files carrying the same stored Telegram album ID are sent together.
