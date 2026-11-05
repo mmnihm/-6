@@ -1915,16 +1915,56 @@ async def discover_cangku_album_metadata(candidate):
         ids = [int(item.id) for item in group]
         if any(ids[i] != ids[0] + i for i in range(len(ids))):
             raise RuntimeError("Source album message IDs are not consecutive")
-        rows = []
+        # Repair incomplete legacy indexes from the Telegram-confirmed source album.
+        # A missing imported row must not make every member of a real album permanently
+        # unbackable. Insert only missing source fingerprints; existing file keys,
+        # backup IDs, user history, and other records remain untouched.
+        album_key = f"cangku:{chat_id}:{group_id}"
+        existing_rows = []
         for source_id in ids:
             row = await db.get_file_by_fingerprint(f"cangku:{chat_id}:{source_id}")
+            if row:
+                existing_rows.append(row)
+        inherited_category = next(
+            (str(row["category"] or "") for row in existing_rows if row["category"]),
+            "",
+        )
+        category = inherited_category or parse_chinese_album_category(group) or "未分类"
+        repaired = 0
+        for position, member in enumerate(group):
+            source_id = int(member.id)
+            source_fp = f"cangku:{chat_id}:{source_id}"
+            row = await db.get_file_by_fingerprint(source_fp)
             if not row:
-                raise RuntimeError("Source album contains a message missing from the imported index")
-            rows.append((f"cangku:{chat_id}:{source_id}", source_id))
-        album_key = f"cangku:{chat_id}:{group_id}"
-        for position, (source_fp, _) in enumerate(rows):
+                media_type, file_name, _ = media_details(member)
+                if not media_type:
+                    raise RuntimeError(
+                        f"Telegram-confirmed album member {source_id} has no supported media"
+                    )
+                media = getattr(member, media_type, None)
+                created_at = (
+                    member.date.isoformat() if getattr(member, "date", None)
+                    else datetime.now(timezone.utc).isoformat()
+                )
+                await db.add_file(
+                    secrets.token_urlsafe(9).replace("-", "").replace("_", ""),
+                    config.ADMIN_ID, file_name or f"{media_type}_{source_id}",
+                    media_type, source_id, 0, category, source_fp,
+                    getattr(media, "file_size", 0) or 0, created_at,
+                    album_group_id=album_key, album_position=position,
+                    refresh_stats=False,
+                )
+                row = await db.get_file_by_fingerprint(source_fp)
+                if not row:
+                    raise RuntimeError(
+                        f"Could not restore missing album index row for source message {source_id}"
+                    )
+                repaired += 1
             await db.update_cangku_album_metadata(source_fp, album_key, position)
-        log.info("Discovered Cangku source album via scanner: group=%s files=%s", album_key, len(rows))
+        log.info(
+            "Discovered Cangku source album via scanner: group=%s files=%s repaired_index_rows=%s",
+            album_key, len(ids), repaired,
+        )
         return True
     except Exception:
         log.exception("Could not safely identify Cangku source media group: %s", fingerprint)
