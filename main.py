@@ -3905,9 +3905,10 @@ async def render_backup_admin(message, notice=""):
         f"状态：{state}\\n"
         f"后台任务：{worker}\\n"
         f"备用频道：{backup_channel_id or '未绑定'}\\n\\n"
-        f"已备份 Cangku 单文件：{counts['backed']} 个\\n"
-        f"待发现资源：{counts['candidates']} 个\\n"
-        f"待处理任务：{counts['queued']} 个\\n"
+        f"已备份 Cangku 资源：{counts['backed']} 个（含相册成员）\\n"
+        f"待发现单文件：{counts['candidates']} 个\\n"
+        f"待发现相册组：{counts['album_candidates']} 组\\n"
+        f"待处理任务：{counts['queued']} 个（相册按整组计 1 个任务）\\n"
         f"失败待重试：{counts['failed']} 个"
     )
     if notice:
