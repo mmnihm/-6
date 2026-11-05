@@ -1125,24 +1125,46 @@ class Database:
                 ORDER BY album_position, file_key
             """, (str(album_group_id),))).fetchall()
 
-    async def update_album_backup_message_ids(self, album_group_id, copied_message_ids):
-        """Save every copied Telegram message ID together; partial album state is rejected."""
+    async def update_album_backup_message_ids(
+        self, album_group_id, copied_message_ids, source_message_ids=None
+    ):
+        """Atomically fill backup IDs for all album rows or only explicitly mapped missing members."""
         ids = [int(value) for value in (copied_message_ids or [])]
+        source_ids = (
+            [int(value) for value in source_message_ids]
+            if source_message_ids is not None else None
+        )
         async with self.connect() as db:
             rows = await (await db.execute("""
-                SELECT file_key, backup_message_id
+                SELECT file_key, source_fingerprint, backup_message_id
                 FROM files WHERE album_group_id=?
                 ORDER BY album_position, file_key
             """, (str(album_group_id),))).fetchall()
-            if len(rows) != len(ids) or not 2 <= len(rows) <= 10:
-                raise RuntimeError("Album backup result count does not match the complete source group")
-            existing = [int(row["backup_message_id"] or 0) for row in rows]
-            if all(value > 0 for value in existing):
-                await db.commit()
-                return True
-            if any(value > 0 for value in existing):
-                raise RuntimeError("Album already has partial backup IDs; refusing to duplicate or split it")
-            for row, copied_id in zip(rows, ids):
+            if not 2 <= len(rows) <= 10:
+                raise RuntimeError("Album backup result does not contain a complete source group")
+            if source_ids is None:
+                if len(rows) != len(ids):
+                    raise RuntimeError("Album backup result count does not match the complete source group")
+                targets = rows
+            else:
+                if len(source_ids) != len(ids) or len(set(source_ids)) != len(source_ids):
+                    raise RuntimeError("Partial album backup mapping is invalid")
+                by_source = {}
+                for row in rows:
+                    parts = str(row["source_fingerprint"] or "").split(":", 2)
+                    if len(parts) == 3 and parts[0] == "cangku":
+                        by_source[int(parts[2])] = row
+                targets = []
+                for source_id in source_ids:
+                    row = by_source.get(source_id)
+                    if not row:
+                        raise RuntimeError("Partial album backup references a source message outside the album")
+                    if int(row["backup_message_id"] or 0) > 0:
+                        raise RuntimeError("Refusing to overwrite an existing album backup message ID")
+                    targets.append(row)
+            if len(targets) != len(ids):
+                raise RuntimeError("Album backup result count does not match target members")
+            for row, copied_id in zip(targets, ids):
                 result = await db.execute("""
                     UPDATE files SET backup_message_id=?
                     WHERE file_key=? AND COALESCE(backup_message_id, 0)=0
