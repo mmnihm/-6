@@ -1147,6 +1147,11 @@ class Database:
                         int(backup_channel_id), now, "Full restart: direct Bot API album",
                         now, now,
                     ))
+                # Full restart must follow Telegram source chronology, not DB insertion time.
+                # The first message ID of an album is stored on its representative job.
+                now_jobs.sort(key=lambda job: (
+                    int(job[1]), int(job[2]), str(job[0])
+                ))
                 for job in now_jobs:
                     await db.execute("""
                         INSERT INTO backup_retry_jobs(
@@ -1425,7 +1430,8 @@ class Database:
             return await (await db.execute("""
                 SELECT * FROM backup_retry_jobs
                 WHERE next_retry_at<=?
-                ORDER BY next_retry_at, created_at
+                ORDER BY primary_channel_id ASC, primary_message_id ASC,
+                         next_retry_at ASC, created_at ASC, file_key ASC
                 LIMIT ?
             """, (iso_now(), max(1, min(50, int(limit)))))).fetchall()
 
