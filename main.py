@@ -1889,6 +1889,7 @@ async def backup_retry_worker(client):
                 await asyncio.sleep(5)
                 continue
             manual_requested = bool(backup_retry_manual_requested)
+            cycle_failure_notices = []
             loop = asyncio.get_running_loop()
             busy = (
                 directory_import_running
@@ -1984,9 +1985,18 @@ async def backup_retry_worker(client):
                     album_group_id = str(record["album_group_id"] or "")
                     if source_fingerprint.startswith("cangku:") and not album_group_id:
                         if scanner is None or not scanner.is_connected:
-                            raise RuntimeError(
-                                "Scanner login is required to verify whether this Cangku source is an album; refusing single-file backup"
+                            # Scanner is a shared prerequisite for legacy Cangku items.
+                            # Keep the durable job instead of marking every file as failed.
+                            await db.defer_backup_retry(
+                                file_key,
+                                "Waiting for Scanner login to verify legacy Cangku album metadata",
+                                delay_seconds=120,
                             )
+                            log.warning(
+                                "Paused Cangku backup queue until Scanner reconnects: file=%s",
+                                file_key,
+                            )
+                            break
                         await discover_cangku_album_metadata({
                             "source_fingerprint": source_fingerprint
                         })
@@ -2139,14 +2149,25 @@ async def backup_retry_worker(client):
                             album_group_id, source_ids, error_text,
                         )
                         await db.complete_backup_retry(file_key)
-                        try:
-                            await client.send_message(int(config.ADMIN_ID), notice, disable_web_page_preview=True)
-                        except Exception:
-                            log.exception("Could not notify admin about skipped backup file %s", file_key)
+                        cycle_failure_notices.append(notice)
                     except Exception:
                         log.exception("Could not persist/report skipped backup file %s", file_key)
                     log.warning("Backup retry skipped after failure: file=%s error=%s", file_key, error_text)
                 await asyncio.sleep(2.0)
+
+            # Send one grouped admin DM per worker cycle, not one message per file.
+            if cycle_failure_notices:
+                summary = "⚠️ 自动备份失败汇总（本轮已跳过失败项）\n\n" + "\n\n".join(cycle_failure_notices)
+                try:
+                    await client.send_message(
+                        int(config.ADMIN_ID), summary[:3900],
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    log.exception(
+                        "Could not send grouped backup failure summary (%s items)",
+                        len(cycle_failure_notices),
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:
