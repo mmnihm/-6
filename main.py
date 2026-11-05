@@ -4128,7 +4128,7 @@ async def render_backup_admin(message, notice=""):
         f"🖥 后台任务：{worker}\n"
         f"📍 备用频道：{backup_channel_id or '未绑定'}\n"
         "━━━━━━━━━━━━━━\n"
-        "📊 复制进度（按当前记录）\n"
+        "📊 本轮复制进度\n"
         f"✅ 已复制：{counts['backed']} 个资源\n"
         f"⏳ 待复制单文件：{counts['candidates']} 个\n"
         f"🖼 待复制相册组：{counts['album_candidates']} 组\n"
@@ -4138,7 +4138,7 @@ async def render_backup_admin(message, notice=""):
         "从头开始会重新复制源资源，并保存新的备用消息 ID。"
     )
     if notice:
-        body = notice + "\\n\\n" + body
+        body = notice + "\n\n" + body
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("⏮️ 从头开始备份", callback_data="mc:backupstart"),
