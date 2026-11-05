@@ -1917,6 +1917,22 @@ async def backup_retry_worker(client):
                 candidates = await db.list_unbacked_cangku_files(limit=5)
                 for candidate in candidates:
                     await discover_cangku_album_metadata(candidate)
+                    # Once Telegram confirms a legacy source is a true single,
+                    # queue it using its original chat/message pointer. Do not
+                    # pair a Cangku message ID with the newly bound primary channel.
+                    refreshed = await db.get_file(str(candidate["file_key"]))
+                    group_id = str(refreshed["album_group_id"] or "") if refreshed else ""
+                    fingerprint = str(candidate["source_fingerprint"] or "")
+                    parts = fingerprint.split(":", 2)
+                    if group_id.startswith("cangku-single:") and len(parts) == 3:
+                        try:
+                            await db.enqueue_backup_retry(
+                                str(candidate["file_key"]), int(parts[1]),
+                                int(parts[2]), int(backup_channel_id),
+                                "idle Cangku single backup",
+                            )
+                        except (TypeError, ValueError):
+                            log.exception("Invalid Cangku single source pointer: %s", candidate["file_key"])
 
                 # Queue one durable job per complete Telegram album, not one
                 # job per photo/video. The representative row is the first
@@ -2079,8 +2095,51 @@ async def backup_retry_worker(client):
                             file_key, copied_message_id,
                         )
                 except Exception as exc:
-                    await db.fail_backup_retry(file_key, f"{type(exc).__name__}: {str(exc)[:400]}")
-                    log.exception("Backup retry failed for file %s", file_key)
+                    error_text = f"{type(exc).__name__}: {str(exc)[:400]}"
+                    try:
+                        latest = await db.get_file(file_key)
+                        source_fingerprint = str(latest["source_fingerprint"] or "") if latest else ""
+                        album_group_id = str(latest["album_group_id"] or "") if latest else ""
+                        source_ids = []
+                        if album_group_id.startswith("cangku:"):
+                            failed_album_rows = await db.get_cangku_album_backup_group(album_group_id)
+                            for album_row in failed_album_rows:
+                                parts = str(album_row["source_fingerprint"] or "").split(":", 2)
+                                if len(parts) == 3 and parts[0] == "cangku":
+                                    source_ids.append(int(parts[2]))
+                        if not source_ids:
+                            parts = source_fingerprint.split(":", 2)
+                            if len(parts) == 3 and parts[0] == "cangku":
+                                source_ids = [int(parts[2])]
+                        if not source_ids:
+                            source_ids = [int(job["primary_message_id"])]
+                        file_name = str(latest["file_name"] or file_key) if latest else file_key
+                        category = str(latest["category"] or "") if latest else ""
+                        await db.record_backup_failure(
+                            file_key, file_name, category, source_fingerprint,
+                            album_group_id, source_ids, error_text,
+                        )
+                        source_label = "相册整组" if album_group_id.startswith("cangku:") else "单条文件"
+                        source_text = "、".join(str(value) for value in source_ids)
+                        notice = (
+                            "⚠️ 自动备份失败，已跳过并继续下一条\n\n"
+                            f"📄 文件：{file_name}\n"
+                            f"📁 目录：{category or '未分类'}\n"
+                            f"类型：{source_label}\n"
+                            f"原始消息 ID：{source_text}\n"
+                            f"文件编号：{file_key}\n"
+                            f"失败原因：{error_text}\n\n"
+                            "请管理员从原始来源手动转发到备用频道。"
+                        )
+                        try:
+                            await client.send_message(int(config.ADMIN_ID), notice, disable_web_page_preview=True)
+                        except Exception:
+                            log.exception("Could not notify admin about skipped backup file %s", file_key)
+                    except Exception:
+                        log.exception("Could not persist/report skipped backup file %s", file_key)
+                    finally:
+                        await db.complete_backup_retry(file_key)
+                    log.warning("Backup retry skipped after failure: file=%s error=%s", file_key, error_text)
                 await asyncio.sleep(2.0)
         except asyncio.CancelledError:
             raise
