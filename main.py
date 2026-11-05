@@ -1070,19 +1070,66 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
         is_album = bool(unit[0][1]["album_group_id"])
         delivered = False
         if is_album and str(unit[0][1]["album_group_id"]) not in invalid_album_groups:
-            album_entries = [
-                (entry[1], entry[2], entry[3], entry[4]) for entry in unit
-            ]
-            try:
-                delivered = await try_send_catalog_album(
-                    client, user_id, album_entries
-                )
-            except Exception as exc:
-                log.warning(
-                    "Grouped media send failed; album skipped as a whole: "
-                    "user=%s count=%s error=%s",
-                    user_id, len(unit), str(exc)[:250],
-                )
+            album_records = [entry[2] for entry in unit]
+            album_candidates = []
+            if primary_channel_id and all(
+                row and int(row["primary_message_id"] or 0) > 0
+                for row in album_records
+            ):
+                album_candidates.append((
+                    "primary",
+                    int(primary_channel_id),
+                    [int(row["primary_message_id"]) for row in album_records],
+                ))
+            if backup_channel_id and all(
+                row and int(row["backup_message_id"] or 0) > 0
+                for row in album_records
+            ):
+                album_candidates.append((
+                    "backup",
+                    int(backup_channel_id),
+                    [int(row["backup_message_id"]) for row in album_records],
+                ))
+            original_sources = []
+            for row in album_records:
+                fingerprint = str(row["source_fingerprint"] or "") if row else ""
+                parts = fingerprint.split(":", 2)
+                if not fingerprint.startswith("cangku:") or len(parts) != 3:
+                    original_sources = []
+                    break
+                try:
+                    original_sources.append((int(parts[1]), int(parts[2])))
+                except ValueError:
+                    original_sources = []
+                    break
+            if original_sources and len({source[0] for source in original_sources}) == 1:
+                album_candidates.append((
+                    "original",
+                    original_sources[0][0],
+                    [source[1] for source in original_sources],
+                ))
+
+            for source_name, source_chat_id, source_message_ids in album_candidates:
+                album_entries = [
+                    (entry[1], entry[2], source_chat_id, source_message_id)
+                    for entry, source_message_id in zip(unit, source_message_ids)
+                ]
+                try:
+                    delivered = await try_send_catalog_album(
+                        client, user_id, album_entries
+                    )
+                    if delivered:
+                        log.info(
+                            "Delivered catalog album from %s storage: user=%s count=%s",
+                            source_name, user_id, len(unit),
+                        )
+                        break
+                except Exception as exc:
+                    log.warning(
+                        "Catalog album source failed; trying next source: "
+                        "user=%s source=%s count=%s error=%s",
+                        user_id, source_name, len(unit), str(exc)[:220],
+                    )
 
         if delivered:
             last_sent_message_id = int(delivered[-1]["message_id"])
