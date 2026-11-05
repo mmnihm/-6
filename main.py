@@ -1661,9 +1661,9 @@ async def directory_export_upload_handler(client, message):
                 "album_group_id": None,
                 "album_position": 0,
             })
-        # Cangku exports preserve Telegram's original mediaGroupId. Only mark
-        # a group as an album when all 2-10 source messages are present and
-        # consecutive; incomplete groups remain single-file references.
+        # Preserve every known mediaGroupId. Complete consecutive 2-10 item
+        # albums are backup-eligible; incomplete groups are explicitly marked
+        # so neither the backup worker nor delivery path silently splits them.
         album_members = {}
         for resource in clean_resources:
             group_id = resource["media_group_id"]
@@ -1673,14 +1673,15 @@ async def directory_export_upload_handler(client, message):
         for group_key, members in album_members.items():
             members.sort(key=lambda row: int(row["message_id"]))
             message_ids = [int(row["message_id"]) for row in members]
-            if 2 <= len(members) <= 10 and all(
+            complete_album = 2 <= len(members) <= 10 and all(
                 message_ids[index] == message_ids[0] + index
                 for index in range(len(message_ids))
-            ):
-                album_group_id = f"cangku:{group_key}"
-                for position, resource in enumerate(members):
-                    resource["album_group_id"] = album_group_id
-                    resource["album_position"] = position
+            )
+            prefix = "cangku:" if complete_album else "cangku-incomplete:"
+            album_group_id = f"{prefix}{group_key}"
+            for position, resource in enumerate(members):
+                resource["album_group_id"] = album_group_id
+                resource["album_position"] = position
         if not clean_resources:
             raise ValueError("文件中没有可迁移的媒体资源。")
         # Source-linked directory import does not require destination storage channels.
