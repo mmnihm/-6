@@ -298,6 +298,16 @@ class Database:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS backup_retry_failures (
+                file_key TEXT PRIMARY KEY,
+                file_name TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
+                source_fingerprint TEXT NOT NULL DEFAULT '',
+                album_group_id TEXT NOT NULL DEFAULT '',
+                source_message_ids TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                failed_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS upload_batches (
                 owner_id BIGINT PRIMARY KEY,
                 category TEXT NOT NULL,
@@ -1053,7 +1063,47 @@ class Database:
                 file_key, int(primary_channel_id), int(primary_message_id),
                 int(backup_channel_id), now, str(error or "")[:500], now, now,
             ))
+            await db.execute(
+                "DELETE FROM backup_retry_failures WHERE file_key=?", (str(file_key),)
+            )
             await db.commit()
+
+    async def record_backup_failure(
+        self, file_key, file_name, category, source_fingerprint,
+        album_group_id, source_message_ids, error=""
+    ):
+        now = iso_now()
+        ids_text = ",".join(str(int(value)) for value in (source_message_ids or []))
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT INTO backup_retry_failures(
+                    file_key, file_name, category, source_fingerprint,
+                    album_group_id, source_message_ids, last_error, failed_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(file_key) DO UPDATE SET
+                    file_name=excluded.file_name,
+                    category=excluded.category,
+                    source_fingerprint=excluded.source_fingerprint,
+                    album_group_id=excluded.album_group_id,
+                    source_message_ids=excluded.source_message_ids,
+                    last_error=excluded.last_error,
+                    failed_at=excluded.failed_at
+            """, (
+                str(file_key), str(file_name or "")[:300], str(category or "")[:120],
+                str(source_fingerprint or "")[:300], str(album_group_id or "")[:300],
+                ids_text[:500], str(error or "")[:500], now,
+            ))
+            await db.commit()
+
+    async def list_backup_failures(self, limit=20):
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT file_key, file_name, category, source_message_ids,
+                       last_error, failed_at
+                FROM backup_retry_failures
+                ORDER BY failed_at DESC
+                LIMIT ?
+            """, (max(1, min(100, int(limit))),))).fetchall()
 
     async def list_unbacked_cangku_files(self, limit=10):
         """Find accessible-source candidates for idle backup; never split Telegram albums."""
