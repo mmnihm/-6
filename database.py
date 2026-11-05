@@ -1071,25 +1071,33 @@ class Database:
             )
             await db.commit()
 
-    async def restart_backup_retry_queue(self, backup_channel_id):
-        """Restart the backup pass from the oldest pending source without duplicating saved backups."""
+    async def restart_backup_retry_queue(self, backup_channel_id, full_restart=False):
+        """Requeue backup work; full_restart clears only old Cangku backup pointers."""
         now = iso_now()
         queued_failures = 0
+        reset_count = 0
         async with self.connect() as db:
-            # Make already queued work immediately eligible again, but keep the
-            # durable jobs and their source pointers intact.
+            if full_restart:
+                # A deliberate full-copy pass must not trust historical backup IDs.
+                # Keep every file row, folder, user, and membership record intact.
+                result = await db.execute("""
+                    UPDATE files SET backup_message_id=0
+                    WHERE source_fingerprint LIKE 'cangku:%'
+                """)
+                reset_count = max(0, int(getattr(result, "rowcount", 0) or 0))
+
+            # Existing durable jobs are made immediately eligible for the selected
+            # backup destination. Their source pointers and retry history remain.
             await db.execute("""
                 UPDATE backup_retry_jobs
                 SET backup_channel_id=?, attempts=0, next_retry_at=?,
                     last_error='', updated_at=?
             """, (int(backup_channel_id), now, now))
 
-            # Re-queue archived failures from their original Cangku source
-            # pointers. Keep the failure history until a later successful
-            # enqueue/copy path resolves it; never alter files or message IDs.
+            # Re-queue archived failures. In a full restart all Cangku rows have
+            # just been reset, so every source-backed failure is eligible again.
             failures = await (await db.execute("""
-                SELECT failure.file_key, failure.source_fingerprint,
-                       files.backup_message_id
+                SELECT failure.file_key, failure.source_fingerprint
                 FROM backup_retry_failures failure
                 JOIN files ON files.file_key=failure.file_key
                 WHERE COALESCE(files.backup_message_id, 0)=0
@@ -1123,7 +1131,7 @@ class Database:
                 ))
                 queued_failures += 1
             await db.commit()
-        return queued_failures
+        return reset_count if full_restart else queued_failures
 
     async def record_backup_failure(
         self, file_key, file_name, category, source_fingerprint,
