@@ -1093,14 +1093,64 @@ class Database:
         reset_count = 0
         async with self.connect() as db:
             if full_restart:
-                # A deliberate full-copy pass must not trust historical backup IDs.
-                # Keep every file row, folder, user, and membership record intact.
+                # A deliberate full-copy pass resets only backup pointers, then
+                # queues every indexed, verified single and every complete album.
+                # No personal scanner or history rescan is required.
                 result = await db.execute("""
                     UPDATE files
                     SET backup_message_id=0
                     WHERE source_fingerprint LIKE 'cangku:%'
                 """)
                 reset_count = max(0, int(getattr(result, "rowcount", 0) or 0))
+                await db.execute("DELETE FROM backup_retry_jobs")
+                await db.execute("""
+                    INSERT INTO backup_retry_jobs(
+                        file_key, primary_channel_id, primary_message_id,
+                        backup_channel_id, attempts, next_retry_at,
+                        last_error, created_at, updated_at
+                    )
+                    SELECT f.file_key,
+                           CAST(substr(f.source_fingerprint,
+                               instr(f.source_fingerprint, ':') + 1,
+                               instr(substr(f.source_fingerprint,
+                                   instr(f.source_fingerprint, ':') + 1), ':') - 1) AS INTEGER),
+                           CAST(substr(f.source_fingerprint,
+                               length(f.source_fingerprint) -
+                               instr(reverse(f.source_fingerprint), ':') + 2) AS INTEGER),
+                           ?, 0, ?, 'Full restart: direct Bot API', ?, ?
+                    FROM files f
+                    WHERE f.source_fingerprint LIKE 'cangku:%'
+                      AND f.album_group_id LIKE 'cangku-single:%'
+                """, (int(backup_channel_id), now, now, now))
+                await db.execute("""
+                    INSERT INTO backup_retry_jobs(
+                        file_key, primary_channel_id, primary_message_id,
+                        backup_channel_id, attempts, next_retry_at,
+                        last_error, created_at, updated_at
+                    )
+                    SELECT f.file_key,
+                           CAST(substr(f.source_fingerprint,
+                               instr(f.source_fingerprint, ':') + 1,
+                               instr(substr(f.source_fingerprint,
+                                   instr(f.source_fingerprint, ':') + 1), ':') - 1) AS INTEGER),
+                           CAST(substr(f.source_fingerprint,
+                               length(f.source_fingerprint) -
+                               instr(reverse(f.source_fingerprint), ':') + 2) AS INTEGER),
+                           ?, 0, ?, 'Full restart: direct Bot API album', ?, ?
+                    FROM files f
+                    WHERE f.album_group_id LIKE 'cangku:%'
+                      AND f.album_position=(
+                          SELECT MIN(x.album_position) FROM files x
+                          WHERE x.album_group_id=f.album_group_id
+                      )
+                      AND (SELECT COUNT(*) FROM files x
+                           WHERE x.album_group_id=f.album_group_id) BETWEEN 2 AND 10
+                      AND (SELECT COUNT(*) FROM files x
+                           WHERE x.album_group_id=f.album_group_id
+                             AND x.source_fingerprint LIKE 'cangku:%')=
+                          (SELECT COUNT(*) FROM files x
+                           WHERE x.album_group_id=f.album_group_id)
+                """, (int(backup_channel_id), now, now, now))
 
             # Existing durable jobs are made immediately eligible for the selected
             # backup destination. Their source pointers and retry history remain.
