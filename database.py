@@ -936,6 +936,21 @@ class Database:
                 "scanned_count": 0, "completed": 0, "updated_at": None
             }
 
+    async def reset_scan_progress_for_full_rescan(self, channel_id):
+        """Restart a full source-channel scan without deleting any indexed data."""
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT INTO scanner_progress(
+                    channel_id, last_message_id, scanned_count, completed, updated_at
+                ) VALUES(?, 0, 0, 0, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    last_message_id=0,
+                    scanned_count=0,
+                    completed=0,
+                    updated_at=excluded.updated_at
+            """, (int(channel_id), iso_now()))
+            await db.commit()
+
     async def mark_scan_completed(self, channel_id):
         async with self.connect() as db:
             await db.execute("""
