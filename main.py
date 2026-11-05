@@ -640,7 +640,7 @@ def folder_detail_keyboard(category_row, page, has_next, is_favorite):
     if int(category_row["file_count"] or 0) > 0:
         rows.append([InlineKeyboardButton(
             "📥 获取资源（单文件每批20个）",
-            callback_data=f"uc:getfolder:{share_key}:{page * 20}",
+            callback_data=f"uc:getfolder:{share_key}:0",
         )])
     rows.append([InlineKeyboardButton(
         "⭐ 取消收藏目录" if is_favorite else "⭐ 收藏目录",
@@ -1009,7 +1009,7 @@ async def try_send_catalog_album(client, user_id, group):
 
 
 async def send_catalog_batch(client, user_id, share_key, offset, batch, track_progress=True):
-    """Group compatible media across the whole batch; skip failures and keep going."""
+    """Send complete media units and advance folder progress only over successful items."""
     sent = failed = 0
     next_offset = offset
     last_sent_message_id = None
