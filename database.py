@@ -1071,6 +1071,36 @@ class Database:
                 LIMIT ?
             """, (max(1, min(50, int(limit))),))).fetchall()
 
+    async def backup_retry_stats(self):
+        """Return durable backup queue counters without modifying any records."""
+        async with self.connect() as db:
+            queued = await (await db.execute(
+                "SELECT COUNT(*) AS n FROM backup_retry_jobs"
+            )).fetchone()
+            failed = await (await db.execute(
+                "SELECT COUNT(*) AS n FROM backup_retry_jobs WHERE attempts>0"
+            )).fetchone()
+            candidates = await (await db.execute("""
+                SELECT COUNT(*) AS n FROM files f
+                WHERE COALESCE(f.backup_message_id, 0)=0
+                  AND f.album_group_id IS NULL
+                  AND f.source_fingerprint LIKE 'cangku:%'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM backup_retry_jobs j WHERE j.file_key=f.file_key
+                  )
+            """)).fetchone()
+            backed = await (await db.execute("""
+                SELECT COUNT(*) AS n FROM files
+                WHERE COALESCE(backup_message_id, 0)>0
+                  AND source_fingerprint LIKE 'cangku:%'
+            """)).fetchone()
+            return {
+                "queued": int(queued["n"] or 0),
+                "failed": int(failed["n"] or 0),
+                "candidates": int(candidates["n"] or 0),
+                "backed": int(backed["n"] or 0),
+            }
+
     async def list_due_backup_retries(self, limit=10):
         async with self.connect() as db:
             return await (await db.execute("""
