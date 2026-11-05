@@ -2241,14 +2241,25 @@ async def backup_retry_worker(client):
                     if source_fingerprint.startswith("cangku:") and (
                         not album_group_id
                         or album_group_id.startswith("cangku-incomplete:")
+                        or album_group_id.startswith("cangku-single:")
                     ):
-                        # Routine backup is Bot-API-only. An unclassified legacy
-                        # message is never guessed to be a single, because it may
-                        # be one member of an album. Report it instead of invoking
-                        # a personal scanner account in the background.
-                        raise RuntimeError(
-                            "Source album metadata is incomplete; skipped safely without personal scanner"
-                        )
+                        # Repair legacy/missing album metadata with the already
+                        # logged-in personal scanner before deciding whether this
+                        # source is a single message or a media group. Never guess.
+                        verified = await discover_cangku_album_metadata(record)
+                        if not verified:
+                            raise RuntimeError(
+                                "Source album metadata could not be verified; waiting for scanner access"
+                            )
+                        record = await db.get_file(file_key)
+                        if not record:
+                            raise RuntimeError("Source index row disappeared during album metadata repair")
+                        source_fingerprint = str(record["source_fingerprint"] or "")
+                        album_group_id = str(record["album_group_id"] or "")
+                        if not album_group_id or album_group_id.startswith("cangku-incomplete:"):
+                            raise RuntimeError(
+                                "Source album metadata remains incomplete after scanner verification"
+                            )
                     if album_group_id.startswith("cangku-incomplete:"):
                         raise RuntimeError(
                             "Cangku album metadata is incomplete; refusing to back it up as separate files"
