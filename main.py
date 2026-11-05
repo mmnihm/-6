@@ -4127,11 +4127,14 @@ async def render_backup_admin(message, notice=""):
         body = notice + "\\n\\n" + body
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("▶️ 开启自动备份", callback_data="mc:backupenable"),
-            InlineKeyboardButton("⏸ 暂停", callback_data="mc:backuppause"),
+            InlineKeyboardButton("⏮️ 从头开始备份", callback_data="mc:backupstart"),
+            InlineKeyboardButton("⏯️ 继续上次备份", callback_data="mc:backupcontinue"),
+        ],
+        [
+            InlineKeyboardButton("⏸ 暂停备份", callback_data="mc:backuppause"),
+            InlineKeyboardButton("📊 查看进度", callback_data="mc:backuprefresh"),
         ],
         [InlineKeyboardButton("⚡ 立即执行一轮", callback_data="mc:backuprun")],
-        [InlineKeyboardButton("🔄 刷新状态", callback_data="mc:backuprefresh")],
         [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
     ])
     await message.edit_text(body, reply_markup=keyboard)
@@ -4240,9 +4243,28 @@ async def admin_callback_handler(client, query):
         return
     if action == "backup":
         await render_backup_admin(message)
-    elif action in ("backuprefresh", "backupenable", "backuppause", "backuprun"):
+    elif action in ("backuprefresh", "backupenable", "backuppause", "backuprun", "backupstart", "backupcontinue"):
         global backup_retry_manual_requested, last_user_activity
-        if action == "backupenable":
+        if action == "backupstart":
+            _, backup_channel_id = await get_storage_channels()
+            if not backup_channel_id:
+                notice = "❌ 请先绑定备用频道，再开始备份。"
+            else:
+                requeued = await db.restart_backup_retry_queue(backup_channel_id)
+                await db.set_setting("backup_retry_enabled", "1")
+                backup_retry_manual_requested = True
+                last_user_activity = asyncio.get_running_loop().time() - 31
+                notice = (
+                    "⏮️ 已从头开始检查备份。\n"
+                    f"已重新安排失败项目：{requeued} 个；原有成功记录和文件索引均保留。\n"
+                    "备用频道已有记录不会重复复制。"
+                )
+        elif action == "backupcontinue":
+            await db.set_setting("backup_retry_enabled", "1")
+            backup_retry_manual_requested = True
+            last_user_activity = asyncio.get_running_loop().time() - 31
+            notice = "⏯️ 已继续上次备份；从未完成的任务接着处理，已成功项目不会重复复制。"
+        elif action == "backupenable":
             await db.set_setting("backup_retry_enabled", "1")
             notice = "✅ 已开启自动备份。"
         elif action == "backuppause":
