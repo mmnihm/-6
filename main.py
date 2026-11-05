@@ -1947,6 +1947,15 @@ async def backup_retry_worker(client):
             # Discover a few metadata-only Cangku records at a time. The
             # existing PostgreSQL retry table makes the queue restart-safe.
             _, backup_channel_id = await get_storage_channels()
+            if backup_channel_id and await db.get_setting("backup_retry_full_restart_pending") == "1":
+                reset_count = await db.restart_backup_retry_queue(
+                    backup_channel_id, full_restart=True
+                )
+                await db.set_setting("backup_retry_full_restart_pending", "0")
+                log.warning(
+                    "Full Cangku backup pass started: reset %s saved backup IDs",
+                    reset_count,
+                )
             if backup_channel_id and scanner is not None and scanner.is_connected:
                 # Resolve original Telegram media_group_id first. Without the
                 # scanner session we cannot safely distinguish a single file
@@ -4113,15 +4122,20 @@ async def render_backup_admin(message, notice=""):
     state = "🟢 自动运行已开启" if enabled else "⏸ 自动备份已暂停"
     worker = "运行中" if backup_worker_running else "尚未启动"
     body = (
-        "📦 自动备份管理\\n\\n"
-        f"状态：{state}\\n"
-        f"后台任务：{worker}\\n"
-        f"备用频道：{backup_channel_id or '未绑定'}\\n\\n"
-        f"已备份 Cangku 资源：{counts['backed']} 个（含相册成员）\\n"
-        f"待发现单文件：{counts['candidates']} 个\\n"
-        f"待发现相册组：{counts['album_candidates']} 组\\n"
-        f"待处理任务：{counts['queued']} 个（相册按整组计 1 个任务）\\n"
-        f"失败待重试：{counts['failed']} 个"
+        "📦 备份管理\\n"
+        "━━━━━━━━━━━━━━\\n"
+        f"⚙️ 自动备份：{state}\\n"
+        f"🖥 后台任务：{worker}\\n"
+        f"📍 备用频道：{backup_channel_id or '未绑定'}\\n"
+        "━━━━━━━━━━━━━━\\n"
+        "📊 复制进度（按当前记录）\\n"
+        f"✅ 已复制：{counts['backed']} 个资源\\n"
+        f"⏳ 待复制单文件：{counts['candidates']} 个\\n"
+        f"🖼 待复制相册组：{counts['album_candidates']} 组\\n"
+        f"📦 队列任务：{counts['queued']} 个\\n"
+        f"⚠️ 失败待重试：{counts['failed']} 个\\n"
+        "━━━━━━━━━━━━━━\\n"
+        "从头开始会重新复制源资源，并保存新的备用消息 ID。"
     )
     if notice:
         body = notice + "\\n\\n" + body
@@ -4250,14 +4264,16 @@ async def admin_callback_handler(client, query):
             if not backup_channel_id:
                 notice = "❌ 请先绑定备用频道，再开始备份。"
             else:
-                requeued = await db.restart_backup_retry_queue(backup_channel_id)
+                # Defer the full reset to the single backup worker so an
+                # in-flight copy finishes before the new pass is prepared.
+                await db.set_setting("backup_retry_full_restart_pending", "1")
                 await db.set_setting("backup_retry_enabled", "1")
                 backup_retry_manual_requested = True
                 last_user_activity = asyncio.get_running_loop().time() - 31
                 notice = (
-                    "⏮️ 已从头开始检查备份。\n"
-                    f"已重新安排失败项目：{requeued} 个；原有成功记录和文件索引均保留。\n"
-                    "备用频道已有记录不会重复复制。"
+                    "⏮️ 已启动从头复制。\\n"
+                    "本轮会重新复制全部 Cangku 源资源，不按旧备份 ID 跳过。\\n"
+                    "每次复制成功后，都会保存新的备用消息 ID；原目录和文件索引保留。"
                 )
         elif action == "backupcontinue":
             await db.set_setting("backup_retry_enabled", "1")
