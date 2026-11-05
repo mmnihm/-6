@@ -928,14 +928,11 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
     primary_message_id = int(record["primary_message_id"] or 0)
     backup_message_id = int(record["backup_message_id"] or 0)
 
-    # The primary storage channel is always the first retrieval source.
-    # The backup is the second choice; legacy Cangku source is kept as a
-    # final fallback for directory-only imports that have no primary copy yet.
+    # Legacy directory imports stored the original Cangku message ID in
+    # primary_message_id even though it does not belong to the currently-bound
+    # primary storage channel. Detect that legacy shape and never pair the
+    # original message ID with the new primary channel ID.
     candidates = []
-    if primary_channel_id and primary_message_id > 0:
-        candidates.append(("primary", int(primary_channel_id), primary_message_id))
-    if backup_channel_id and backup_message_id > 0:
-        candidates.append(("backup", int(backup_channel_id), backup_message_id))
     cangku_source = None
     if fingerprint.startswith("cangku:"):
         parts = fingerprint.split(":", 2)
@@ -944,6 +941,13 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
                 cangku_source = (int(parts[1]), int(parts[2]))
             except ValueError:
                 cangku_source = None
+    legacy_original_pointer = bool(
+        cangku_source and primary_message_id == cangku_source[1]
+    )
+    if primary_channel_id and primary_message_id > 0 and not legacy_original_pointer:
+        candidates.append(("primary", int(primary_channel_id), primary_message_id))
+    if backup_channel_id and backup_message_id > 0:
+        candidates.append(("backup", int(backup_channel_id), backup_message_id))
     if cangku_source:
         candidates.append(("original", cangku_source[0], cangku_source[1]))
 
@@ -1073,7 +1077,14 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
             album_records = [entry[2] for entry in unit]
             album_candidates = []
             if primary_channel_id and all(
-                row and int(row["primary_message_id"] or 0) > 0
+                row
+                and int(row["primary_message_id"] or 0) > 0
+                and not (
+                    str(row["source_fingerprint"] or "").startswith("cangku:")
+                    and len(str(row["source_fingerprint"] or "").split(":", 2)) == 3
+                    and int(row["primary_message_id"] or 0)
+                    == int(str(row["source_fingerprint"]).split(":", 2)[2])
+                )
                 for row in album_records
             ):
                 album_candidates.append((
@@ -1141,14 +1152,16 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
             continue
 
         if is_album:
-            # Never split an album on delivery failure or incomplete storage.
+            # Never split an album. A failed unit must remain pending; for
+            # paginated folder delivery, stop here so the next request retries
+            # this exact album instead of advancing past it.
             failed += len(unit)
-            completed.update(entry[0] for entry in unit)
             log.error(
-                "Album skipped without splitting: user=%s group=%s count=%s",
+                "Album delivery failed and remains pending: user=%s group=%s count=%s",
                 user_id, unit[0][1]["album_group_id"], len(unit),
             )
-            await advance_progress()
+            if track_progress:
+                return sent, failed, next_offset, last_sent_message_id
             continue
 
         # Only genuine single files use the individual copy path.
@@ -1160,15 +1173,17 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
             if ok:
                 sent += 1
                 last_sent_message_id = int(copied_message_id)
+                completed.add(position)
+                await advance_progress()
             else:
                 failed += 1
                 log.warning(
-                    "Skipping failed file: user=%s share_key=%s offset=%s file=%s reason=%s",
+                    "File delivery failed and remains pending: user=%s share_key=%s offset=%s file=%s reason=%s",
                     user_id, share_key, offset + position,
                     item["file_key"], error_text,
                 )
-            completed.add(position)
-            await advance_progress()
+                if track_progress:
+                    return sent, failed, next_offset, last_sent_message_id
 
     return sent, failed, next_offset, last_sent_message_id
 
@@ -1687,7 +1702,7 @@ async def directory_import_confirm_handler(client, message):
                 file_key = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
                 inserted = await db.add_file(
                     file_key, user.id, item["file_name"], item["media_type"],
-                    item["message_id"], 0, item["category"], fingerprint,
+                    0, 0, item["category"], fingerprint,
                     item.get("file_size", 0), item.get("created_at"),
                     refresh_stats=False,
                 )
@@ -3129,7 +3144,7 @@ async def user_catalog_callback_handler(client, query):
             )
             summary = f"🎲 随机发送完成：成功 {sent}/{len(rows)} 个文件。"
             if failed:
-                summary += f"\n\n⚠️ 有 {failed} 个文件未能发送，已自动跳过；其余资源不受影响。"
+                summary += f"\n\n⚠️ 有 {failed} 个文件本次未能发送，没有删除资源或修改目录；可以再次尝试。"
             # Send the completion summary through the same direct Bot API
             # transport used by the reliable file-copy path. The raw JSON
             # reply_markup makes it explicit that Telegram receives buttons.
