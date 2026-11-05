@@ -2036,10 +2036,16 @@ async def backup_retry_worker(client):
                         continue
                     source_fingerprint = str(record["source_fingerprint"] or "")
                     album_group_id = str(record["album_group_id"] or "")
-                    if source_fingerprint.startswith("cangku:") and not album_group_id:
+                    if source_fingerprint.startswith("cangku:") and (
+                        not album_group_id
+                        or album_group_id.startswith("cangku-incomplete:")
+                    ):
+                        # Imported Cangku JSON may contain only part of an album's
+                        # metadata. Re-check these rows against Telegram before
+                        # treating them as permanently unsafe; a complete source
+                        # album can repair the imported metadata, while a genuine
+                        # single is explicitly marked as such by the scanner.
                         if scanner is None or not scanner.is_connected:
-                            # Scanner is a shared prerequisite for legacy Cangku items.
-                            # Keep the durable job instead of marking every file as failed.
                             await db.defer_backup_retry(
                                 file_key,
                                 "Waiting for Scanner login to verify legacy Cangku album metadata",
