@@ -1106,30 +1106,44 @@ class Database:
             await db.commit()
 
     async def restart_backup_retry_queue(self, backup_channel_id, full_restart=False):
-        """Requeue backup work; full_restart clears only old Cangku backup pointers."""
+        """Rebuild the complete Cangku copy queue in source-message order."""
         now = iso_now()
         queued_failures = 0
         reset_count = 0
         async with self.connect() as db:
             if full_restart:
-                # Reset backup pointers, then enqueue only indexed singles and
-                # complete album groups. Parse source pointers in Python so this
-                # works with both PostgreSQL and SQLite; no user scanner needed.
+                # Reset only source-linked Cangku mappings. Keep the original
+                # files, scanner index, user data, and non-Cangku retry jobs.
                 result = await db.execute("""
                     UPDATE files SET backup_message_id=0
                     WHERE source_fingerprint LIKE 'cangku:%'
                 """)
                 reset_count = max(0, int(getattr(result, "rowcount", 0) or 0))
-                await db.execute("DELETE FROM backup_retry_jobs")
+
+                # Remove only the old Cangku jobs; unrelated upload/retry work
+                # must not be discarded by a full source-channel restart.
+                await db.execute("""
+                    DELETE FROM backup_retry_jobs
+                    WHERE file_key IN (
+                        SELECT file_key FROM files
+                        WHERE source_fingerprint LIKE 'cangku:%'
+                    )
+                """)
+
+                # Queue EVERY indexed source message, not just rows whose album
+                # metadata already has a recognized prefix. The worker verifies
+                # unknown/legacy album metadata against Telegram before copying.
+                # Album members may each have a job; the first source message
+                # forwards the complete album and later member jobs safely see
+                # their newly saved backup IDs and finish without copying again.
                 source_rows = await (await db.execute("""
-                    SELECT file_key, source_fingerprint, album_group_id,
-                           primary_message_id, album_position
+                    SELECT file_key, source_fingerprint
                     FROM files
                     WHERE source_fingerprint LIKE 'cangku:%'
                     ORDER BY created_at, file_key
                 """)).fetchall()
+
                 now_jobs = []
-                albums = {}
                 for row in source_rows:
                     fingerprint = str(row["source_fingerprint"] or "")
                     parts = fingerprint.split(":", 2)
@@ -1140,34 +1154,16 @@ class Database:
                         source_message_id = int(parts[2])
                     except (TypeError, ValueError):
                         continue
-                    group_id = str(row["album_group_id"] or "")
-                    if group_id.startswith("cangku-single:"):
-                        now_jobs.append((
-                            str(row["file_key"]), source_chat_id, source_message_id,
-                            int(backup_channel_id), now, "Full restart: direct Bot API single",
-                            now, now,
-                        ))
-                    elif group_id.startswith("cangku:"):
-                        albums.setdefault(group_id, []).append((
-                            row, source_chat_id, source_message_id
-                        ))
-                for group_id, members in albums.items():
-                    if not 2 <= len(members) <= 10:
-                        continue
-                    if len({member[1] for member in members}) != 1:
-                        continue
-                    members.sort(key=lambda member: (
-                        int(member[0]["album_position"] or 0),
-                        member[2],
-                    ))
-                    first_row, source_chat_id, source_message_id = members[0]
                     now_jobs.append((
-                        str(first_row["file_key"]), source_chat_id, source_message_id,
-                        int(backup_channel_id), now, "Full restart: direct Bot API album",
+                        str(row["file_key"]), source_chat_id, source_message_id,
+                        int(backup_channel_id), now,
+                        "Full restart: verified source message",
                         now, now,
                     ))
-                # Full restart must follow Telegram source chronology, not DB insertion time.
-                # The first message ID of an album is stored on its representative job.
+
+                # The copy queue is always ordered by original Telegram message
+                # ID, independent of scan order, database insertion time, or
+                # the position where a previous backup run stopped.
                 now_jobs.sort(key=lambda job: (
                     int(job[1]), int(job[2]), str(job[0])
                 ))
@@ -1183,18 +1179,22 @@ class Database:
                             primary_message_id=excluded.primary_message_id,
                             backup_channel_id=excluded.backup_channel_id,
                             attempts=0, next_retry_at=excluded.next_retry_at,
-                            last_error=excluded.last_error, updated_at=excluded.updated_at
+                            last_error=excluded.last_error,
+                            updated_at=excluded.updated_at
                     """, job)
-            # Existing durable jobs are made immediately eligible for the selected
-            # backup destination. Their source pointers and retry history remain.
-            await db.execute("""
-                UPDATE backup_retry_jobs
-                SET backup_channel_id=?, attempts=0, next_retry_at=?,
-                    last_error='', updated_at=?
-            """, (int(backup_channel_id), now, now))
 
-            # Re-queue archived failures. In a full restart all Cangku rows have
-            # just been reset, so every source-backed failure is eligible again.
+                # Do not rewrite unrelated jobs' destination or retry state.
+            else:
+                # A normal resume makes all pending work immediately eligible.
+                await db.execute("""
+                    UPDATE backup_retry_jobs
+                    SET backup_channel_id=?, attempts=0, next_retry_at=?,
+                        last_error='', updated_at=?
+                """, (int(backup_channel_id), now, now))
+
+            # Re-queue archived failures. During a full restart the complete
+            # source set is already queued above; this upsert simply refreshes
+            # any failed representative job without changing source ordering.
             failures = await (await db.execute("""
                 SELECT failure.file_key, failure.source_fingerprint
                 FROM backup_retry_failures failure
@@ -1229,6 +1229,7 @@ class Database:
                     int(backup_channel_id), now, now, now,
                 ))
                 queued_failures += 1
+
             await db.commit()
         return reset_count if full_restart else queued_failures
 
