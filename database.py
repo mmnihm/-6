@@ -1169,6 +1169,24 @@ class Database:
                       SELECT 1 FROM backup_retry_jobs j WHERE j.file_key=f.file_key
                   )
             """)).fetchone()
+            album_candidates = await (await db.execute("""
+                SELECT COUNT(*) AS n FROM (
+                    SELECT grouped.album_group_id
+                    FROM files grouped
+                    GROUP BY grouped.album_group_id
+                    HAVING grouped.album_group_id IS NOT NULL
+                       AND COUNT(*) BETWEEN 2 AND 10
+                       AND SUM(CASE WHEN grouped.source_fingerprint LIKE 'cangku:%'
+                                    THEN 1 ELSE 0 END)=COUNT(*)
+                       AND SUM(CASE WHEN COALESCE(grouped.backup_message_id, 0)=0
+                                    THEN 1 ELSE 0 END)=COUNT(*)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM backup_retry_jobs jobs
+                           JOIN files queued ON queued.file_key=jobs.file_key
+                           WHERE queued.album_group_id=grouped.album_group_id
+                       )
+                ) pending_albums
+            """)).fetchone()
             backed = await (await db.execute("""
                 SELECT COUNT(*) AS n FROM files
                 WHERE COALESCE(backup_message_id, 0)>0
@@ -1178,6 +1196,7 @@ class Database:
                 "queued": int(queued["n"] or 0),
                 "failed": int(failed["n"] or 0),
                 "candidates": int(candidates["n"] or 0),
+                "album_candidates": int(album_candidates["n"] or 0),
                 "backed": int(backed["n"] or 0),
             }
 
