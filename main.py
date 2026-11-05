@@ -2152,10 +2152,16 @@ async def backup_retry_worker(client):
                             "Bot API direct Cangku single backup",
                         )
 
-                # Complete album membership is already stored in PostgreSQL.
-                # Forward the full ordered message-ID list in one Bot API call.
-                # This path deliberately does not consult the user-account scanner.
-                album_candidates = await db.list_unbacked_cangku_albums(limit=1)
+                # Never queue a partial album while an oldest-first history scan
+                # is incomplete. A failed scan can resume later without splitting it.
+                scan_progress = (
+                    await db.get_scan_progress(primary_channel_id)
+                    if primary_channel_id else {"completed": 0}
+                )
+                album_candidates = (
+                    await db.list_unbacked_cangku_albums(limit=1)
+                    if scan_progress.get("completed") else []
+                )
                 for candidate in album_candidates:
                     fingerprint = str(candidate["source_fingerprint"] or "")
                     parts = fingerprint.split(":", 2)
@@ -2188,6 +2194,20 @@ async def backup_retry_worker(client):
                 ):
                     break
                 file_key = str(pending_job["file_key"])
+                pending_record = await db.get_file(file_key)
+                pending_album_group = (
+                    str(pending_record["album_group_id"] or "")
+                    if pending_record else ""
+                )
+                if pending_album_group.startswith("cangku:"):
+                    scan_progress = (
+                        await db.get_scan_progress(primary_channel_id)
+                        if primary_channel_id else {"completed": 0}
+                    )
+                    if not scan_progress.get("completed"):
+                        # Leave the durable album job untouched until the full
+                        # source index is complete; never copy a partial group.
+                        continue
                 job = await db.claim_backup_retry(file_key, lease_seconds=300)
                 if not job:
                     continue
