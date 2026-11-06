@@ -1240,25 +1240,30 @@ class Database:
         now = iso_now()
         ids_text = ",".join(str(int(value)) for value in (source_message_ids or []))
         async with self.connect() as db:
-            await db.execute("""
+            result = await db.execute("""
                 INSERT INTO backup_retry_failures(
                     file_key, file_name, category, source_fingerprint,
                     album_group_id, source_message_ids, last_error, failed_at
                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(file_key) DO UPDATE SET
-                    file_name=excluded.file_name,
-                    category=excluded.category,
-                    source_fingerprint=excluded.source_fingerprint,
-                    album_group_id=excluded.album_group_id,
-                    source_message_ids=excluded.source_message_ids,
-                    last_error=excluded.last_error,
-                    failed_at=excluded.failed_at
+                ON CONFLICT(file_key) DO NOTHING
             """, (
                 str(file_key), str(file_name or "")[:300], str(category or "")[:120],
                 str(source_fingerprint or "")[:300], str(album_group_id or "")[:300],
                 ids_text[:500], str(error or "")[:500], now,
             ))
+            # A Telegram album is one backup unit even though every member has
+            # its own file row and retry job. Once its representative failure is
+            # recorded, remove every queued member atomically so the worker can
+            # neither retry nor notify about the same album again.
+            if str(album_group_id or "").startswith("cangku:"):
+                await db.execute("""
+                    DELETE FROM backup_retry_jobs
+                    WHERE file_key IN (
+                        SELECT file_key FROM files WHERE album_group_id=?
+                    )
+                """, (str(album_group_id),))
             await db.commit()
+            return getattr(result, "rowcount", 0) == 1
 
     async def list_backup_failures(self, limit=20):
         async with self.connect() as db:
@@ -1597,6 +1602,45 @@ class Database:
                     await self._refresh_category_stats(db, current["category"], create=False)
             await db.commit()
             return cur.rowcount > 0
+
+    async def assign_backup_album_category(self, backup_message_ids, category):
+        """Assign one hashtag directory to every indexed member of a complete backup album."""
+        ids = list(dict.fromkeys(int(value) for value in (backup_message_ids or [])))
+        category = str(category or "").strip()[:120]
+        if not category or not 2 <= len(ids) <= 10:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        async with self.connect() as db:
+            rows = await (await db.execute(
+                f"SELECT file_key, category, source_fingerprint FROM files "
+                f"WHERE backup_message_id IN ({placeholders})",
+                ids,
+            )).fetchall()
+            # Do not partially classify a group: every message in the album
+            # must already have a matching indexed backup record.
+            if len(rows) != len(ids):
+                return 0
+            file_keys = [str(row["file_key"]) for row in rows]
+            key_placeholders = ",".join("?" for _ in file_keys)
+            old_categories = {
+                str(row["category"] or "").strip()
+                for row in rows
+                if str(row["category"] or "").strip() and str(row["category"] or "").strip() != category
+            }
+            await db.execute(
+                f"UPDATE files SET category=? WHERE file_key IN ({key_placeholders})",
+                [category] + file_keys,
+            )
+            await db.execute(
+                f"UPDATE scanner_messages SET category=? WHERE fingerprint IN "
+                f"(SELECT source_fingerprint FROM files WHERE file_key IN ({key_placeholders}))",
+                [category] + file_keys,
+            )
+            for old_category in old_categories:
+                await self._refresh_category_stats(db, old_category, create=False)
+            await self._refresh_category_stats(db, category)
+            await db.commit()
+            return len(file_keys)
 
     async def toggle_notification_subscription(self, user_id):
         async with self.connect() as db:
