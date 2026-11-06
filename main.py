@@ -4722,10 +4722,14 @@ async def admin_callback_handler(client, query):
             )
             return
         directory_import_running = True
-        await message.edit_text(
-            "⏳ 正在读取备用频道已备份的资源并识别相册标签……\n\n"
-            "只会修改数据库中的目录归属，不会复制、删除或移动频道消息。"
-        )
+        try:
+            await message.edit_text(
+                "⏳ 正在读取备用频道已备份的资源并识别相册标签……\n\n"
+                "只会修改数据库中的目录归属，不会复制、删除或移动频道消息。"
+            )
+        except Exception:
+            directory_import_running = False
+            raise
         asyncio.create_task(run_backup_tag_folder_scan(
             client, int(user.id), int(backup_channel_id), message
         ))
