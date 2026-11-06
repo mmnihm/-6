@@ -915,6 +915,76 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
     finally:
         scan_task = None
 
+async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status_message):
+    """Read the bound backup channel and assign each complete tagged album to one folder."""
+    global directory_import_running
+    scanned_messages = 0
+    album_groups = {}
+    tagged_groups = 0
+    assigned_files = 0
+    try:
+        chat = await resolve_scanner_chat(backup_channel_id)
+        async for item in iter_chat_history_newest_first(chat.id):
+            scanned_messages += 1
+            group_id = getattr(item, "media_group_id", None)
+            if not group_id:
+                continue
+            group_key = str(group_id)
+            group = album_groups.setdefault(
+                group_key, {"message_ids": [], "category": ""}
+            )
+            message_id = int(getattr(item, "id", 0) or 0)
+            if message_id and message_id not in group["message_ids"]:
+                group["message_ids"].append(message_id)
+            if not group["category"]:
+                group["category"] = parse_chinese_album_category([item])
+
+        # Only complete Telegram albums (2-10 messages) with a Chinese hashtag
+        # are classified. Singles and untagged albums never create folders.
+        for group in album_groups.values():
+            message_ids = sorted(set(group["message_ids"]))
+            category = str(group["category"] or "").strip()
+            if not category or not 2 <= len(message_ids) <= 10:
+                continue
+            updated = await db.assign_backup_album_category(message_ids, category)
+            if updated == len(message_ids):
+                tagged_groups += 1
+                assigned_files += updated
+
+        category_catalog_cache["expires_at"] = 0
+        category_catalog_cache["rows"] = []
+        categories = await db.list_categories()
+        result_text = (
+            "✅ 备用频道标签目录整理完成\n\n"
+            f"📨 已读取频道消息：{scanned_messages} 条\n"
+            f"🖼️ 识别相册组：{len(album_groups)} 组\n"
+            f"🏷️ 成功归类相册：{tagged_groups} 组\n"
+            f"📦 归入目录资源：{assigned_files} 个\n"
+            f"📁 当前目录总数：{len(categories)} 个\n\n"
+            "只处理完整相册组中带中文 #标签 的资源，整组归入同一目录。"
+            "单条文件、无标签相册及未完整备份的相册不会自动建立目录。"
+        )
+        try:
+            await status_message.edit_text(result_text, reply_markup=back_keyboard())
+        except Exception:
+            await client.send_message(admin_id, result_text, reply_markup=back_keyboard())
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.exception("Backup-channel hashtag folder scan failed")
+        error_text = (
+            "❌ 按标签建立文件夹失败，现有目录和文件记录均未清空。\n"
+            f"原因：{type(exc).__name__}: {str(exc)[:350]}\n\n"
+            "请确认扫描账号已加入备用频道并能读取历史消息。"
+        )
+        try:
+            await status_message.edit_text(error_text, reply_markup=back_keyboard())
+        except Exception:
+            await client.send_message(admin_id, error_text, reply_markup=back_keyboard())
+    finally:
+        directory_import_running = False
+
+
 async def reply_admin_only(message):
     await message.reply_text("⛔ 仅管理员可使用此命令。")
 
@@ -2463,12 +2533,13 @@ async def backup_retry_worker(client):
                         # Persist the failure before removing the retry job. If
                         # the database write fails, leave the leased job to be retried
                         # after its lease expires instead of silently losing the report.
-                        await db.record_backup_failure(
+                        should_notify = await db.record_backup_failure(
                             file_key, file_name, category, source_fingerprint,
                             album_group_id, source_ids, error_text,
                         )
                         await db.complete_backup_retry(file_key)
-                        cycle_failure_notices.append(notice)
+                        if should_notify:
+                            cycle_failure_notices.append(notice)
                     except Exception:
                         log.exception("Could not persist/report skipped backup file %s", file_key)
                     log.warning("Backup retry skipped after failure: file=%s error=%s", file_key, error_text)
@@ -4629,6 +4700,36 @@ async def admin_callback_handler(client, query):
                 lines.append(f"{row['user_id']} — {label}")
             body = "👥 手动会员列表\n" + "\n".join(lines) + "\n\n授权：/grant 用户ID 天数|永久\n取消：/revoke 用户ID"
         await message.edit_text(body, reply_markup=back_keyboard())
+    elif action == "tagfolderscan":
+        global directory_import_running
+        if directory_import_running:
+            await message.edit_text(
+                "⏳ 当前已有扫描或目录导入任务正在运行，请完成后再试。",
+                reply_markup=back_keyboard(),
+            )
+            return
+        if scanner is None or not scanner.is_connected:
+            await message.edit_text(
+                "❌ 扫描账号尚未登录或连接已断开。请先完成扫描账号登录。",
+                reply_markup=back_keyboard(),
+            )
+            return
+        _, backup_channel_id = await get_storage_channels()
+        if not backup_channel_id:
+            await message.edit_text(
+                "❌ 尚未绑定备用频道，请先绑定备用存储频道。",
+                reply_markup=back_keyboard(),
+            )
+            return
+        directory_import_running = True
+        await message.edit_text(
+            "⏳ 正在读取备用频道已备份的资源并识别相册标签……\n\n"
+            "只会修改数据库中的目录归属，不会复制、删除或移动频道消息。"
+        )
+        asyncio.create_task(run_backup_tag_folder_scan(
+            client, int(user.id), int(backup_channel_id), message
+        ))
+        return
     elif action == "directories" or action.startswith("directories:"):
         categories = await db.list_categories()
         page = int(action.split(":", 1)[1]) if ":" in action else 0
@@ -4636,7 +4737,10 @@ async def admin_callback_handler(client, query):
         page_size = 10
         start_at = page * page_size
         selected = categories[start_at:start_at + page_size]
-        rows = [[InlineKeyboardButton("➕ 新建目录", callback_data="mc:dirnew")]]
+        rows = [
+            [InlineKeyboardButton("➕ 新建目录", callback_data="mc:dirnew")],
+            [InlineKeyboardButton("🏷 按标签建立文件夹（读取备用频道）", callback_data="mc:tagfolderscan")],
+        ]
         for index, row in enumerate(selected, start_at):
             rows.append([InlineKeyboardButton(
                 f"{index - start_at + 1}. 📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
@@ -4662,7 +4766,10 @@ async def admin_callback_handler(client, query):
             f"📁 文件夹列表（共 {len(categories)} 个，第 {page + 1} 页）\n\n"
             "点击文件夹名称可复制名称；点击下方数字查看统计和管理。"
         )
-        copy_rows = [[{"text": "➕ 新建目录", "callback_data": "mc:dirnew"}]]
+        copy_rows = [
+            [{"text": "➕ 新建目录", "callback_data": "mc:dirnew"}],
+            [{"text": "🏷 按标签建立文件夹（读取备用频道）", "callback_data": "mc:tagfolderscan"}],
+        ]
         for index, row in enumerate(selected):
             copy_rows.append([{
                 "text": f"{index + 1}. 📁 {row['category'][:36]}（{int(row['file_count'] or 0)}）",
