@@ -2121,6 +2121,29 @@ async def discover_cangku_album_metadata(candidate, force=False):
         return False
 
 
+async def find_deleted_source_messages(chat_id, message_ids):
+    """Return source IDs Telegram confirms are missing/empty; API errors still raise."""
+    if scanner is None or not scanner.is_connected:
+        raise RuntimeError("扫描账号尚未连接，无法核实原始消息是否存在")
+    requested = [int(value) for value in message_ids]
+    if not requested:
+        return []
+    result = await scanner_api_call(
+        scanner.get_messages,
+        int(chat_id),
+        requested if len(requested) > 1 else requested[0],
+    )
+    messages = result if isinstance(result, list) else [result]
+    found_ids = set()
+    for message in messages:
+        if message is None or getattr(message, "empty", False):
+            continue
+        message_id = getattr(message, "id", None)
+        if message_id is not None:
+            found_ids.add(int(message_id))
+    return [message_id for message_id in requested if message_id not in found_ids]
+
+
 async def backup_retry_worker(client):
     """Resume durable jobs and queue Cangku singles/albums only while idle."""
     global last_user_activity, backup_retry_manual_requested, scan_task
@@ -2407,6 +2430,18 @@ async def backup_retry_worker(client):
                             await db.complete_backup_retry(file_key)
                             continue
 
+                        # Confirm every original album member still exists before
+                        # forwarding. Telegram returns empty/missing messages for
+                        # deleted source posts; never split or recreate a partial album.
+                        deleted_source_ids = await find_deleted_source_messages(
+                            source_chat_id, source_message_ids
+                        )
+                        if deleted_source_ids:
+                            raise RuntimeError(
+                                "原始相册消息已被删除或不存在，整组放弃转发；缺失消息 ID："
+                                + "、".join(str(value) for value in deleted_source_ids)
+                            )
+
                         # The scanner user account can read the primary channel;
                         # the bot account may not be a member and would get
                         # Bot API 400 "chat not found". Forward albums with the
@@ -2461,6 +2496,19 @@ async def backup_retry_worker(client):
                             album_group_id, len(copied_ids),
                         )
                     else:
+                        # Verify the original post immediately before forwarding.
+                        # Deleted/empty source messages are terminal skips, not retries.
+                        source_parts = source_fingerprint.split(":", 2)
+                        if len(source_parts) == 3 and source_parts[0] == "cangku":
+                            deleted_source_ids = await find_deleted_source_messages(
+                                int(source_parts[1]), [int(source_parts[2])]
+                            )
+                            if deleted_source_ids:
+                                raise RuntimeError(
+                                    "原始消息已被删除或不存在，直接放弃转发；消息 ID："
+                                    + str(deleted_source_ids[0])
+                                )
+
                         # Use the same logged-in scanner account for source access
                         # and forwarding. The bot account may not be a member of the
                         # private primary channel, causing Bot API "chat not found".
