@@ -915,9 +915,11 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
         scan_task = None
 
 async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status_message):
-    """Read the bound backup channel and assign each complete tagged album to one folder."""
+    """Index media directly from the backup channel and create folders from tagged albums."""
     global directory_import_running
     scanned_messages = 0
+    indexed_files = 0
+    skipped_existing = 0
     album_groups = {}
     tagged_groups = 0
     assigned_files = 0
@@ -925,21 +927,59 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
         chat = await resolve_scanner_chat(backup_channel_id)
         async for item in iter_chat_history_newest_first(chat.id):
             scanned_messages += 1
-            group_id = getattr(item, "media_group_id", None)
-            if not group_id:
+            media_type, file_name, _ = media_details(item)
+            if not media_type:
                 continue
-            group_key = str(group_id)
-            group = album_groups.setdefault(
-                group_key, {"message_ids": [], "category": ""}
-            )
-            message_id = int(getattr(item, "id", 0) or 0)
-            if message_id and message_id not in group["message_ids"]:
-                group["message_ids"].append(message_id)
-            if not group["category"]:
-                group["category"] = parse_chinese_album_category([item])
 
-        # Only complete Telegram albums (2-10 messages) with a Chinese hashtag
-        # are classified. Singles and untagged albums never create folders.
+            message_id = int(getattr(item, "id", 0) or 0)
+            if not message_id:
+                continue
+
+            existing = await db.get_file_by_backup_message_id(message_id)
+            if existing:
+                skipped_existing += 1
+            else:
+                group_id = getattr(item, "media_group_id", None)
+                album_key = (
+                    f"backup:{int(chat.id)}:{group_id}" if group_id else None
+                )
+                fingerprint = f"backup:{int(chat.id)}:{message_id}"
+                created_at = (
+                    item.date.isoformat() if getattr(item, "date", None)
+                    else datetime.now(timezone.utc).isoformat()
+                )
+                inserted = await db.add_file(
+                    secrets.token_urlsafe(9).replace("-", "").replace("_", ""),
+                    config.ADMIN_ID,
+                    file_name or f"{media_type}_{message_id}",
+                    media_type,
+                    0,
+                    message_id,
+                    category="未分类",
+                    source_fingerprint=fingerprint,
+                    created_at=created_at,
+                    album_group_id=album_key,
+                    album_position=message_id if album_key else 0,
+                    refresh_stats=False,
+                )
+                if inserted:
+                    indexed_files += 1
+                else:
+                    skipped_existing += 1
+
+            group_id = getattr(item, "media_group_id", None)
+            if group_id:
+                group_key = str(group_id)
+                group = album_groups.setdefault(
+                    group_key, {"message_ids": [], "category": ""}
+                )
+                if message_id not in group["message_ids"]:
+                    group["message_ids"].append(message_id)
+                if not group["category"]:
+                    group["category"] = parse_chinese_album_category([item])
+
+        # Apply a hashtag to the entire indexed album only after the scan has
+        # collected its complete set of Telegram message IDs.
         for group in album_groups.values():
             message_ids = sorted(set(group["message_ids"]))
             category = str(group["category"] or "").strip()
@@ -954,14 +994,16 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
         category_catalog_cache["rows"] = []
         categories = await db.list_categories()
         result_text = (
-            "✅ 备用频道标签目录整理完成\n\n"
+            "✅ 副频道扫描及标签目录整理完成\n\n"
             f"📨 已读取频道消息：{scanned_messages} 条\n"
+            f"📦 新入库资源：{indexed_files} 个\n"
+            f"⏭️ 已存在资源：{skipped_existing} 个（未重复入库）\n"
             f"🖼️ 识别相册组：{len(album_groups)} 组\n"
             f"🏷️ 成功归类相册：{tagged_groups} 组\n"
-            f"📦 归入目录资源：{assigned_files} 个\n"
-            f"📁 当前目录总数：{len(categories)} 个\n\n"
-            "只处理完整相册组中带中文 #标签 的资源，整组归入同一目录。"
-            "单条文件、无标签相册及未完整备份的相册不会自动建立目录。"
+            f"📁 归入目录资源：{assigned_files} 个\n"
+            f"📂 当前目录总数：{len(categories)} 个\n\n"
+            "资源直接从副频道读取；完整相册组中带中文 #标签 的内容整组归入目录。"
+            "单条文件和无标签相册保留在未分类资源中。"
         )
         try:
             await status_message.edit_text(result_text, reply_markup=back_keyboard())
@@ -970,11 +1012,11 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        log.exception("Backup-channel hashtag folder scan failed")
+        log.exception("Backup-channel direct indexing and hashtag scan failed")
         error_text = (
-            "❌ 按标签建立文件夹失败，现有目录和文件记录均未清空。\n"
+            "❌ 副频道扫描或标签目录整理失败。\n"
             f"原因：{type(exc).__name__}: {str(exc)[:350]}\n\n"
-            "请确认扫描账号已加入备用频道并能读取历史消息。"
+            "已完成的资源入库会保留；再次扫描会跳过已入库资源。"
         )
         try:
             await status_message.edit_text(error_text, reply_markup=back_keyboard())
