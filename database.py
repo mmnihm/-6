@@ -609,6 +609,14 @@ class Database:
                 "SELECT * FROM files WHERE source_fingerprint=?", (fingerprint,)
             )).fetchone()
 
+    async def get_file_by_backup_message_id(self, backup_message_id: int):
+        """Find an existing catalog row already pointing at this backup-channel message."""
+        async with self.connect() as db:
+            return await (await db.execute(
+                "SELECT * FROM files WHERE backup_message_id=? LIMIT 1",
+                (int(backup_message_id),),
+            )).fetchone()
+
     async def get_existing_fingerprints(self, fingerprints):
         """Return already-imported fingerprints with a small number of batched queries."""
         values = list(dict.fromkeys(fingerprints))
