@@ -2197,7 +2197,11 @@ async def backup_retry_worker(client):
                     await db.reset_scan_progress_for_full_rescan(primary_channel_id)
                     await db.set_setting("backup_full_scan_started", "1")
                     scan_task = asyncio.create_task(run_history_scan(primary_channel_id))
-                    log.warning("Full backup restart: fresh complete source history scan started")
+                    log.warning(
+                        "Full backup restart: fresh source history scan started at offset_id=0 "
+                        "for channel=%s",
+                        primary_channel_id,
+                    )
                     await asyncio.sleep(2)
                     continue
                 scan_progress = await db.get_scan_progress(primary_channel_id)
@@ -3348,24 +3352,32 @@ async def scanner_login_input_handler(client, message):
     else:
         return
 
+    candidate_scanner = None
     try:
         session_string = await login_client.export_session_string()
         if not session_string:
             raise RuntimeError("Pyrogram returned an empty scanner session string")
-        # Store the credential in the private PostgreSQL settings table before
-        # dropping the temporary in-memory login client. Never log this value.
-        await db.set_setting(SCANNER_SESSION_SETTING_KEY, session_string)
+        # First prove that the exported string can independently restore an
+        # authorized Pyrogram client. Do not report success based on export alone.
         await login_client.disconnect()
-        scanner = Client(
+        candidate_scanner = Client(
             "member_cloud_scanner",
             api_id=config.API_ID,
             api_hash=config.API_HASH,
             session_string=session_string,
         )
-        await scanner.start()
-        scanner_me = await scanner.get_me()
+        await candidate_scanner.start()
+        scanner_me = await candidate_scanner.get_me()
         if scanner_me.is_bot:
             raise RuntimeError("Scanner login must be a normal user account")
+        # Persist only after the independent restore test succeeds, then read
+        # the value back from the same database used by the next deployment.
+        await db.set_setting(SCANNER_SESSION_SETTING_KEY, session_string)
+        persisted_session = await db.get_setting(SCANNER_SESSION_SETTING_KEY)
+        if persisted_session != session_string:
+            raise RuntimeError("Scanner session database write/read verification failed")
+        scanner = candidate_scanner
+        log.info("Scanner session persisted and read-back verified for user %s", scanner_me.id)
         scanner_login_clients.pop(user.id, None)
         scanner_login_states.pop(user.id, None)
         await message.reply_text(
@@ -3375,11 +3387,16 @@ async def scanner_login_input_handler(client, message):
             "现在可以发送 /scan 只扫描主存储频道。"
         )
     except Exception:
-        log.exception("Could not activate scanner after login")
+        log.exception("Could not activate or persist scanner after login")
         try:
             await login_client.disconnect()
         except Exception:
             pass
+        try:
+            if candidate_scanner is not None and candidate_scanner.is_connected:
+                await candidate_scanner.stop()
+        except Exception:
+            log.exception("Could not stop unpersisted scanner validation client")
         scanner = None
         scanner_login_clients.pop(user.id, None)
         scanner_login_states.pop(user.id, None)
@@ -4657,7 +4674,7 @@ async def admin_callback_handler(client, query):
     elif action in ("backuprefresh", "backupenable", "backuppause", "backuprun", "backupstart", "backupcontinue"):
         global backup_retry_manual_requested, last_user_activity
         if action == "backupstart":
-            _, backup_channel_id = await get_storage_channels()
+            primary_channel_id, backup_channel_id = await get_storage_channels()
             if not backup_channel_id:
                 notice = "❌ 请先绑定备用频道，再开始备份。"
             elif scanner is None or not scanner.is_connected:
@@ -4666,12 +4683,30 @@ async def admin_callback_handler(client, query):
                     "请先进入「扫描账号登录」完成登录，再回来点击从头开始。\n"
                     "本次没有重置任何备份 ID，也没有改动原数据。"
                 )
+            elif not primary_channel_id:
+                notice = "❌ 尚未绑定主存储频道，无法从头扫描。没有改动现有备份记录。"
             else:
-                # The worker first resets only the scan cursor, scans the entire
-                # original channel, and only then freezes the complete index into jobs.
+                # Stop any older /scan task first. Otherwise it could keep
+                # advancing the previous cursor while the full restart waits.
+                if scan_task and not scan_task.done():
+                    scan_task.cancel()
+                    try:
+                        await scan_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        log.exception("Previous history scan ended with an error during full restart")
+                # Reset the actual durable history cursor immediately on click,
+                # not later after the worker becomes idle. Indexed rows remain intact.
+                await db.reset_scan_progress_for_full_rescan(primary_channel_id)
+                await db.set_setting("history_scan_direction", "newest_first_v1")
                 await db.set_setting("backup_full_scan_started", "0")
                 await db.set_setting("backup_full_scan_required", "1")
                 await db.set_setting("backup_retry_full_restart_pending", "1")
+                log.warning(
+                    "Admin requested full backup restart: scan cursor reset to 0 for channel %s",
+                    primary_channel_id,
+                )
                 await db.set_setting("backup_retry_enabled", "1")
                 backup_retry_manual_requested = True
                 last_user_activity = asyncio.get_running_loop().time() - 31
