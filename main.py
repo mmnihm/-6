@@ -381,11 +381,10 @@ app = Client(
 SCANNER_WORKDIR = os.path.dirname(config.DATABASE_PATH) or "."
 os.makedirs(SCANNER_WORKDIR, exist_ok=True)
 SCANNER_SESSION_PATH = os.path.join(SCANNER_WORKDIR, "member_cloud_scanner.session")
-scanner = (
-    Client("member_cloud_scanner", api_id=config.API_ID,
-           api_hash=config.API_HASH, workdir=SCANNER_WORKDIR)
-    if os.path.exists(SCANNER_SESSION_PATH) else None
-)
+SCANNER_SESSION_SETTING_KEY = "scanner_session_string_v1"
+# The authoritative scanner login is stored in the database, not the
+# deployment filesystem, which may be replaced during every redeploy.
+scanner = None
 scan_task = None
 
 
@@ -2989,11 +2988,13 @@ async def scanner_login_start_handler(client, message):
             await old_client.disconnect()
         except Exception:
             pass
+    # Keep the temporary login in memory. Its authorized session is exported
+    # to the database after verification, so no local disk persistence is needed.
     login_client = Client(
-        "member_cloud_scanner",
+        "member_cloud_scanner_login",
         api_id=config.API_ID,
         api_hash=config.API_HASH,
-        workdir=SCANNER_WORKDIR,
+        in_memory=True,
     )
     try:
         await login_client.connect()
@@ -3348,12 +3349,18 @@ async def scanner_login_input_handler(client, message):
         return
 
     try:
+        session_string = await login_client.export_session_string()
+        if not session_string:
+            raise RuntimeError("Pyrogram returned an empty scanner session string")
+        # Store the credential in the private PostgreSQL settings table before
+        # dropping the temporary in-memory login client. Never log this value.
+        await db.set_setting(SCANNER_SESSION_SETTING_KEY, session_string)
         await login_client.disconnect()
         scanner = Client(
             "member_cloud_scanner",
             api_id=config.API_ID,
             api_hash=config.API_HASH,
-            workdir=SCANNER_WORKDIR,
+            session_string=session_string,
         )
         await scanner.start()
         scanner_me = await scanner.get_me()
@@ -3364,8 +3371,8 @@ async def scanner_login_input_handler(client, message):
         await message.reply_text(
             "✅ 扫描账号登录成功！\n"
             f"账号 ID：{scanner_me.id}\n"
-            "登录会话已保存在部署平台的数据目录中。\n\n"
-            "请确保平台的数据目录启用了持久化存储。现在可以发送 /scan 只扫描主存储频道。"
+            "登录会话已安全保存到机器人数据库，后续重新部署会自动恢复，不需要重复登录。\n\n"
+            "现在可以发送 /scan 只扫描主存储频道。"
         )
     except Exception:
         log.exception("Could not activate scanner after login")
@@ -3377,7 +3384,7 @@ async def scanner_login_input_handler(client, message):
         scanner_login_clients.pop(user.id, None)
         scanner_login_states.pop(user.id, None)
         await message.reply_text(
-            "⚠️ 验证通过，但扫描账号启动失败。请确认部署平台的数据目录可写并且已持久化，然后重新 /scanlogin。"
+            "⚠️ 验证通过，但扫描账号启动失败。请检查部署日志；会话已尝试保存到数据库，可重新部署后自动恢复，必要时再执行 /scanlogin。"
         )
 
 
@@ -5537,6 +5544,53 @@ async def main():
             "Database backend: %s",
             "PostgreSQL" if db.uses_postgres else "SQLite (local fallback)",
         )
+
+        # Restore the scanner from the database-backed session string. This is
+        # durable across container replacement and does not rely on /app/data.
+        stored_scanner_session = await db.get_setting(SCANNER_SESSION_SETTING_KEY)
+        if stored_scanner_session:
+            scanner = Client(
+                "member_cloud_scanner",
+                api_id=config.API_ID,
+                api_hash=config.API_HASH,
+                session_string=stored_scanner_session,
+            )
+            log.info("Persistent scanner session loaded from database")
+        elif os.path.exists(SCANNER_SESSION_PATH):
+            # One-time migration for deployments that still have the old
+            # file-based Pyrogram session available.
+            legacy_scanner = Client(
+                "member_cloud_scanner",
+                api_id=config.API_ID,
+                api_hash=config.API_HASH,
+                workdir=SCANNER_WORKDIR,
+            )
+            try:
+                await legacy_scanner.start()
+                legacy_me = await legacy_scanner.get_me()
+                if legacy_me.is_bot:
+                    raise RuntimeError("History scanner must be a normal Telegram user account")
+                migrated_session = await legacy_scanner.export_session_string()
+                await db.set_setting(SCANNER_SESSION_SETTING_KEY, migrated_session)
+                await legacy_scanner.stop()
+                scanner = Client(
+                    "member_cloud_scanner",
+                    api_id=config.API_ID,
+                    api_hash=config.API_HASH,
+                    session_string=migrated_session,
+                )
+                log.info("Legacy file-based scanner session migrated to database")
+            except Exception:
+                log.exception("Could not migrate legacy scanner session")
+                try:
+                    if legacy_scanner.is_connected:
+                        await legacy_scanner.stop()
+                except Exception:
+                    log.exception("Could not stop legacy scanner during migration")
+                scanner = None
+        else:
+            scanner = None
+            log.warning("No persistent scanner session found; admin must use /scanlogin")
 
         await app.start()
         app_started = True
