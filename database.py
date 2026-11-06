@@ -1488,6 +1488,40 @@ class Database:
         now = utc_now()
         lease_until = (now + timedelta(seconds=max(60, int(lease_seconds)))).isoformat()
         async with self.connect() as db:
+            # Older deployments may already have queued a failure before the
+            # no-requeue guard was installed. Check again at claim time so a
+            # stale job can never trigger one more Telegram forward.
+            current = await (await db.execute(
+                "SELECT album_group_id FROM files WHERE file_key=?",
+                (str(file_key),),
+            )).fetchone()
+            album_group_id = str(current["album_group_id"] or "") if current else ""
+            failed = await (await db.execute("""
+                SELECT 1
+                FROM backup_retry_failures failure
+                LEFT JOIN files failed_file ON failed_file.file_key=failure.file_key
+                WHERE failure.file_key=?
+                   OR (
+                       ?<>'' AND failed_file.album_group_id=?
+                   )
+                LIMIT 1
+            """, (str(file_key), album_group_id, album_group_id))).fetchone()
+            if failed:
+                if album_group_id:
+                    await db.execute("""
+                        DELETE FROM backup_retry_jobs
+                        WHERE file_key IN (
+                            SELECT file_key FROM files WHERE album_group_id=?
+                        )
+                    """, (album_group_id,))
+                else:
+                    await db.execute(
+                        "DELETE FROM backup_retry_jobs WHERE file_key=?",
+                        (str(file_key),),
+                    )
+                await db.commit()
+                return None
+
             result = await db.execute("""
                 UPDATE backup_retry_jobs
                 SET next_retry_at=?, updated_at=?
