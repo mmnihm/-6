@@ -1083,6 +1083,23 @@ class Database:
     ):
         now = iso_now()
         async with self.connect() as db:
+            # A prior terminal failure applies to the whole known album, not
+            # merely its representative file row. Keep that record and refuse
+            # automatic re-enqueue so the worker cannot forward it forever.
+            failed = await (await db.execute("""
+                SELECT 1
+                FROM backup_retry_failures failure
+                LEFT JOIN files failed_file ON failed_file.file_key=failure.file_key
+                JOIN files current_file ON current_file.file_key=?
+                WHERE failure.file_key=?
+                   OR (
+                       current_file.album_group_id IS NOT NULL
+                       AND failed_file.album_group_id=current_file.album_group_id
+                   )
+                LIMIT 1
+            """, (str(file_key), str(file_key)))).fetchone()
+            if failed:
+                return False
             await db.execute("""
                 INSERT INTO backup_retry_jobs(
                     file_key, primary_channel_id, primary_message_id,
@@ -1100,10 +1117,8 @@ class Database:
                 file_key, int(primary_channel_id), int(primary_message_id),
                 int(backup_channel_id), now, str(error or "")[:500], now, now,
             ))
-            await db.execute(
-                "DELETE FROM backup_retry_failures WHERE file_key=?", (str(file_key),)
-            )
             await db.commit()
+            return True
 
     async def restart_backup_retry_queue(self, backup_channel_id, full_restart=False):
         """Rebuild the complete Cangku copy queue in source-message order."""
@@ -1137,10 +1152,21 @@ class Database:
                 # forwards the complete album and later member jobs safely see
                 # their newly saved backup IDs and finish without copying again.
                 source_rows = await (await db.execute("""
-                    SELECT file_key, source_fingerprint
-                    FROM files
-                    WHERE source_fingerprint LIKE 'cangku:%'
-                    ORDER BY created_at, file_key
+                    SELECT source.file_key, source.source_fingerprint
+                    FROM files source
+                    WHERE source.source_fingerprint LIKE 'cangku:%'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM backup_retry_failures failure
+                          LEFT JOIN files failed_file
+                            ON failed_file.file_key=failure.file_key
+                          WHERE failure.file_key=source.file_key
+                             OR (
+                                 source.album_group_id IS NOT NULL
+                                 AND failed_file.album_group_id=source.album_group_id
+                             )
+                      )
+                    ORDER BY source.created_at, source.file_key
                 """)).fetchall()
 
                 now_jobs = []
@@ -1192,44 +1218,10 @@ class Database:
                         last_error='', updated_at=?
                 """, (int(backup_channel_id), now, now))
 
-            # Re-queue archived failures. During a full restart the complete
-            # source set is already queued above; this upsert simply refreshes
-            # any failed representative job without changing source ordering.
-            failures = await (await db.execute("""
-                SELECT failure.file_key, failure.source_fingerprint
-                FROM backup_retry_failures failure
-                JOIN files ON files.file_key=failure.file_key
-                WHERE COALESCE(files.backup_message_id, 0)=0
-                  AND failure.source_fingerprint LIKE 'cangku:%'
-                ORDER BY failure.failed_at, failure.file_key
-            """)).fetchall()
-            for failure in failures:
-                parts = str(failure["source_fingerprint"] or "").split(":", 2)
-                if len(parts) != 3 or parts[0] != "cangku":
-                    continue
-                try:
-                    source_chat_id = int(parts[1])
-                    source_message_id = int(parts[2])
-                except (TypeError, ValueError):
-                    continue
-                await db.execute("""
-                    INSERT INTO backup_retry_jobs(
-                        file_key, primary_channel_id, primary_message_id,
-                        backup_channel_id, attempts, next_retry_at,
-                        last_error, created_at, updated_at
-                    ) VALUES(?, ?, ?, ?, 0, ?, 'Restarted from backup manager', ?, ?)
-                    ON CONFLICT(file_key) DO UPDATE SET
-                        primary_channel_id=excluded.primary_channel_id,
-                        primary_message_id=excluded.primary_message_id,
-                        backup_channel_id=excluded.backup_channel_id,
-                        attempts=0, next_retry_at=excluded.next_retry_at,
-                        last_error='', updated_at=excluded.updated_at
-                """, (
-                    str(failure["file_key"]), source_chat_id, source_message_id,
-                    int(backup_channel_id), now, now, now,
-                ))
-                queued_failures += 1
-
+            # Archived failures are deliberately not re-queued by normal resume
+            # or full restart. A failed item remains skipped until an explicit
+            # administrative retry action is added; this prevents an endless
+            # fail -> delete job -> discover candidate -> forward loop.
             await db.commit()
         return reset_count if full_restart else queued_failures
 
@@ -1286,6 +1278,10 @@ class Database:
                   AND f.source_fingerprint LIKE 'cangku:%'
                   AND NOT EXISTS (
                       SELECT 1 FROM backup_retry_jobs j WHERE j.file_key=f.file_key
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM backup_retry_failures failed
+                      WHERE failed.file_key=f.file_key
                   )
                 ORDER BY f.created_at, f.file_key
                 LIMIT ?
@@ -1348,6 +1344,11 @@ class Database:
                              SELECT 1 FROM backup_retry_jobs jobs
                              JOIN files queued ON queued.file_key=jobs.file_key
                              WHERE queued.album_group_id=grouped.album_group_id
+                         )
+                         AND NOT EXISTS (
+                             SELECT 1 FROM backup_retry_failures failure
+                             JOIN files failed_file ON failed_file.file_key=failure.file_key
+                             WHERE failed_file.album_group_id=grouped.album_group_id
                          )
                   )
                 ORDER BY f.created_at, f.file_key
