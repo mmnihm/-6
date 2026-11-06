@@ -990,6 +990,8 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
                 tagged_groups += 1
                 assigned_files += updated
 
+        if indexed_files:
+            await db.refresh_category_stats(["未分类"])
         category_catalog_cache["expires_at"] = 0
         category_catalog_cache["rows"] = []
         categories = await db.list_categories()
