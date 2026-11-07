@@ -752,18 +752,18 @@ def parse_category(message) -> str:
 
 
 def parse_chinese_album_category(messages) -> str:
-    """Return a directory only when a complete album contains a Chinese-only hashtag."""
+    """Find a Chinese hashtag anywhere in any caption belonging to an album."""
+    import re
+
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_])#([\\u3400-\\u4dbf\\u4e00-\\u9fff]"
+        r"[\\u3400-\\u4dbf\\u4e00-\\u9fff0-9A-Za-z_-]{0,39})"
+    )
     for message in messages:
         caption = (getattr(message, "caption", None) or "").strip()
-        for token in caption.split():
-            if not token.startswith("#"):
-                continue
-            category = token[1:].strip("，,。.!！?？:：;；()（）[]【】{}")
-            if category and all(
-                "\\u3400" <= char <= "\\u4dbf" or "\\u4e00" <= char <= "\\u9fff"
-                for char in category
-            ):
-                return category[:40]
+        match = pattern.search(caption)
+        if match:
+            return match.group(1).rstrip("_-")[:40]
     return ""
 
 
@@ -935,15 +935,15 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
             if not message_id:
                 continue
 
-            existing = await db.get_file_by_backup_message_id(message_id)
+            fingerprint = f"backup:{int(chat.id)}:{message_id}"
+            existing = await db.get_file_by_backup_fingerprint(fingerprint)
+            group_id = getattr(item, "media_group_id", None)
+            album_key = (
+                f"backup:{int(chat.id)}:{group_id}" if group_id else None
+            )
             if existing:
                 skipped_existing += 1
             else:
-                group_id = getattr(item, "media_group_id", None)
-                album_key = (
-                    f"backup:{int(chat.id)}:{group_id}" if group_id else None
-                )
-                fingerprint = f"backup:{int(chat.id)}:{message_id}"
                 created_at = (
                     item.date.isoformat() if getattr(item, "date", None)
                     else datetime.now(timezone.utc).isoformat()
@@ -969,7 +969,7 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
 
             group_id = getattr(item, "media_group_id", None)
             if group_id:
-                group_key = str(group_id)
+                group_key = f"{int(chat.id)}:{group_id}"
                 group = album_groups.setdefault(
                     group_key, {"message_ids": [], "category": ""}
                 )
@@ -985,7 +985,7 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
             category = str(group["category"] or "").strip()
             if not category or not 2 <= len(message_ids) <= 10:
                 continue
-            updated = await db.assign_backup_album_category(message_ids, category)
+            updated = await db.assign_backup_album_category(int(chat.id), message_ids, category)
             if updated == len(message_ids):
                 tagged_groups += 1
                 assigned_files += updated
