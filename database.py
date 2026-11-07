@@ -610,11 +610,19 @@ class Database:
             )).fetchone()
 
     async def get_file_by_backup_message_id(self, backup_message_id: int):
-        """Find an existing catalog row already pointing at this backup-channel message."""
+        """Legacy lookup by message ID; prefer the channel-qualified fingerprint."""
         async with self.connect() as db:
             return await (await db.execute(
                 "SELECT * FROM files WHERE backup_message_id=? LIMIT 1",
                 (int(backup_message_id),),
+            )).fetchone()
+
+    async def get_file_by_backup_fingerprint(self, fingerprint: str):
+        """Find an indexed backup message using its channel-qualified identity."""
+        async with self.connect() as db:
+            return await (await db.execute(
+                "SELECT * FROM files WHERE source_fingerprint=? LIMIT 1",
+                (str(fingerprint),),
             )).fetchone()
 
     async def get_existing_fingerprints(self, fingerprints):
@@ -1646,21 +1654,22 @@ class Database:
             await db.commit()
             return cur.rowcount > 0
 
-    async def assign_backup_album_category(self, backup_message_ids, category):
-        """Assign one hashtag directory to every indexed member of a complete backup album."""
+    async def assign_backup_album_category(self, backup_chat_id, backup_message_ids, category):
+        """Assign a hashtag folder only to the complete album from this exact channel."""
         ids = list(dict.fromkeys(int(value) for value in (backup_message_ids or [])))
         category = str(category or "").strip()[:120]
         if not category or not 2 <= len(ids) <= 10:
             return 0
-        placeholders = ",".join("?" for _ in ids)
+        fingerprints = [f"backup:{int(backup_chat_id)}:{message_id}" for message_id in ids]
+        placeholders = ",".join("?" for _ in fingerprints)
         async with self.connect() as db:
             rows = await (await db.execute(
                 f"SELECT file_key, category, source_fingerprint FROM files "
-                f"WHERE backup_message_id IN ({placeholders})",
-                ids,
+                f"WHERE source_fingerprint IN ({placeholders})",
+                fingerprints,
             )).fetchall()
-            # Do not partially classify a group: every message in the album
-            # must already have a matching indexed backup record.
+            # Do not partially classify a group: every message in this album
+            # must already have a matching index row from this same channel.
             if len(rows) != len(ids):
                 return 0
             file_keys = [str(row["file_key"]) for row in rows]
@@ -1668,16 +1677,16 @@ class Database:
             old_categories = {
                 str(row["category"] or "").strip()
                 for row in rows
-                if str(row["category"] or "").strip() and str(row["category"] or "").strip() != category
+                if str(row["category"] or "").strip()
+                and str(row["category"] or "").strip() != category
             }
             await db.execute(
                 f"UPDATE files SET category=? WHERE file_key IN ({key_placeholders})",
                 [category] + file_keys,
             )
             await db.execute(
-                f"UPDATE scanner_messages SET category=? WHERE fingerprint IN "
-                f"(SELECT source_fingerprint FROM files WHERE file_key IN ({key_placeholders}))",
-                [category] + file_keys,
+                f"UPDATE scanner_messages SET category=? WHERE fingerprint IN ({key_placeholders})",
+                [category] + fingerprints,
             )
             for old_category in old_categories:
                 await self._refresh_category_stats(db, old_category, create=False)
