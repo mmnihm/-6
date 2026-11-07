@@ -741,7 +741,7 @@ def parse_category(message) -> str:
         if token.startswith("#"):
             category = token[1:].strip("，,。.!！?？:：;；()（）[]【】{}")
             if category and all(
-                "\\u3400" <= char <= "\\u4dbf" or "\\u4e00" <= char <= "\\u9fff"
+                "\u3400" <= char <= "\u4dbf" or "\u4e00" <= char <= "\u9fff"
                 for char in category
             ):
                 return category[:40]
@@ -756,8 +756,8 @@ def parse_chinese_album_category(messages) -> str:
     import re
 
     pattern = re.compile(
-        r"(?<![A-Za-z0-9_])#([\\u3400-\\u4dbf\\u4e00-\\u9fff]"
-        r"[\\u3400-\\u4dbf\\u4e00-\\u9fff0-9A-Za-z_-]{0,39})"
+        r"(?<![A-Za-z0-9_])#([\u3400-\u4dbf\u4e00-\u9fff]"
+        r"[\u3400-\u4dbf\u4e00-\u9fff0-9A-Za-z_-]{0,39})"
     )
     for message in messages:
         caption = (getattr(message, "caption", None) or "").strip()
