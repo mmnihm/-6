@@ -1638,8 +1638,11 @@ async def _flush_album_upload(client, key):
                 raise RuntimeError(f"相册第 {position + 1} 条不是支持的媒体，整组取消入库")
             if is_admin_batch:
                 fingerprint = f"upload:{message.chat.id}:{message.id}"
-                if await db.get_upload_batch_item_by_fingerprint(fingerprint):
-                    raise RuntimeError("相册中存在已暂存的重复文件，整组跳过，避免重复复制")
+                if (
+                    await db.get_upload_batch_item_by_fingerprint(fingerprint)
+                    or await db.get_file_by_fingerprint(fingerprint)
+                ):
+                    raise RuntimeError("相册中存在已处理的重复文件，整组跳过，避免重复复制")
             elif fingerprint and await db.get_file_by_fingerprint(fingerprint):
                 raise RuntimeError("相册中存在已入库的重复文件，整组取消，避免只保存部分相册")
             media_object = getattr(message, media_type, None)
@@ -2666,7 +2669,10 @@ async def _upload_single_handler(client, message):
         # match another message sent earlier in the same batch. Telegram may
         # redeliver the same update, so check the staging table before copying.
         source_fingerprint = f"upload:{message.chat.id}:{message.id}"
-        if await db.get_upload_batch_item_by_fingerprint(source_fingerprint):
+        if (
+            await db.get_upload_batch_item_by_fingerprint(source_fingerprint)
+            or await db.get_file_by_fingerprint(source_fingerprint)
+        ):
             log.info(
                 "Skipped already-staged Telegram upload: user=%s chat=%s message=%s",
                 user.id, message.chat.id, message.id,
