@@ -328,7 +328,8 @@ class Database:
                 backup_error TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 album_group_id TEXT,
-                album_position BIGINT NOT NULL DEFAULT 0
+                album_position BIGINT NOT NULL DEFAULT 0,
+                upload_dedupe_key TEXT
             );
         """
         async with self.connect() as db:
@@ -367,6 +368,12 @@ class Database:
                 await db.execute("ALTER TABLE upload_batch_items ADD COLUMN album_group_id TEXT")
             if "album_position" not in batch_column_names:
                 await db.execute("ALTER TABLE upload_batch_items ADD COLUMN album_position BIGINT NOT NULL DEFAULT 0")
+            if "upload_dedupe_key" not in batch_column_names:
+                await db.execute("ALTER TABLE upload_batch_items ADD COLUMN upload_dedupe_key TEXT")
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_upload_batch_dedupe_key "
+                "ON upload_batch_items(upload_dedupe_key) WHERE upload_dedupe_key IS NOT NULL"
+            )
             category_columns = await (await db.execute(
                 "SELECT column_name AS name FROM information_schema.columns "
                 "WHERE table_schema=current_schema() AND table_name='categories'"
@@ -660,6 +667,16 @@ class Database:
                 (int(owner_id),),
             )).fetchone()
 
+    async def get_upload_batch_item_by_fingerprint(self, fingerprint):
+        """Find an admin upload already staged from the same Telegram message."""
+        if not fingerprint:
+            return None
+        async with self.connect() as db:
+            return await (await db.execute(
+                "SELECT file_key FROM upload_batch_items WHERE upload_dedupe_key=? LIMIT 1",
+                (str(fingerprint),),
+            )).fetchone()
+
     async def count_upload_batch_items(self, owner_id):
         async with self.connect() as db:
             row = await (await db.execute(
@@ -680,8 +697,9 @@ class Database:
                     file_key, owner_id, file_name, media_type, category,
                     primary_channel_id, primary_message_id, backup_channel_id,
                     backup_message_id, source_fingerprint, file_size,
-                    backup_error, created_at, album_group_id, album_position
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    backup_error, created_at, album_group_id, album_position,
+                    upload_dedupe_key
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 key, int(owner_id), str(file_name), str(media_type), str(category),
                 int(primary_channel_id), int(primary_id), int(backup_channel_id),
@@ -689,6 +707,7 @@ class Database:
                 str(backup_error or "")[:500], iso_now(),
                 str(album_group_id) if album_group_id else None,
                 max(0, int(album_position or 0)),
+                str(source_fingerprint) if str(source_fingerprint or "").startswith("upload:") else None,
             ))
             await db.commit()
             return cur.rowcount == 1
