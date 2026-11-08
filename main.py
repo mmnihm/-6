@@ -915,7 +915,7 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
         scan_task = None
 
 async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status_message):
-    """Index media directly from the backup channel and create folders from tagged albums."""
+    """Classify already-indexed backup-channel albums without duplicating catalog rows."""
     global directory_import_running
     scanned_messages = 0
     indexed_files = 0
@@ -936,9 +936,9 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
             if not message_id:
                 continue
 
-            # This task is classification-only: never insert channel messages
-            # into the catalog. Match each backup-channel message to an existing
-            # catalog row through its already-recorded backup_message_id.
+            # This directory pass only classifies resources already saved by the
+            # normal dual-channel upload flow. New uploads are still copied to
+            # both storage channels and inserted by the upload handlers below.
             existing = await db.get_file_by_backup_message_id(message_id)
             if existing:
                 skipped_existing += 1
@@ -968,7 +968,8 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
                 tagged_groups += 1
                 assigned_files += updated
 
-        # No new catalog rows are created by this scan.
+        # This scan must not create duplicate catalog rows; normal new uploads
+        # continue to use the dual-channel upload handlers.
         category_catalog_cache["expires_at"] = 0
         category_catalog_cache["rows"] = []
         categories = await db.list_categories()
@@ -981,7 +982,8 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
             f"🏷️ 成功归类相册：{tagged_groups} 组\n"
             f"📁 归入目录资源：{assigned_files} 个\n"
             f"📂 当前目录总数：{len(categories)} 个\n\n"
-            "仅读取副储存频道并更新已有资源的目录归属；不会新增入库、复制或删除任何资源。"
+            "本次仅整理副储存频道中已入库资源的目录，不重复创建已有记录，也不复制或删除文件。\n"
+            "以后通过机器人上传的新文件，仍会按正常流程同时保存到主频道和副频道并入库。\n"
             "单条文件和无标签相册保留在未分类资源中。"
         )
         try:
@@ -995,7 +997,7 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
         error_text = (
             "❌ 副频道扫描或标签目录整理失败。\n"
             f"原因：{type(exc).__name__}: {str(exc)[:350]}\n\n"
-            "本次扫描不会新增资源入库，已有数据保持不变。"
+            "本次目录扫描不会重复创建已有资源记录；正常新上传仍会同时保存到主频道和副频道。已有数据保持不变。"
         )
         try:
             await status_message.edit_text(error_text, reply_markup=back_keyboard())
