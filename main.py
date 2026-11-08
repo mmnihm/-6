@@ -920,6 +920,7 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
     scanned_messages = 0
     indexed_files = 0
     skipped_existing = 0
+    unmatched_messages = 0
     album_groups = {}
     tagged_groups = 0
     assigned_files = 0
@@ -935,37 +936,14 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
             if not message_id:
                 continue
 
-            fingerprint = f"backup:{int(chat.id)}:{message_id}"
-            existing = await db.get_file_by_backup_fingerprint(fingerprint)
-            group_id = getattr(item, "media_group_id", None)
-            album_key = (
-                f"backup:{int(chat.id)}:{group_id}" if group_id else None
-            )
+            # This task is classification-only: never insert channel messages
+            # into the catalog. Match each backup-channel message to an existing
+            # catalog row through its already-recorded backup_message_id.
+            existing = await db.get_file_by_backup_message_id(message_id)
             if existing:
                 skipped_existing += 1
             else:
-                created_at = (
-                    item.date.isoformat() if getattr(item, "date", None)
-                    else datetime.now(timezone.utc).isoformat()
-                )
-                inserted = await db.add_file(
-                    secrets.token_urlsafe(9).replace("-", "").replace("_", ""),
-                    config.ADMIN_ID,
-                    file_name or f"{media_type}_{message_id}",
-                    media_type,
-                    0,
-                    message_id,
-                    category="未分类",
-                    source_fingerprint=fingerprint,
-                    created_at=created_at,
-                    album_group_id=album_key,
-                    album_position=message_id if album_key else 0,
-                    refresh_stats=False,
-                )
-                if inserted:
-                    indexed_files += 1
-                else:
-                    skipped_existing += 1
+                unmatched_messages += 1
 
             group_id = getattr(item, "media_group_id", None)
             if group_id:
@@ -990,21 +968,20 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
                 tagged_groups += 1
                 assigned_files += updated
 
-        if indexed_files:
-            await db.refresh_category_stats(["未分类"])
+        # No new catalog rows are created by this scan.
         category_catalog_cache["expires_at"] = 0
         category_catalog_cache["rows"] = []
         categories = await db.list_categories()
         result_text = (
             "✅ 副频道扫描及标签目录整理完成\n\n"
             f"📨 已读取频道消息：{scanned_messages} 条\n"
-            f"📦 新入库资源：{indexed_files} 个\n"
-            f"⏭️ 已存在资源：{skipped_existing} 个（未重复入库）\n"
+            f"🔗 匹配到已有资源：{skipped_existing} 个\n"
+            f"⚠️ 未匹配到数据库记录：{unmatched_messages} 条（不入库）\n"
             f"🖼️ 识别相册组：{len(album_groups)} 组\n"
             f"🏷️ 成功归类相册：{tagged_groups} 组\n"
             f"📁 归入目录资源：{assigned_files} 个\n"
             f"📂 当前目录总数：{len(categories)} 个\n\n"
-            "资源直接从副频道读取；完整相册组中带中文 #标签 的内容整组归入目录。"
+            "仅读取副储存频道并更新已有资源的目录归属；不会新增入库、复制或删除任何资源。"
             "单条文件和无标签相册保留在未分类资源中。"
         )
         try:
@@ -1018,7 +995,7 @@ async def run_backup_tag_folder_scan(client, admin_id, backup_channel_id, status
         error_text = (
             "❌ 副频道扫描或标签目录整理失败。\n"
             f"原因：{type(exc).__name__}: {str(exc)[:350]}\n\n"
-            "已完成的资源入库会保留；再次扫描会跳过已入库资源。"
+            "本次扫描不会新增资源入库，已有数据保持不变。"
         )
         try:
             await status_message.edit_text(error_text, reply_markup=back_keyboard())
