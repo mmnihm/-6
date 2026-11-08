@@ -1665,8 +1665,8 @@ class Database:
         async with self.connect() as db:
             rows = await (await db.execute(
                 f"SELECT file_key, category, source_fingerprint FROM files "
-                f"WHERE source_fingerprint IN ({placeholders})",
-                fingerprints,
+                f"WHERE backup_message_id IN ({','.join('?' for _ in ids)})",
+                ids,
             )).fetchall()
             # Do not partially classify a group: every message in this album
             # must already have a matching index row from this same channel.
@@ -1684,10 +1684,8 @@ class Database:
                 f"UPDATE files SET category=? WHERE file_key IN ({key_placeholders})",
                 [category] + file_keys,
             )
-            await db.execute(
-                f"UPDATE scanner_messages SET category=? WHERE fingerprint IN ({key_placeholders})",
-                [category] + fingerprints,
-            )
+            # The existing catalog rows are authoritative; no scanner-message
+            # rows or new file records are created during this directory pass.
             for old_category in old_categories:
                 await self._refresh_category_stats(db, old_category, create=False)
             await self._refresh_category_stats(db, category)
