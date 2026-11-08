@@ -1724,6 +1724,24 @@ class Database:
             )).fetchall()
             return [row["user_id"] for row in rows]
 
+    async def remove_users_from_broadcast_list(self, user_ids):
+        """Remove failed broadcast recipients from users only; preserve all other records."""
+        values = list(dict.fromkeys(int(user_id) for user_id in (user_ids or [])))
+        if not values:
+            return 0
+        removed = 0
+        async with self.connect() as db:
+            for start in range(0, len(values), 500):
+                batch = values[start:start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                result = await db.execute(
+                    f"DELETE FROM users WHERE user_id IN ({placeholders})",
+                    batch,
+                )
+                removed += max(0, int(getattr(result, "rowcount", 0) or 0))
+            await db.commit()
+        return removed
+
     async def list_manual_members(self, limit=30):
         async with self.connect() as db:
             return await (await db.execute("""
