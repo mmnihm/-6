@@ -5567,7 +5567,7 @@ async def broadcast_handler(client, message):
         return
     target_ids = await db.list_user_ids()
     sent = 0
-    failed = 0
+    failed_ids = []
     status = await message.reply_text(f"⏳ 开始广播，共 {len(target_ids)} 位用户…")
     for target_id in target_ids:
         try:
@@ -5579,12 +5579,22 @@ async def broadcast_handler(client, message):
                 await client.send_message(target_id, content[1])
                 sent += 1
             except Exception:
-                failed += 1
+                failed_ids.append(int(target_id))
+                log.warning("Broadcast delivery failed after FloodWait: user=%s", target_id, exc_info=True)
         except Exception:
-            failed += 1
+            failed_ids.append(int(target_id))
+            log.warning("Broadcast delivery failed: user=%s", target_id, exc_info=True)
         await asyncio.sleep(0.05)
+
+    # Remove failed recipients from the broadcast user list only.
+    # Membership, files, and other user-related records remain untouched.
+    cleaned = await db.remove_users_from_broadcast_list(failed_ids)
+    failed = len(failed_ids)
     await status.edit_text(
-        f"✅ 广播完成\n成功：{sent}\n失败：{failed}\n总数：{len(target_ids)}"
+        f"✅ 广播完成\n"
+        f"📨 发送成功：{sent}\n"
+        f"🧹 清理失败用户：{cleaned}\n"
+        f"👥 用户总数：{sent}"
     )
 
 
