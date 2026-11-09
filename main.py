@@ -282,6 +282,7 @@ def admin_keyboard():
          InlineKeyboardButton("📢 群发广播", callback_data="mc:broadcast")],
         [InlineKeyboardButton("📊 数据统计", callback_data="mc:stats"),
          InlineKeyboardButton("🔐 扫描账号", callback_data="mc:scannerlogin")],
+        [InlineKeyboardButton("🛡 内容保护与删除", callback_data="mc:contentguard")],
         [InlineKeyboardButton("🛡 管理员管理", callback_data="mc:admins"),
          InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
     ])
@@ -1154,16 +1155,24 @@ async def cache_cangku_backup(client, file_key, source_chat_id, source_message_i
         cangku_backup_in_progress.discard(file_key)
 
 
-MEMBER_DELIVERY_DELETE_SECONDS = 600
+async def get_member_delivery_settings():
+    protect = await db.get_setting("member_content_protection")
+    delete_after = await db.get_setting("member_auto_delete_seconds")
+    try:
+        delete_after = max(0, min(172800, int(delete_after))) if delete_after is not None else 600
+    except (TypeError, ValueError):
+        delete_after = 600
+    return (protect != "0", delete_after)
 
 
-def schedule_member_delivery_delete(client, chat_id, message_ids):
+async def schedule_member_delivery_delete(client, chat_id, message_ids):
     ids = [int(value) for value in message_ids if value]
-    if not ids:
+    _, delete_after = await get_member_delivery_settings()
+    if not ids or delete_after <= 0:
         return
 
     async def delete_later():
-        await asyncio.sleep(MEMBER_DELIVERY_DELETE_SECONDS)
+        await asyncio.sleep(delete_after)
         try:
             await client.delete_messages(int(chat_id), ids)
             log.info("Auto-deleted member delivery: chat=%s count=%s", chat_id, len(ids))
@@ -1214,11 +1223,12 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
     last_error = None
     for source_name, source_chat_id, source_message_id in candidates:
         try:
+            protect_content, _ = await get_member_delivery_settings()
             copied = await telegram_bot_api("copyMessage", {
                 "chat_id": int(user_id),
                 "from_chat_id": int(source_chat_id),
                 "message_id": int(source_message_id),
-                "protect_content": True,
+                "protect_content": protect_content,
             })
             copied_message_id = int(copied["message_id"])
             log.info(
@@ -1243,7 +1253,7 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
             client, file_key, cangku_source[0], cangku_source[1]
         ))
 
-    schedule_member_delivery_delete(client, user_id, [copied_message_id])
+    await schedule_member_delivery_delete(client, user_id, [copied_message_id])
     await db.record_history(user_id, file_key)
     if return_message_id:
         return True, "文件已发送。", copied_message_id
@@ -1258,14 +1268,15 @@ async def try_send_catalog_album(client, user_id, group):
     if len(source_chats) != 1:
         return False
     message_ids = [int(entry[3]) for entry in group]
+    protect_content, _ = await get_member_delivery_settings()
     copied = await telegram_bot_api("copyMessages", {
         "chat_id": int(user_id),
         "from_chat_id": source_chats.pop(),
         "message_ids": message_ids,
-        "protect_content": True,
+        "protect_content": protect_content,
     })
     if isinstance(copied, list) and len(copied) == len(group):
-        schedule_member_delivery_delete(
+        await schedule_member_delivery_delete(
             client, user_id, [item.get("message_id") for item in copied]
         )
         return copied
@@ -4802,6 +4813,41 @@ async def admin_callback_handler(client, query):
         else:
             notice = ""
         await render_backup_admin(message, notice)
+    elif action == "contentguard" or action.startswith("guard:"):
+        if action == "contentguard":
+            pass
+        else:
+            parts = action.split(":")
+            if len(parts) == 2 and parts[1] == "protect":
+                protect, _ = await get_member_delivery_settings()
+                await db.set_setting("member_content_protection", "0" if protect else "1")
+            elif len(parts) == 3 and parts[1] == "delete":
+                try:
+                    seconds = int(parts[2])
+                except ValueError:
+                    seconds = -1
+                if seconds not in (0, 60, 300, 600, 1800, 3600, 86400):
+                    await query.answer("无效的删除时间", show_alert=True)
+                    return
+                await db.set_setting("member_auto_delete_seconds", str(seconds))
+            else:
+                return
+        protect, delete_after = await get_member_delivery_settings()
+        duration_labels = {0: "关闭", 60: "1 分钟", 300: "5 分钟", 600: "10 分钟", 1800: "30 分钟", 3600: "1 小时", 86400: "24 小时"}
+        duration_label = duration_labels.get(delete_after, f"{delete_after // 60} 分钟")
+        await message.edit_text(
+            "🛡 会员资源内容保护与自动删除\\n\\n"
+            f"内容保护：{'开启' if protect else '关闭'}\\n"
+            f"自动删除：{duration_label}\\n\\n"
+            "内容保护用于限制会员转发/保存机器人发出的资源。自动删除只清理会员私聊里的机器人发送消息，不会删除主存储或备用存储频道原件。\\n\\n请选择要修改的项目：",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{'✅' if protect else '⏸'} 内容保护开关", callback_data="mc:guard:protect")],
+                [InlineKeyboardButton("1分钟", callback_data="mc:guard:delete:60"), InlineKeyboardButton("5分钟", callback_data="mc:guard:delete:300"), InlineKeyboardButton("10分钟", callback_data="mc:guard:delete:600")],
+                [InlineKeyboardButton("30分钟", callback_data="mc:guard:delete:1800"), InlineKeyboardButton("1小时", callback_data="mc:guard:delete:3600"), InlineKeyboardButton("24小时", callback_data="mc:guard:delete:86400")],
+                [InlineKeyboardButton("关闭自动删除", callback_data="mc:guard:delete:0")],
+                [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+            ]),
+        )
     elif action == "home":
         users, files, members, banned = await db.stats()
         group_id = await get_member_group_id()
