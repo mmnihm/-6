@@ -4836,10 +4836,10 @@ async def admin_callback_handler(client, query):
         duration_labels = {0: "关闭", 60: "1 分钟", 300: "5 分钟", 600: "10 分钟", 1800: "30 分钟", 3600: "1 小时", 86400: "24 小时"}
         duration_label = duration_labels.get(delete_after, f"{delete_after // 60} 分钟")
         await message.edit_text(
-            "🛡 会员资源内容保护与自动删除\\n\\n"
-            f"内容保护：{'开启' if protect else '关闭'}\\n"
-            f"自动删除：{duration_label}\\n\\n"
-            "内容保护用于限制会员转发/保存机器人发出的资源。自动删除只清理会员私聊里的机器人发送消息，不会删除主存储或备用存储频道原件。\\n\\n请选择要修改的项目：",
+            "🛡 会员资源内容保护与自动删除\n\n"
+            f"内容保护：{'开启' if protect else '关闭'}\n"
+            f"自动删除：{duration_label}\n\n"
+            "内容保护用于限制会员转发/保存机器人发出的资源。自动删除只清理会员私聊里的机器人发送消息，不会删除主存储或备用存储频道原件。\n\n请选择要修改的项目：",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(f"{'✅' if protect else '⏸'} 内容保护开关", callback_data="mc:guard:protect")],
                 [InlineKeyboardButton("1分钟", callback_data="mc:guard:delete:60"), InlineKeyboardButton("5分钟", callback_data="mc:guard:delete:300"), InlineKeyboardButton("10分钟", callback_data="mc:guard:delete:600")],
