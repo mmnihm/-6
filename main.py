@@ -1154,6 +1154,25 @@ async def cache_cangku_backup(client, file_key, source_chat_id, source_message_i
         cangku_backup_in_progress.discard(file_key)
 
 
+MEMBER_DELIVERY_DELETE_SECONDS = 600
+
+
+def schedule_member_delivery_delete(client, chat_id, message_ids):
+    ids = [int(value) for value in message_ids if value]
+    if not ids:
+        return
+
+    async def delete_later():
+        await asyncio.sleep(MEMBER_DELIVERY_DELETE_SECONDS)
+        try:
+            await client.delete_messages(int(chat_id), ids)
+            log.info("Auto-deleted member delivery: chat=%s count=%s", chat_id, len(ids))
+        except Exception:
+            log.exception("Could not auto-delete member delivery: chat=%s ids=%s", chat_id, ids)
+
+    asyncio.create_task(delete_later())
+
+
 async def send_catalog_file(client, user_id, file_key, return_message_id=False):
     record = await db.get_file(file_key)
     if not record:
@@ -1199,6 +1218,7 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
                 "chat_id": int(user_id),
                 "from_chat_id": int(source_chat_id),
                 "message_id": int(source_message_id),
+                "protect_content": True,
             })
             copied_message_id = int(copied["message_id"])
             log.info(
@@ -1223,6 +1243,7 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
             client, file_key, cangku_source[0], cangku_source[1]
         ))
 
+    schedule_member_delivery_delete(client, user_id, [copied_message_id])
     await db.record_history(user_id, file_key)
     if return_message_id:
         return True, "文件已发送。", copied_message_id
@@ -1241,8 +1262,14 @@ async def try_send_catalog_album(client, user_id, group):
         "chat_id": int(user_id),
         "from_chat_id": source_chats.pop(),
         "message_ids": message_ids,
+        "protect_content": True,
     })
-    return copied if isinstance(copied, list) and len(copied) == len(group) else False
+    if isinstance(copied, list) and len(copied) == len(group):
+        schedule_member_delivery_delete(
+            client, user_id, [item.get("message_id") for item in copied]
+        )
+        return copied
+    return False
 
 
 async def send_catalog_batch(client, user_id, share_key, offset, batch, track_progress=True):
