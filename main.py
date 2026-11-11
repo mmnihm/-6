@@ -1247,12 +1247,6 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
         reason = f"主存储及备用来源均无法取回文件：{str(last_error)[:180]}"
         return (False, reason, None) if return_message_id else (False, reason)
 
-    if cangku_source and source_name == "original" and file_key not in cangku_backup_in_progress:
-        cangku_backup_in_progress.add(file_key)
-        asyncio.create_task(cache_cangku_backup(
-            client, file_key, cangku_source[0], cangku_source[1]
-        ))
-
     await schedule_member_delivery_delete(client, user_id, [copied_message_id])
     await db.record_history(user_id, file_key)
     if return_message_id:
