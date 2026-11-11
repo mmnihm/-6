@@ -430,7 +430,7 @@ async def is_admin(user_id: int) -> bool:
         return False
 
 
-async def get_membership_tier(user_id: int):
+async def get_membership_tier(user_id: int, force_refresh: bool = False):
     if await is_superadmin(user_id):
         return "超级管理员"
     if await is_admin(user_id):
@@ -448,7 +448,7 @@ async def get_membership_tier(user_id: int):
         return "手动会员"
 
     now = asyncio.get_running_loop().time()
-    cached = membership_cache.get(int(user_id))
+    cached = None if force_refresh else membership_cache.get(int(user_id))
     if cached and cached[0] > now:
         return cached[1]
     if cached:
@@ -507,8 +507,8 @@ async def get_membership_tier(user_id: int):
         return None
 
 
-async def has_access(user_id: int) -> bool:
-    return await get_membership_tier(user_id) is not None
+async def has_access(user_id: int, force_refresh: bool = False) -> bool:
+    return await get_membership_tier(user_id, force_refresh=force_refresh) is not None
 
 
 def media_details(message):
@@ -1509,9 +1509,6 @@ async def start_handler(client, message):
             )
             return
         if payload.startswith("folder_"):
-            if not await has_access(user.id):
-                await message.reply_text("⛔ 仅限会员群成员使用。请先加入会员群后重试。")
-                return
             category_row = await db.get_category_by_share_key(payload[7:])
             if not category_row:
                 await message.reply_text("⚠️ 这个文件夹分享链接已失效或不存在。")
@@ -1538,17 +1535,14 @@ async def start_handler(client, message):
             )
             return
         if payload.startswith("file_"):
-            if not await has_access(user.id):
-                await message.reply_text("⛔ 仅限会员群成员使用。请先加入会员群后重试。")
+            if not await has_access(user.id, force_refresh=True):
+                await message.reply_text("⛔ 获取资源失败：请先加入管理员指定的会员群，再重新点击获取资源。")
                 return
             ok, result = await send_catalog_file(client, user.id, payload[5:])
             if not ok:
                 await message.reply_text(f"❌ {result}")
             return
 
-        if not await has_access(user.id):
-            await message.reply_text("⛔ 本机器人仅对会员开放。请先加入会员群。")
-            return
         await message.reply_text(
             await user_home_text(user.id),
             reply_markup=await user_home_keyboard(),
@@ -3946,22 +3940,16 @@ async def user_catalog_callback_handler(client, query):
     action = query.data.split(":")
     message = query.message
     if not user or not message:
-        await query.answer("仅限会员群成员使用", show_alert=True)
+        await query.answer("无法识别用户或消息，请重新打开机器人。", show_alert=True)
         return
 
-    opening_folder = action[1] in ("folder", "folderresume", "folderstats", "getfolder")
-    if opening_folder:
-        # Acknowledge immediately so slow database or Telegram delivery work
-        # never leaves the callback spinner running.
-        await query.answer(
-            "📥 正在准备本批资源…" if action[1] == "getfolder" else "📂 正在打开目录…"
-        )
-        if not await has_access(user.id):
-            await message.edit_text("⛔ 仅限会员群成员使用。")
+    if action[1] == "getfolder":
+        await query.answer("📥 正在检查会员群资格并准备资源…")
+        if not await has_access(user.id, force_refresh=True):
+            await message.reply_text("⛔ 获取资源失败：请先加入管理员指定的会员群，再重新点击获取资源。")
             return
-    elif not await has_access(user.id):
-        await query.answer("仅限会员群成员使用", show_alert=True)
-        return
+    else:
+        await query.answer()
 
     if action[1] == "home":
         await query.answer()
@@ -4031,8 +4019,8 @@ async def user_catalog_callback_handler(client, query):
         # must not leave the user's callback spinner hanging.
         await query.answer("🎲 正在随机选择资源（相册整组发送）")
         try:
-            if not await has_access(user.id):
-                await message.reply_text("⛔ 仅限会员群成员使用。")
+            if not await has_access(user.id, force_refresh=True):
+                await message.reply_text("⛔ 获取资源失败：请先加入管理员指定的会员群，再重新点击获取资源。")
                 return
             _, _, total = await db.public_catalog(limit=1)
             if not total:
@@ -4591,6 +4579,9 @@ async def user_catalog_callback_handler(client, query):
             category_delivery_in_progress.discard(delivery_key)
 
     if action[1] == "open" and len(action) == 3:
+        if not await has_access(user.id, force_refresh=True):
+            await query.answer("⛔ 请先加入管理员指定的会员群，再获取资源。", show_alert=True)
+            return
         ok, result = await send_catalog_file(client, user.id, action[2])
         await query.answer(result if ok else result, show_alert=not ok)
         return
