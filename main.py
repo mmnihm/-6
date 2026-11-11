@@ -3904,8 +3904,7 @@ async def build_favorites_view(user_id):
 @app.on_message(filters.private & filters.command("search"))
 async def catalog_search_handler(client, message):
     user = message.from_user
-    if not user or not await has_access(user.id):
-        await message.reply_text("⛔ 仅限会员群成员使用。")
+    if not user:
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -3948,8 +3947,6 @@ async def user_catalog_callback_handler(client, query):
         if not await has_access(user.id, force_refresh=True):
             await message.reply_text("⛔ 获取资源失败：请先加入管理员指定的会员群，再重新点击获取资源。")
             return
-    else:
-        await query.answer()
 
     if action[1] == "home":
         await query.answer()
