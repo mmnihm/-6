@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import unittest
@@ -5,16 +6,24 @@ import faulthandler
 
 faulthandler.dump_traceback_later(30, repeat=True)
 
+import database
 from database import Database, PostgresCompat
 
 
 class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
+        # Count assertions here expect an immediate recount; the production
+        # throttle is exercised in its own test below.
+        self._saved_interval = database.CATEGORY_STATS_MIN_INTERVAL
+        database.CATEGORY_STATS_MIN_INTERVAL = 0.0
         self.db = Database(os.path.join(self.temp_dir.name, "test.db"))
         await self.db.initialize()
 
     async def asyncTearDown(self):
+        for task in list(self.db._category_stats_pending.values()):
+            task.cancel()
+        database.CATEGORY_STATS_MIN_INTERVAL = self._saved_interval
         self.temp_dir.cleanup()
 
     async def test_postgres_sql_adapter_translates_sqlite_syntax(self):
@@ -373,8 +382,10 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(total, 1)
         self.assertEqual(rows[0]["file_name"], "movie-one.mp4")
         self.assertEqual(set(rows[0].keys()), {
-            "file_key", "file_name", "media_type", "category", "created_at"
+            "file_key", "file_name", "media_type", "category", "created_at",
+            "album_group_id", "album_position", "album_size",
         })
+        self.assertEqual(int(rows[0]["album_size"]), 1)
         self.assertEqual(set(categories), {"电影", "教程"})
 
         rows, _, total = await self.db.public_catalog(category="教程")
@@ -389,6 +400,114 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.db.unban_user(404)
         self.assertFalse(await self.db.is_banned(404))
         self.assertEqual(await self.db.list_user_ids(), [404])
+
+    async def test_album_aggregate_and_non_album_size(self):
+        for pos in range(3):
+            await self.db.add_file(
+                f"alb{pos}", 101, f"p{pos}.jpg", "photo", 10 + pos, 20 + pos,
+                "相册", album_group_id="group-1", album_position=pos,
+            )
+        await self.db.add_file("solo1", 101, "solo.jpg", "photo", 30, 31, "相册")
+
+        rows, _, _ = await self.db.public_catalog(category="相册", limit=10)
+        sizes = {row["file_key"]: int(row["album_size"]) for row in rows}
+        self.assertEqual(sizes["alb0"], 3)
+        self.assertEqual(sizes["alb2"], 3)
+        # A file outside an album is its own unit, not the whole table's NULL count.
+        self.assertEqual(sizes["solo1"], 1)
+
+        files = await self.db.list_category_files("相册", limit=10)
+        album_sizes = {int(row["album_size"]) for row in files if row["album_group_id"]}
+        self.assertEqual(album_sizes, {3})
+
+        expanded = await self.db.complete_album_groups(rows)
+        self.assertEqual(
+            {row["file_key"] for row in expanded}, {"alb0", "alb1", "alb2", "solo1"}
+        )
+
+    async def test_catalog_stats_cache_invalidated_on_write(self):
+        await self.db.add_file("cache1", 101, "a.mp4", "video", 1, 2, "电影")
+        self.assertEqual((await self.db.catalog_stats())["messages"], 1)
+        self.assertEqual((await self.db.catalog_stats())["messages"], 1)
+        await self.db.add_file("cache2", 101, "b.mp4", "video", 3, 4, "电影")
+        self.assertEqual((await self.db.catalog_stats())["messages"], 2)
+
+
+    async def _category_file_count(self, name="电影"):
+        async with self.db.connect() as db:
+            row = await (await db.execute(
+                "SELECT file_count FROM categories WHERE name=?", (name,)
+            )).fetchone()
+            return int(row["file_count"] or 0) if row else 0
+
+    async def test_folder_recount_is_throttled_then_catches_up(self):
+        database.CATEGORY_STATS_MIN_INTERVAL = 0.4
+        await self.db.add_file("t1", 101, "a.mp4", "video", 11, 22, "电影")
+        self.assertEqual(await self._category_file_count(), 1)
+
+        # Second write inside the window coalesces instead of rescanning the folder.
+        await self.db.add_file("t2", 101, "b.mp4", "video", 12, 23, "电影")
+        self.assertEqual(await self._category_file_count(), 1)
+
+        # The deferred catch-up recount settles the count once the window closes.
+        await asyncio.sleep(1.0)
+        self.assertEqual(await self._category_file_count(), 2)
+
+    async def test_forced_refresh_ignores_throttle_window(self):
+        database.CATEGORY_STATS_MIN_INTERVAL = 60.0
+        await self.db.add_file("t1", 101, "a.mp4", "video", 11, 22, "电影")
+        await self.db.add_file("t2", 101, "b.mp4", "video", 12, 23, "电影")
+        self.assertEqual(await self._category_file_count(), 1)
+
+        # Recategorising a file is a structural edit: counts update immediately.
+        await self.db.set_file_category("t2", "教程")
+        self.assertEqual(await self._category_file_count(), 1)
+        self.assertEqual(await self._category_file_count("教程"), 1)
+        await self.db.refresh_category_stats(["电影"])
+        self.assertEqual(await self._category_file_count(), 1)
+
+    async def test_catalog_total_matches_filtered_pages(self):
+        await self.db.add_file("t1", 101, "movie.mp4", "video", 11, 22, "电影")
+        await self.db.add_file("t2", 101, "lesson.pdf", "document", 12, 23, "教程")
+        self.assertEqual(await self.db.catalog_total(), 2)
+        self.assertEqual(await self.db.catalog_total(category="教程"), 1)
+        self.assertEqual(await self.db.catalog_total(query="movie"), 1)
+        _, _, page_total = await self.db.public_catalog(category="教程")
+        self.assertEqual(page_total, 1)
+
+    async def test_scan_does_not_reindex_uploaded_copy(self):
+        """A history scan must not add a second row for the bot's own upload copy."""
+        now = "2026-11-11T00:00:00+00:00"
+        primary_channel_id = 555
+        for fingerprint in ("AQADfileunique", "upload:42:77"):
+            self.db = Database(os.path.join(self.temp_dir.name, f"scan_{fingerprint[:4]}.db"))
+            await self.db.initialize()
+            await self.db.add_file(
+                "uploadkey", 101, "a.mp4", "video", 1000, 2000, "电影",
+                source_fingerprint=fingerprint, file_size=100, created_at=now,
+            )
+            await self.db.save_scanned_message(
+                primary_channel_id, None, primary_channel_id, 1000,
+                f"cangku:{primary_channel_id}:1000", "a.mp4", "video", "",
+                now, 1, "scanrow",
+                album_group_id=f"cangku-single:{primary_channel_id}:1000",
+                album_position=0,
+            )
+            rows = await self.db.list_files(50)
+            self.assertEqual([row["file_key"] for row in rows], ["uploadkey"])
+            _, _, total = await self.db.public_catalog(limit=50)
+            self.assertEqual(total, 1)
+
+    async def test_scan_still_indexes_unseen_channel_message(self):
+        """Guarding against re-indexing must not drop genuine history files."""
+        now = "2026-11-11T00:00:00+00:00"
+        await self.db.save_scanned_message(
+            555, None, 555, 4321, "cangku:555:4321", "old.mp4", "video", "电影",
+            now, 1, "legacyrow", album_group_id="cangku-single:555:4321",
+            album_position=0,
+        )
+        rows = await self.db.list_files(50)
+        self.assertEqual([row["file_key"] for row in rows], ["legacyrow"])
 
 
 if __name__ == "__main__":

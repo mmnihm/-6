@@ -4019,7 +4019,7 @@ async def user_catalog_callback_handler(client, query):
             if not await has_access(user.id, force_refresh=True):
                 await message.reply_text("⛔ 获取资源失败：请先加入管理员指定的会员群，再重新点击获取资源。")
                 return
-            _, _, total = await db.public_catalog(limit=1)
+            total = await db.catalog_total()
             if not total:
                 await message.reply_text("📭 资源库暂时没有可随机发送的文件。")
                 return

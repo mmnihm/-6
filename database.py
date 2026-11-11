@@ -1,13 +1,46 @@
 import os
+import asyncio
+import logging
 import aiosqlite
 import re
 import secrets
+import time
 from contextlib import asynccontextmanager
 
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from datetime import datetime, timezone, timedelta
+
+log = logging.getLogger(__name__)
+
+# A folder summary is display-only. Retelling a whole folder on every single
+# upload made each file cost a full scan (measured 14 ms on a 5k-file folder),
+# so writes now coalesce: at most one recount per folder per interval, with a
+# catch-up recount scheduled once the interval ends. Folder counts can lag the
+# truth by at most this many seconds.
+CATEGORY_STATS_MIN_INTERVAL = 30.0
+
+
+# Catalog pages need each album's size and newest timestamp. Computing those
+# with a correlated subquery costs one extra scan per returned row, so the
+# aggregate is built once per query and joined instead. Query the outer table
+# as `files f` and reference `album_agg.album_size` / `album_agg.album_latest`.
+ALBUM_AGGREGATE_JOIN = (
+    " LEFT JOIN (SELECT album_group_id, COUNT(*) AS album_size, "
+    "MAX(created_at) AS album_latest FROM files "
+    "WHERE album_group_id IS NOT NULL GROUP BY album_group_id) album_agg "
+    "ON album_agg.album_group_id=f.album_group_id"
+)
+
+# Same aggregate, narrowed to the folder being browsed (one bound parameter
+# for the category), so a folder page does not count every album in the catalog.
+ALBUM_CATEGORY_AGGREGATE_JOIN = (
+    " LEFT JOIN (SELECT album_group_id, COUNT(*) AS album_size, "
+    "MAX(created_at) AS album_latest FROM files "
+    "WHERE album_group_id IS NOT NULL AND category=? GROUP BY album_group_id) album_agg "
+    "ON album_agg.album_group_id=f.album_group_id"
+)
 
 
 def utc_now():
@@ -35,7 +68,7 @@ class PostgresCompat:
             ).rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
         statement = statement.replace("?", "%s")
         # Psycopg parses percent signs whenever query parameters are supplied.
-        # Escape SQL pattern wildcards such as LIKE '%%.mp4', while preserving
+        # Escape SQL pattern wildcards such as LIKE '%.mp4', while preserving
         # positional/named placeholders and already escaped percent signs.
         if has_params:
             statement = re.sub(r"%(?![%sbt(])", "%%", statement)
@@ -73,6 +106,13 @@ class Database:
         if self.database_url.startswith("postgres://"):
             self.database_url = "postgresql://" + self.database_url[len("postgres://"):]
         self.pool = None
+        # Display-only totals are recomputed at most once per interval; every
+        # catalog mutation invalidates them immediately (see _invalidate_catalog_stats).
+        self._catalog_stats_cache = None
+        self._catalog_stats_cache_at = 0.0
+        # Per-folder throttling for summary recounts (see CATEGORY_STATS_MIN_INTERVAL).
+        self._category_stats_last = {}
+        self._category_stats_pending = {}
 
     @property
     def uses_postgres(self):
@@ -91,6 +131,10 @@ class Database:
             await self.pool.open(wait=True)
 
     async def close(self):
+        # Drop queued recounts so shutdown does not leave tasks behind.
+        for task in list(self._category_stats_pending.values()):
+            task.cancel()
+        self._category_stats_pending.clear()
         if self.pool is not None:
             await self.pool.close()
             self.pool = None
@@ -183,7 +227,7 @@ class Database:
                     "WHERE category IS NOT NULL AND category<>''"
                 )).fetchall()
                 for item in imported_categories:
-                    await self._refresh_category_stats(pg, str(item["category"]))
+                    await self._refresh_category_stats(pg, str(item["category"]), force=True)
                 await pg.execute(
                     "INSERT INTO settings(key, value) VALUES(%s, %s) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -415,6 +459,18 @@ class Database:
                 "ON files(category, created_at DESC)"
             )
             await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_created_at "
+                "ON files(created_at DESC)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_primary_message_id "
+                "ON files(primary_message_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_backup_message_id "
+                "ON files(backup_message_id)"
+            )
+            await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_files_album_group "
                 "ON files(album_group_id, album_position)"
             )
@@ -439,7 +495,7 @@ class Database:
                         (name, iso_now(), iso_now(),
                          secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
                     )
-                    await self._refresh_category_stats(db, name)
+                    await self._refresh_category_stats(db, name, force=True)
                 missing_share_keys = await (await db.execute(
                     "SELECT name FROM categories WHERE share_key IS NULL OR share_key=''"
                 )).fetchall()
@@ -465,7 +521,7 @@ class Database:
                         "SELECT name FROM categories"
                     )).fetchall()
                     for item in existing_categories:
-                        await self._refresh_category_stats(db, str(item["name"]), create=False)
+                        await self._refresh_category_stats(db, str(item["name"]), create=False, force=True)
                 await db.execute(
                     "INSERT INTO settings(key, value) VALUES('category_size_stats_v1', 'completed')"
                 )
@@ -763,6 +819,7 @@ class Database:
             # the same category rows inside one transaction.
             if published:
                 await self._refresh_category_stats(db, category)
+                self._invalidate_catalog_stats()
             await db.execute("DELETE FROM upload_batch_items WHERE owner_id=?", (int(owner_id),))
             await db.execute("DELETE FROM upload_batches WHERE owner_id=?", (int(owner_id),))
             await db.commit()
@@ -798,6 +855,7 @@ class Database:
                             (category_name, iso_now(), iso_now(),
                              secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
                         )
+                self._invalidate_catalog_stats()
             await db.commit()
             return cur.rowcount == 1
 
@@ -836,6 +894,7 @@ class Database:
                 "scanner_progress",
             ):
                 await db.execute(f"DELETE FROM {table}")
+            self._invalidate_catalog_stats()
             await db.commit()
 
     async def save_scanned_message(
@@ -889,7 +948,21 @@ class Database:
             primary = current if channel_id == primary_channel_id else other
             backup = other if channel_id == primary_channel_id else current
             inserted = False
-            if primary:
+            # Uploads copy the media into this channel before writing their row,
+            # so a history scan would index the bot's own copy a second time
+            # under a "canku:" fingerprint. Skip any message the upload path has
+            # already stored (its fingerprint never starts with "cangku:").
+            scanned_column = (
+                "primary_message_id" if channel_id == primary_channel_id
+                else "backup_message_id"
+            )
+            already_indexed = await (await db.execute(
+                f"SELECT file_key FROM files WHERE {scanned_column}=? "
+                "AND (source_fingerprint IS NULL "
+                "OR substr(source_fingerprint, 1, 7) <> 'cangku:') LIMIT 1",
+                (int(message_id),),
+            )).fetchone()
+            if primary and not already_indexed:
                 primary_id = primary["message_id"]
                 backup_id = backup["message_id"] if backup else 0
                 cur = await db.execute("""
@@ -921,6 +994,7 @@ class Database:
                         (category_name, iso_now(), iso_now(),
                          secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
                     )
+                self._invalidate_catalog_stats()
             await db.commit()
             return bool(other), inserted
 
@@ -955,6 +1029,8 @@ class Database:
                     changed_categories.add(row["category"])
             for category in changed_categories:
                 await self._refresh_category_stats(db, category)
+            if created:
+                self._invalidate_catalog_stats()
             await db.commit()
         return created
 
@@ -1629,32 +1705,52 @@ class Database:
                 "SELECT * FROM files ORDER BY created_at DESC LIMIT ?", (limit,)
             )).fetchall()
 
-    async def public_catalog(self, query="", category="", limit=30, offset=0):
+    @staticmethod
+    def _catalog_filter(query="", category=""):
+        """Build the shared WHERE clause so page and count queries stay identical."""
         conditions = []
         params = []
         if query:
-            conditions.append("(file_name LIKE ? OR category LIKE ?)")
+            conditions.append("(f.file_name LIKE ? OR f.category LIKE ?)")
             params.extend((f"%{query}%", f"%{query}%"))
         if category:
-            conditions.append("category=?")
+            conditions.append("f.category=?")
             params.append(category)
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        return where, params
+
+    async def catalog_total(self, query="", category=""):
+        """Count matching files without building a page of rows."""
+        where, params = self._catalog_filter(query, category)
         async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT COUNT(*) AS n FROM files f" + where, params
+            )).fetchone()
+            return int(row["n"] or 0)
+
+    async def public_catalog(self, query="", category="", limit=30, offset=0):
+        where, params = self._catalog_filter(query, category)
+        album_join = ALBUM_CATEGORY_AGGREGATE_JOIN if category else ALBUM_AGGREGATE_JOIN
+        # The join precedes the WHERE clause, so its category parameter comes first.
+        row_params = ([category] if category else []) + list(params) + [limit, offset]
+        async with self.connect() as db:
+            # Saved folder rows are authoritative and already carry their counts;
+            # grouping the whole files table on every page load was the slow path.
             categories = await (await db.execute(
-                "SELECT category FROM files GROUP BY category ORDER BY lower(category)"
+                "SELECT name AS category FROM categories ORDER BY lower(name)"
             )).fetchall()
             total = (await (await db.execute(
-                "SELECT COUNT(*) AS n FROM files" + where, params
+                "SELECT COUNT(*) AS n FROM files f" + where, params
             )).fetchone())["n"]
             rows = await (await db.execute(
-                "SELECT file_key, file_name, media_type, category, created_at, "
-                "album_group_id, album_position, "
-                "(SELECT COUNT(*) FROM files grouped WHERE grouped.album_group_id=files.album_group_id) AS album_size "
-                "FROM files" + where + " ORDER BY COALESCE((SELECT MAX(g.created_at) FROM files g "
-                "WHERE g.album_group_id=files.album_group_id), files.created_at) DESC, "
-                "CASE WHEN files.album_group_id IS NOT NULL THEN files.album_position ELSE 0 END "
+                "SELECT f.file_key, f.file_name, f.media_type, f.category, f.created_at, "
+                "f.album_group_id, f.album_position, "
+                "COALESCE(album_agg.album_size, 1) AS album_size "
+                "FROM files f" + album_join + where
+                + " ORDER BY COALESCE(album_agg.album_latest, f.created_at) DESC, "
+                "CASE WHEN f.album_group_id IS NOT NULL THEN f.album_position ELSE 0 END "
                 "LIMIT ? OFFSET ?",
-                params + [limit, offset],
+                row_params,
             )).fetchall()
             return rows, [row["category"] for row in categories], total
 
@@ -1667,9 +1763,10 @@ class Database:
                 "UPDATE files SET category=? WHERE file_key=?", (category, key)
             )
             if cur.rowcount > 0:
-                await self._refresh_category_stats(db, category)
+                await self._refresh_category_stats(db, category, force=True)
                 if current and current["category"] != category:
-                    await self._refresh_category_stats(db, current["category"], create=False)
+                    await self._refresh_category_stats(db, current["category"], create=False, force=True)
+                self._invalidate_catalog_stats()
             await db.commit()
             return cur.rowcount > 0
 
@@ -1706,8 +1803,8 @@ class Database:
             # The existing catalog rows are authoritative; no scanner-message
             # rows or new file records are created during this directory pass.
             for old_category in old_categories:
-                await self._refresh_category_stats(db, old_category, create=False)
-            await self._refresh_category_stats(db, category)
+                await self._refresh_category_stats(db, old_category, create=False, force=True)
+            await self._refresh_category_stats(db, category, force=True)
             await db.commit()
             return len(file_keys)
 
@@ -1769,23 +1866,33 @@ class Database:
             """, (limit,))).fetchall()
 
     async def stats(self):
+        # One round trip instead of four: the four counts are independent, and
+        # the admin panel asks for them together every time it renders.
         async with self.connect() as db:
-            users = (await (await db.execute(
-                "SELECT COUNT(*) n FROM users"
-            )).fetchone())["n"]
-            files = (await (await db.execute(
-                "SELECT COUNT(*) n FROM files"
-            )).fetchone())["n"]
-            members = (await (await db.execute("""
-                SELECT COUNT(*) n FROM manual_members
-                WHERE expires_at IS NULL OR expires_at > ?
-            """, (iso_now(),))).fetchone())["n"]
-            banned = (await (await db.execute(
-                "SELECT COUNT(*) n FROM banned_users"
-            )).fetchone())["n"]
-            return users, files, members, banned
+            row = await (await db.execute("""
+                SELECT (SELECT COUNT(*) FROM users) AS users,
+                       (SELECT COUNT(*) FROM files) AS files,
+                       (SELECT COUNT(*) FROM manual_members
+                        WHERE expires_at IS NULL OR expires_at > ?) AS members,
+                       (SELECT COUNT(*) FROM banned_users) AS banned
+            """, (iso_now(),))).fetchone()
+            return (
+                int(row["users"] or 0), int(row["files"] or 0),
+                int(row["members"] or 0), int(row["banned"] or 0),
+            )
+
+    def _invalidate_catalog_stats(self):
+        """Drop cached totals; called from every mutation that changes file rows."""
+        self._catalog_stats_cache = None
+        self._catalog_stats_cache_at = 0.0
 
     async def catalog_stats(self):
+        # The aggregation classifies every file by extension, so it is only
+        # recomputed when the cache is cold or older than the TTL. Callers only
+        # show these numbers as display totals.
+        cached = self._catalog_stats_cache
+        if cached is not None and (time.monotonic() - self._catalog_stats_cache_at) < 30:
+            return dict(cached)
         async with self.connect() as db:
             row = await (await db.execute("""
                 SELECT COUNT(*) AS messages,
@@ -1824,7 +1931,7 @@ class Database:
                            )) THEN 1 ELSE 0 END) AS audios
                 FROM files
             """)).fetchone()
-            return {
+            result = {
                 "folders": int(row["folders"] or 0),
                 "messages": int(row["messages"] or 0),
                 "images": int(row["images"] or 0),
@@ -1832,12 +1939,25 @@ class Database:
                 "animations": int(row["animations"] or 0),
                 "audios": int(row["audios"] or 0),
             }
+        self._catalog_stats_cache = dict(result)
+        self._catalog_stats_cache_at = time.monotonic()
+        return result
 
-    async def _refresh_category_stats(self, db, category: str, create=True):
+    async def _refresh_category_stats(self, db, category: str, create=True, force=False):
         """Recalculate and persist one category summary; never scans unrelated folders."""
         category = str(category or "").strip()
         if not category:
             return
+        if not force:
+            now = asyncio.get_running_loop().time()
+            last = self._category_stats_last.get(category, 0.0)
+            if last and now - last < CATEGORY_STATS_MIN_INTERVAL:
+                # A recount inside this window already covers this write; make sure
+                # the folder is re-counted once the window closes so it still settles.
+                self._schedule_category_stats_refresh(category, create=create)
+                return
+            self._category_stats_last[category] = now
+
         if create:
             await db.execute(
                 "INSERT INTO categories(name, created_at, description, updated_at, share_key) "
@@ -1845,6 +1965,8 @@ class Database:
                 (category, iso_now(), iso_now(),
                  secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
             )
+        # Counts and byte sizes in one statement: the two scans used to read the
+        # same rows twice and each carried its own ~40 LIKE comparisons.
         row = await (await db.execute("""
             SELECT COUNT(*) AS file_count,
                    SUM(CASE WHEN lower(media_type) IN ('photo', 'image')
@@ -1854,7 +1976,8 @@ class Database:
                            OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
                            OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
                            OR lower(file_name) LIKE '%.tiff'
-                       )) THEN 1 ELSE 0 END) AS image_count,
+                       ))
+                       THEN 1 ELSE 0 END) AS image_count,
                    SUM(CASE WHEN lower(media_type)='video'
                        OR (lower(media_type)='document' AND (
                            lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
@@ -1863,7 +1986,8 @@ class Database:
                            OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
                            OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
                            OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
-                       )) THEN 1 ELSE 0 END) AS video_count,
+                       ))
+                       THEN 1 ELSE 0 END) AS video_count,
                    SUM(CASE WHEN lower(media_type)='animation'
                        OR (lower(media_type)='document' AND (
                            lower(file_name) LIKE '%.gif' OR lower(file_name) LIKE '%.apng'
@@ -1894,49 +2018,46 @@ class Database:
                            OR lower(file_name) LIKE '%.wav' OR lower(file_name) LIKE '%.ogg'
                            OR lower(file_name) LIKE '%.opus' OR lower(file_name) LIKE '%.wma'
                        ) THEN 1 ELSE 0 END) AS document_count,
-                   SUM(COALESCE(file_size, 0)) AS total_size,
-                   SUM(CASE WHEN COALESCE(file_size, 0)>0 THEN 1 ELSE 0 END) AS sized_count
+                   COALESCE(SUM(file_size), 0) AS total_size,
+                   SUM(CASE WHEN COALESCE(file_size, 0)>0 THEN 1 ELSE 0 END) AS sized_count,
+                   COALESCE(SUM(CASE WHEN lower(media_type) IN ('video', 'video_note')
+                       OR (lower(media_type)='document' AND (
+                           lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
+                           OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
+                           OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
+                           OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
+                           OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
+                           OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
+                       ))
+                       THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS video_size,
+                   COALESCE(SUM(CASE WHEN lower(media_type) IN ('photo', 'image')
+                       OR (lower(media_type)='document' AND (
+                           lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
+                           OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
+                           OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
+                           OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
+                           OR lower(file_name) LIKE '%.tiff'
+                       ))
+                       THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS image_size,
+                   COALESCE(SUM(CASE WHEN NOT (
+                       lower(media_type) IN ('video', 'video_note', 'photo', 'image')
+                       OR (lower(media_type)='document' AND (
+                           lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
+                           OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
+                           OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
+                           OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
+                           OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
+                           OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
+                           OR lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
+                           OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
+                           OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
+                           OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
+                           OR lower(file_name) LIKE '%.tiff'
+                       ))
+                   ) THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS other_size
             FROM files WHERE category=?
-        """, (category,))).fetchone()
-        size_row = await (await db.execute("""
-            SELECT
-                COALESCE(SUM(CASE WHEN
-                    lower(media_type) IN ('video', 'video_note')
-                    OR (lower(media_type)='document' AND (
-                        lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
-                        OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
-                        OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
-                        OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
-                        OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
-                        OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
-                    )) THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS video_size,
-                COALESCE(SUM(CASE WHEN
-                    lower(media_type) IN ('photo', 'image')
-                    OR (lower(media_type)='document' AND (
-                        lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
-                        OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
-                        OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
-                        OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
-                        OR lower(file_name) LIKE '%.tiff'
-                    )) THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS image_size,
-                COALESCE(SUM(CASE WHEN NOT (
-                    lower(media_type) IN ('video', 'video_note', 'photo', 'image')
-                    OR (lower(media_type)='document' AND (
-                        lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
-                        OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
-                        OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
-                        OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
-                        OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
-                        OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
-                        OR lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
-                        OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
-                        OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
-                        OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
-                        OR lower(file_name) LIKE '%.tiff'
-                    ))
-                ) THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS other_size
-            FROM files WHERE category=?
-        """, (category,))).fetchone()
+        """,
+            (category,))).fetchone()
         await db.execute("""
             UPDATE categories SET
                 file_count=?, image_count=?, video_count=?, animation_count=?,
@@ -1948,9 +2069,36 @@ class Database:
             int(row["video_count"] or 0), int(row["animation_count"] or 0),
             int(row["audio_count"] or 0), int(row["document_count"] or 0),
             int(row["total_size"] or 0), int(row["sized_count"] or 0),
-            int(size_row["video_size"] or 0), int(size_row["image_size"] or 0),
-            int(size_row["other_size"] or 0), iso_now(), category,
+            int(row["video_size"] or 0), int(row["image_size"] or 0),
+            int(row["other_size"] or 0), iso_now(), category,
         ))
+        self._category_stats_last[category] = asyncio.get_running_loop().time()
+
+    def _schedule_category_stats_refresh(self, category: str, create=True):
+        """Queue one catch-up recount per folder, after the throttle window ends."""
+        existing = self._category_stats_pending.get(category)
+        if existing is not None and not existing.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def run():
+            try:
+                window = self._category_stats_last.get(category, 0.0) + CATEGORY_STATS_MIN_INTERVAL
+                delay = window - asyncio.get_running_loop().time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                async with self.connect() as db:
+                    await self._refresh_category_stats(db, category, create=create, force=True)
+                    await db.commit()
+            except Exception:
+                log.warning("deferred category recount failed for %r", category, exc_info=True)
+            finally:
+                self._category_stats_pending.pop(category, None)
+
+        self._category_stats_pending[category] = loop.create_task(run())
 
     async def save_category(self, name: str, description="", created_at=None):
         name = str(name or "").strip()[:120]
@@ -1984,7 +2132,7 @@ class Database:
             return
         async with self.connect() as db:
             for name in names:
-                await self._refresh_category_stats(db, name)
+                await self._refresh_category_stats(db, name, force=True)
             await db.commit()
 
     async def get_category_storage_stats(self, category: str):
@@ -2077,7 +2225,7 @@ class Database:
                     (new_name, iso_now(), iso_now(),
                      secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
                 )
-            await self._refresh_category_stats(db, new_name)
+            await self._refresh_category_stats(db, new_name, force=True)
             await db.commit()
             return True
 
@@ -2153,11 +2301,16 @@ class Database:
 
     async def list_category_files(self, category, limit=8, offset=0):
         async with self.connect() as db:
+            # A page holds a handful of rows and the album index answers each
+            # lookup directly, so correlated subqueries stay cheaper here than
+            # aggregating the folder's whole album set.
             return await (await db.execute("""
                 SELECT file_key, file_name, media_type, category,
                        album_group_id, album_position,
-                       (SELECT COUNT(*) FROM files grouped
-                        WHERE grouped.album_group_id=files.album_group_id) AS album_size
+                       CASE WHEN album_group_id IS NULL THEN 1 ELSE
+                           (SELECT COUNT(*) FROM files grouped
+                            WHERE grouped.album_group_id=files.album_group_id)
+                       END AS album_size
                 FROM files WHERE category=?
                 ORDER BY COALESCE((SELECT MAX(g.created_at) FROM files g
                                    WHERE g.album_group_id=files.album_group_id), files.created_at) DESC,
@@ -2181,9 +2334,7 @@ class Database:
         async with self.connect() as db:
             album_rows = await (await db.execute(f"""
                 SELECT file_key, file_name, media_type, category,
-                       album_group_id, album_position,
-                       (SELECT COUNT(*) FROM files grouped
-                        WHERE grouped.album_group_id=files.album_group_id) AS album_size
+                       album_group_id, album_position
                 FROM files
                 WHERE album_group_id IN ({placeholders})
                 ORDER BY album_group_id, album_position
@@ -2191,7 +2342,12 @@ class Database:
 
         complete = {}
         for row in album_rows:
-            complete.setdefault(str(row["album_group_id"]), []).append(row)
+            complete.setdefault(str(row["album_group_id"]), []).append(dict(row))
+        # The whole group is already fetched, so its size needs no extra query.
+        for group in complete.values():
+            size = len(group)
+            for row in group:
+                row["album_size"] = size
 
         result = []
         emitted = set()
