@@ -504,7 +504,10 @@ async def get_membership_tier(user_id: int, force_refresh: bool = False):
         return "手动会员"
 
     now = asyncio.get_running_loop().time()
-    cached = None if force_refresh else membership_cache.get(int(user_id))
+    # A still-fresh result is reused even when the caller asks to refresh: the
+    # window is only 15 seconds, so consecutive clicks cost zero API calls
+    # while a member who just left is still blocked within that window.
+    cached = membership_cache.get(int(user_id))
     if cached and cached[0] > now:
         return cached[1]
 
@@ -1297,7 +1300,8 @@ DELIVERY_MAX_ATTEMPTS = 3
 
 
 async def send_catalog_file(client, user_id, file_key, return_message_id=False,
-                            record=None, storage=None, settings=None):
+                            record=None, storage=None, settings=None,
+                            defer_side_effects=False):
     record = record if record is not None else await db.get_file(file_key)
     if not record:
         return (False, "文件不存在或已被移除。", None) if return_message_id else (False, "文件不存在或已被移除。")
@@ -1371,14 +1375,15 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False,
         reason = "该资源暂时无法取回，已记录，请稍后重试。"
         return (False, reason, None) if return_message_id else (False, reason)
 
-    await schedule_member_delivery_delete(client, user_id, [copied_message_id])
-    await db.record_history(user_id, file_key)
+    if not defer_side_effects:
+        await schedule_member_delivery_delete(client, user_id, [copied_message_id])
+        await db.record_history(user_id, file_key)
     if return_message_id:
         return True, "文件已发送。", copied_message_id
     return True, "文件已发送。"
 
 
-async def try_send_catalog_album(client, user_id, group, settings=None):
+async def try_send_catalog_album(client, user_id, group, settings=None, schedule_delete=True):
     """Copy one original Telegram album as a unit without rebuilding unrelated media."""
     if len(group) < 2 or len(group) > 10:
         return False
@@ -1396,9 +1401,10 @@ async def try_send_catalog_album(client, user_id, group, settings=None):
         "protect_content": protect_content,
     })
     if isinstance(copied, list) and len(copied) == len(group):
-        await schedule_member_delivery_delete(
-            client, user_id, [item.get("message_id") for item in copied]
-        )
+        if schedule_delete:
+            await schedule_member_delivery_delete(
+                client, user_id, [item.get("message_id") for item in copied]
+            )
         return copied
     return False
 
@@ -1478,16 +1484,31 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
     # Successful keys are cleared in one write at the end of the batch instead
     # of one DELETE per file.
     success_keys = []
+    history_keys = []
+    pending_delete_ids = []
 
-    async def flush_clears():
-        if not success_keys:
-            return
-        keys = list(success_keys)
-        success_keys.clear()
-        try:
-            await db.clear_delivery_failures(user_id, keys, share_key)
-        except Exception:
-            log.exception("Could not clear delivery failures: user=%s", user_id)
+    async def flush_batch_writes():
+        if success_keys:
+            keys = list(success_keys)
+            success_keys.clear()
+            try:
+                await db.clear_delivery_failures(user_id, keys, share_key)
+            except Exception:
+                log.exception("Could not clear delivery failures: user=%s", user_id)
+        if history_keys:
+            keys = list(history_keys)
+            history_keys.clear()
+            try:
+                await db.record_history_batch(user_id, keys)
+            except Exception:
+                log.exception("Could not record delivered history: user=%s", user_id)
+        if pending_delete_ids:
+            ids = list(pending_delete_ids)
+            pending_delete_ids.clear()
+            try:
+                await schedule_member_delivery_delete(client, user_id, ids)
+            except Exception:
+                log.exception("Could not schedule delivery deletion: user=%s", user_id)
 
     async def advance_progress():
         nonlocal next_offset
@@ -1564,7 +1585,8 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 ]
                 try:
                     delivered = await try_send_catalog_album(
-                        client, user_id, album_entries, settings=delivery_settings
+                        client, user_id, album_entries, settings=delivery_settings,
+                        schedule_delete=False,
                     )
                     if delivered:
                         log.info(
@@ -1583,7 +1605,10 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
         if delivered:
             last_sent_message_id = int(delivered[-1]["message_id"])
             keys = [entry[1]["file_key"] for entry in unit]
-            await db.record_history_batch(user_id, keys)
+            history_keys.extend(keys)
+            pending_delete_ids.extend(
+                int(item["message_id"]) for item in delivered if item.get("message_id")
+            )
             success_keys.extend(keys)
             sent += len(unit)
             completed.update(entry[0] for entry in unit)
@@ -1614,7 +1639,7 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 "Album delivery failed and remains pending: user=%s group=%s count=%s attempts=%s",
                 user_id, unit[0][1]["album_group_id"], len(unit), attempts,
             )
-            await flush_clears()
+            await flush_batch_writes()
             return sent, failed, skipped, next_offset, last_sent_message_id
 
         # Only genuine single files use the individual copy path.
@@ -1624,10 +1649,13 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 client, user_id, item["file_key"], return_message_id=True,
                 record=records_by_key.get(item["file_key"]),
                 storage=storage, settings=delivery_settings,
+                defer_side_effects=True,
             )
             if ok:
                 sent += 1
                 last_sent_message_id = int(copied_message_id)
+                pending_delete_ids.append(int(copied_message_id))
+                history_keys.append(item["file_key"])
                 success_keys.append(item["file_key"])
                 completed.add(position)
                 await advance_progress()
@@ -1638,10 +1666,10 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                     user_id, share_key, offset + position,
                     item["file_key"], error_text,
                 )
-                await flush_clears()
+                await flush_batch_writes()
                 return sent, failed, skipped, next_offset, last_sent_message_id
 
-    await flush_clears()
+    await flush_batch_writes()
     return sent, failed, skipped, next_offset, last_sent_message_id
 
 

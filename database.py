@@ -585,26 +585,50 @@ class Database:
                 "SELECT value FROM settings WHERE key='filename_ad_cleanup_v1'"
             )).fetchone()
             if not name_cleanup:
+                # Chunked by primary key so a large library never has to be
+                # loaded into memory at once during startup.
+                page_size = 5000
                 for table, key_columns in (
                     ("files", ("file_key",)),
                     ("scanner_messages", ("channel_id", "message_id")),
                     ("upload_batch_items", ("file_key",)),
                     ("backup_retry_failures", ("file_key",)),
                 ):
-                    rows = await (await db.execute(
-                        f"SELECT {', '.join(key_columns)}, file_name FROM {table}"
-                    )).fetchall()
-                    updates = []
-                    for row in rows:
-                        cleaned = clean_file_name(row["file_name"])
-                        if cleaned != row["file_name"]:
-                            updates.append((cleaned, *(row[column] for column in key_columns)))
-                    if updates:
-                        where = " AND ".join(f"{column}=?" for column in key_columns)
-                        await db.executemany(
-                            f"UPDATE {table} SET file_name=? WHERE {where}", updates
+                    where = " AND ".join(f"{column}=?" for column in key_columns)
+                    select_columns = ", ".join(key_columns)
+                    order_by = ", ".join(key_columns)
+                    cleaned_total = 0
+                    offset = 0
+                    while True:
+                        rows = await (await db.execute(
+                            f"SELECT {select_columns}, file_name FROM {table} "
+                            f"ORDER BY {order_by} LIMIT ? OFFSET ?",
+                            (page_size, offset),
+                        )).fetchall()
+                        if not rows:
+                            break
+                        updates = []
+                        for row in rows:
+                            cleaned = clean_file_name(row["file_name"])
+                            if cleaned != row["file_name"]:
+                                updates.append(
+                                    (cleaned, *(row[column] for column in key_columns))
+                                )
+                        if updates:
+                            await db.executemany(
+                                f"UPDATE {table} SET file_name=? WHERE {where}", updates
+                            )
+                        cleaned_total += len(updates)
+                        # Keys never change here, so ordering stays stable and
+                        # paging cannot skip rows.
+                        offset += len(rows)
+                    if cleaned_total:
+                        log.info(
+                            "Cleaned promotional fragments from %s stored names: %s",
+                            table, cleaned_total,
                         )
-                        log.info("Cleaned promotional fragments from %s stored names: %s", table, len(updates))
+                    else:
+                        log.info("No promotional fragments found in %s stored names", table)
                 await db.execute(
                     "INSERT INTO settings(key, value) VALUES('filename_ad_cleanup_v1', 'completed')"
                 )

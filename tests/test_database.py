@@ -555,6 +555,26 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         rows = await self.db.list_pending_deletions(10)
         self.assertEqual([int(row["message_id"]) for row in rows], [13])
 
+    async def test_startup_name_cleanup_pages_through_every_row(self):
+        """The chunked migration must not skip rows when the library is large."""
+        now = "2026-11-13T00:00:00+00:00"
+        total = 12
+        for index in range(total):
+            await self.db.add_file(
+                f"k{index}", 1, f"电影{index} @ad_channel 加群领取.mkv", "video",
+                100 + index, 0, "电影", f"cangku:1:{index}", created_at=now
+            )
+        # Re-run the startup migration with the one-time marker removed.
+        async with self.db.connect() as conn:
+            await conn.execute("DELETE FROM settings WHERE key='filename_ad_cleanup_v1'")
+            await conn.commit()
+        await self.db.initialize()
+        rows = await self.db.list_files(50)
+        self.assertEqual(len(rows), total)
+        for row in rows:
+            self.assertNotIn("@", row["file_name"])
+            self.assertNotIn("加群", row["file_name"])
+
 
 if __name__ == "__main__":
     unittest.main()
