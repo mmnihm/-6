@@ -302,6 +302,17 @@ class Database:
                 completed INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS scanner_caption_jobs (
+                channel_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                caption TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts BIGINT NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(channel_id, message_id)
+            );
             CREATE TABLE IF NOT EXISTS user_history (
                 user_id BIGINT NOT NULL,
                 file_key TEXT NOT NULL,
@@ -543,6 +554,49 @@ class Database:
                 INSERT INTO settings(key, value) VALUES(?, ?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value
             """, (key, str(value)))
+            await db.commit()
+
+    async def enqueue_scanner_caption_job(self, channel_id: int, message_id: int, caption: str):
+        now = iso_now()
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT INTO scanner_caption_jobs(
+                    channel_id, message_id, caption, status, attempts,
+                    last_error, created_at, updated_at
+                ) VALUES(?, ?, ?, 'pending', 0, '', ?, ?)
+                ON CONFLICT(channel_id, message_id) DO UPDATE SET
+                    caption=excluded.caption, status='pending', attempts=0,
+                    last_error='', updated_at=excluded.updated_at
+            """, (int(channel_id), int(message_id), str(caption or ''), now, now))
+            await db.commit()
+
+    async def list_scanner_caption_jobs(self, limit: int = 20):
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT channel_id, message_id, caption, attempts
+                FROM scanner_caption_jobs
+                WHERE status='pending'
+                ORDER BY created_at, channel_id, message_id
+                LIMIT ?
+            """, (max(1, min(100, int(limit))),))).fetchall()
+
+    async def complete_scanner_caption_job(self, channel_id: int, message_id: int):
+        async with self.connect() as db:
+            await db.execute("""
+                UPDATE scanner_caption_jobs SET status='done', updated_at=?
+                WHERE channel_id=? AND message_id=?
+            """, (iso_now(), int(channel_id), int(message_id)))
+            await db.commit()
+
+    async def retry_scanner_caption_job(self, channel_id: int, message_id: int, error: str = ""):
+        async with self.connect() as db:
+            await db.execute("""
+                UPDATE scanner_caption_jobs
+                SET attempts=attempts+1,
+                    status=CASE WHEN attempts+1 >= 20 THEN 'failed' ELSE 'pending' END,
+                    last_error=?, updated_at=?
+                WHERE channel_id=? AND message_id=?
+            """, (str(error or '')[:500], iso_now(), int(channel_id), int(message_id)))
             await db.commit()
 
     async def claim_first_admin(self, user_id: int) -> bool:
