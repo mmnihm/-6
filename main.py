@@ -20,7 +20,7 @@ from pyrogram.errors import (
 )
 
 import config
-from database import Database
+from database import Database, clean_file_name
 from web_catalog import create_catalog_app
 
 logging.basicConfig(
@@ -570,7 +570,7 @@ def media_details(message):
     for kind in ("animation", "video", "audio", "photo", "voice", "document"):
         media = getattr(message, kind, None)
         if media:
-            name = getattr(media, "file_name", None) or f"{kind}_{message.id}"
+            name = clean_file_name(getattr(media, "file_name", None) or f"{kind}_{message.id}")
             unique_id = getattr(media, "file_unique_id", None)
             return kind, name, unique_id
     return None, None, None
