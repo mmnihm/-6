@@ -53,17 +53,16 @@ def iso_now():
 
 def clean_file_name(value):
     """Remove obvious promotional/contact fragments without touching the media itself."""
-    name = str(value or "").replace("\\u200b", "").replace("\\ufeff", "").strip()
+    name = str(value or "").replace("\u200b", "").replace("\ufeff", "").strip()
     if not name:
         return "未命名资源"
 
     # Remove Telegram handles and common public contact/invite URLs.
-    name = re.sub(r"(?i)(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/[^\\s]+", " ", name)
-    name = re.sub(r"(?i)www\\.[^\\s]+|https?://[^\\s]+", " ", name)
-    name = re.sub(r"(?<![\\w])@[a-z][a-z0-9_]{3,}(?![\\w])", " ", name)
+    name = re.sub(r"(?i)(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/[^\s]+", " ", name)
+    name = re.sub(r"(?i)www\.[^\s]+|https?://[^\s]+", " ", name)
+    name = re.sub(r"(?<![\w])@[a-z][a-z0-9_]{3,}(?![\w])", " ", name)
 
-    # Remove clear advertising / solicitation phrases, including the trailing
-    # contact text commonly appended after a real resource title.
+    # Remove clear advertising / solicitation phrases, including trailing contact text.
     promo = re.compile(
         r"(?i)(?:加群|进群|入群|私聊|联系(?:我|客服)?|商务合作|广告合作|推广|招代理|代理加盟|"
         r"扫码(?:联系|加群)?|点击(?:链接|下方)|关注(?:频道|账号)?|订阅频道|"
@@ -75,11 +74,10 @@ def clean_file_name(value):
         name = name[:match.start()] + " "
 
     # Trim separators left behind by removed ad fragments.
-    name = re.sub(r"[\\s:：|｜,，;；、~～·•_-]+$", "", name)
-    name = re.sub(r"^[\\s:：|｜,，;；、~～·•_-]+", "", name)
-    name = re.sub(r"\\s{2,}", " ", name).strip()
+    name = re.sub(r"[\s:：|｜,，;；、~～·•_-]+$", "", name)
+    name = re.sub(r"^[\s:：|｜,，;；、~～·•_-]+", "", name)
+    name = re.sub(r"\s{2,}", " ", name).strip()
     return name[:300] if name else "未命名资源"
-
 
 class PostgresCompat:
     """Small async adapter for the SQLite-style calls used by this project."""
