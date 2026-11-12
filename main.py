@@ -59,6 +59,8 @@ backup_worker_running = False
 last_user_activity = 0.0
 category_delivery_in_progress = set()
 last_getfolder_click_at = {}  # Per-user 5-second resource button cooldown
+file_open_in_progress = set()
+bot_admin_status_cache = {}
 search_sessions = {}
 
 # One shared gate for all metadata reads made by the user-account scanner.
@@ -504,8 +506,6 @@ async def get_membership_tier(user_id: int, force_refresh: bool = False):
     cached = None if force_refresh else membership_cache.get(int(user_id))
     if cached and cached[0] > now:
         return cached[1]
-    if cached:
-        membership_cache.pop(int(user_id), None)
 
     group_id = await get_member_group_id()
     if not group_id:
@@ -518,16 +518,22 @@ async def get_membership_tier(user_id: int, force_refresh: bool = False):
         bot_id = BOT_ID
         if not bot_id:
             bot_id = (await app.get_me()).id
-        bot_member = await telegram_bot_api(
-            "getChatMember",
-            {"chat_id": group_id, "user_id": bot_id},
-        )
-        bot_status = str(bot_member.get("status", ""))
-        if bot_status not in ("administrator", "creator"):
+        # The bot's own admin status barely ever changes, so it is cached far
+        # longer than a member check and removed from every click's latency.
+        cached_admin = bot_admin_status_cache.get((int(group_id), int(bot_id)))
+        if cached_admin and cached_admin[0] > now:
+            bot_is_admin = cached_admin[1]
+        else:
+            bot_member = await telegram_bot_api(
+                "getChatMember",
+                {"chat_id": group_id, "user_id": bot_id},
+            )
+            bot_is_admin = str(bot_member.get("status", "")) in ("administrator", "creator")
+            bot_admin_status_cache[(int(group_id), int(bot_id))] = (now + 600, bot_is_admin)
+        if not bot_is_admin:
             log.error(
-                "Membership verification unavailable: bot is not admin "
-                "in bound group %s (bot status=%s)",
-                group_id, bot_status,
+                "Membership verification unavailable: bot is not admin in bound group %s",
+                group_id,
             )
             return None
 
@@ -553,11 +559,13 @@ async def get_membership_tier(user_id: int, force_refresh: bool = False):
         membership_cache[int(user_id)] = (now + 15, tier)
         return tier
     except Exception as exc:
+        # A Telegram hiccup must not tell a paying member to go join the group.
+        stale = membership_cache.get(int(user_id))
         log.error(
-            "Bot API membership check failed: user=%s group=%s error=%s",
-            user_id, group_id, str(exc)[:400],
+            "Bot API membership check failed: user=%s group=%s error=%s stale=%s",
+            user_id, group_id, str(exc)[:400], stale[1] if stale else None,
         )
-        return None
+        return stale[1] if stale else None
 
 
 async def has_access(user_id: int, force_refresh: bool = False) -> bool:
@@ -1218,30 +1226,85 @@ async def get_member_delivery_settings():
     return (protect != "0", delete_after)
 
 
+def seconds_until(timestamp_text):
+    """Seconds left until an ISO timestamp; 0 when already due or unparseable."""
+    try:
+        when = datetime.fromisoformat(str(timestamp_text))
+    except (TypeError, ValueError):
+        return 0
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+async def _delete_later(client, chat_id, message_ids, delete_at):
+    delay = seconds_until(delete_at)
+    if delay > 0:
+        await asyncio.sleep(delay)
+    try:
+        await client.delete_messages(int(chat_id), message_ids)
+        log.info("Auto-deleted member delivery: chat=%s count=%s", chat_id, len(message_ids))
+    except Exception:
+        log.exception(
+            "Could not auto-delete member delivery: chat=%s ids=%s", chat_id, message_ids
+        )
+    finally:
+        try:
+            await db.remove_pending_deletions(chat_id, message_ids)
+        except Exception:
+            log.exception("Could not clear pending deletions: chat=%s", chat_id)
+
+
 async def schedule_member_delivery_delete(client, chat_id, message_ids):
     ids = [int(value) for value in message_ids if value]
     _, delete_after = await get_member_delivery_settings()
     if not ids or delete_after <= 0:
         return
 
-    async def delete_later():
-        await asyncio.sleep(delete_after)
-        try:
-            await client.delete_messages(int(chat_id), ids)
-            log.info("Auto-deleted member delivery: chat=%s count=%s", chat_id, len(ids))
-        except Exception:
-            log.exception("Could not auto-delete member delivery: chat=%s ids=%s", chat_id, ids)
-
-    asyncio.create_task(delete_later())
+    delete_at = (datetime.now(timezone.utc) + timedelta(seconds=delete_after)).isoformat()
+    try:
+        await db.add_pending_deletions(chat_id, ids, delete_at)
+    except Exception:
+        log.exception("Could not persist pending deletion: chat=%s", chat_id)
+    asyncio.create_task(_delete_later(client, chat_id, ids, delete_at))
 
 
-async def send_catalog_file(client, user_id, file_key, return_message_id=False):
-    record = await db.get_file(file_key)
+async def resume_pending_deletions(client):
+    """Re-arm deletions that were scheduled before the last restart."""
+    try:
+        rows = await db.list_pending_deletions(2000)
+    except Exception:
+        log.exception("Could not load pending deletions at startup")
+        return 0
+    if not rows:
+        return 0
+    batched = {}
+    for row in rows:
+        batched.setdefault((int(row["chat_id"]), str(row["delete_at"]),), []).append(
+            int(row["message_id"])
+        )
+    for (chat_id, delete_at), ids in batched.items():
+        asyncio.create_task(_delete_later(client, chat_id, ids, delete_at))
+    log.info("Resumed %s pending member deletions across %s chats", len(rows), len(batched))
+    return len(rows)
+
+
+# A delivery unit that keeps failing must not pin the folder cursor forever.
+# After this many failed attempts the unit is skipped (and reported), so the
+# member can still receive the rest of the folder.
+DELIVERY_MAX_ATTEMPTS = 3
+
+
+async def send_catalog_file(client, user_id, file_key, return_message_id=False,
+                            record=None, storage=None, settings=None):
+    record = record if record is not None else await db.get_file(file_key)
     if not record:
         return (False, "文件不存在或已被移除。", None) if return_message_id else (False, "文件不存在或已被移除。")
 
     fingerprint = str(record["source_fingerprint"] or "")
-    primary_channel_id, backup_channel_id = await get_storage_channels()
+    if storage is None:
+        storage = await get_storage_channels()
+    primary_channel_id, backup_channel_id = storage
     copied_message_id = None
     primary_message_id = int(record["primary_message_id"] or 0)
     backup_message_id = int(record["backup_message_id"] or 0)
@@ -1270,13 +1333,15 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
         candidates.append(("original", cangku_source[0], cangku_source[1]))
 
     if not candidates:
-        reason = "主存储没有对应消息记录，备用存储也没有可用副本。"
+        reason = "该资源暂时无法取回，已记录，请稍后重试。"
         return (False, reason, None) if return_message_id else (False, reason)
 
     last_error = None
     for source_name, source_chat_id, source_message_id in candidates:
         try:
-            protect_content, _ = await get_member_delivery_settings()
+            if settings is None:
+                settings = await get_member_delivery_settings()
+            protect_content, _ = settings
             copied = await telegram_bot_api("copyMessage", {
                 "chat_id": int(user_id),
                 "from_chat_id": int(source_chat_id),
@@ -1297,7 +1362,12 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
             )
 
     if copied_message_id is None:
-        reason = f"主存储及备用来源均无法取回文件：{str(last_error)[:180]}"
+        # Keep Telegram's raw error in the log, not in the member-facing text.
+        log.error(
+            "All catalog sources failed: file=%s user=%s error=%s",
+            file_key, user_id, str(last_error)[:220],
+        )
+        reason = "该资源暂时无法取回，已记录，请稍后重试。"
         return (False, reason, None) if return_message_id else (False, reason)
 
     await schedule_member_delivery_delete(client, user_id, [copied_message_id])
@@ -1307,7 +1377,7 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False):
     return True, "文件已发送。"
 
 
-async def try_send_catalog_album(client, user_id, group):
+async def try_send_catalog_album(client, user_id, group, settings=None):
     """Copy one original Telegram album as a unit without rebuilding unrelated media."""
     if len(group) < 2 or len(group) > 10:
         return False
@@ -1315,7 +1385,9 @@ async def try_send_catalog_album(client, user_id, group):
     if len(source_chats) != 1:
         return False
     message_ids = [int(entry[3]) for entry in group]
-    protect_content, _ = await get_member_delivery_settings()
+    if settings is None:
+        settings = await get_member_delivery_settings()
+    protect_content, _ = settings
     copied = await telegram_bot_api("copyMessages", {
         "chat_id": int(user_id),
         "from_chat_id": source_chats.pop(),
@@ -1332,10 +1404,12 @@ async def try_send_catalog_album(client, user_id, group):
 
 async def send_catalog_batch(client, user_id, share_key, offset, batch, track_progress=True):
     """Send complete media units and advance folder progress only over successful items."""
-    sent = failed = 0
+    sent = failed = skipped = 0
     next_offset = offset
     last_sent_message_id = None
-    primary_channel_id, backup_channel_id = await get_storage_channels()
+    storage = await get_storage_channels()
+    delivery_settings = await get_member_delivery_settings()
+    primary_channel_id, backup_channel_id = storage
     records = await db.get_files_by_keys(item["file_key"] for item in batch)
     records_by_key = {row["file_key"]: row for row in records}
     delivered_keys = (
@@ -1400,6 +1474,19 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
 
     units.sort(key=lambda unit: unit[0][0])
     completed = set()
+    # Successful keys are cleared in one write at the end of the batch instead
+    # of one DELETE per file.
+    success_keys = []
+
+    async def flush_clears():
+        if not success_keys:
+            return
+        keys = list(success_keys)
+        success_keys.clear()
+        try:
+            await db.clear_delivery_failures(user_id, keys, share_key)
+        except Exception:
+            log.exception("Could not clear delivery failures: user=%s", user_id)
 
     async def advance_progress():
         nonlocal next_offset
@@ -1421,6 +1508,7 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 await advance_progress()
                 continue
         delivered = False
+        album_error = None
         if is_album and str(unit[0][1]["album_group_id"]) not in invalid_album_groups:
             album_records = [entry[2] for entry in unit]
             album_candidates = []
@@ -1475,7 +1563,7 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 ]
                 try:
                     delivered = await try_send_catalog_album(
-                        client, user_id, album_entries
+                        client, user_id, album_entries, settings=delivery_settings
                     )
                     if delivered:
                         log.info(
@@ -1484,6 +1572,7 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                         )
                         break
                 except Exception as exc:
+                    album_error = exc
                     log.warning(
                         "Catalog album source failed; trying next source: "
                         "user=%s source=%s count=%s error=%s",
@@ -1494,31 +1583,51 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
             last_sent_message_id = int(delivered[-1]["message_id"])
             keys = [entry[1]["file_key"] for entry in unit]
             await db.record_history_batch(user_id, keys)
+            success_keys.extend(keys)
             sent += len(unit)
             completed.update(entry[0] for entry in unit)
             await advance_progress()
             continue
 
+        unit_keys = [entry[1]["file_key"] for entry in unit]
+        attempts = await db.record_delivery_failure(
+            user_id, unit_keys, share_key,
+            str(album_error)[:220] if is_album else "",
+        )
+        if attempts >= DELIVERY_MAX_ATTEMPTS:
+            # Repeatedly unreachable unit: skip it so the folder keeps flowing.
+            skipped += len(unit)
+            completed.update(entry[0] for entry in unit)
+            await advance_progress()
+            log.error(
+                "Giving up on unreachable delivery unit after %s attempts: user=%s keys=%s",
+                attempts, user_id, unit_keys,
+            )
+            continue
         if is_album:
             # Never split an album. A failed unit must remain pending; for
             # paginated folder delivery, stop here so the next request retries
             # this exact album instead of advancing past it.
             failed += len(unit)
             log.error(
-                "Album delivery failed and remains pending: user=%s group=%s count=%s",
-                user_id, unit[0][1]["album_group_id"], len(unit),
+                "Album delivery failed and remains pending: user=%s group=%s count=%s attempts=%s",
+                user_id, unit[0][1]["album_group_id"], len(unit), attempts,
             )
-            return sent, failed, next_offset, last_sent_message_id
+            await flush_clears()
+            return sent, failed, skipped, next_offset, last_sent_message_id
 
         # Only genuine single files use the individual copy path.
         for entry in unit:
             position, item = entry[0], entry[1]
             ok, error_text, copied_message_id = await send_catalog_file(
-                client, user_id, item["file_key"], return_message_id=True
+                client, user_id, item["file_key"], return_message_id=True,
+                record=records_by_key.get(item["file_key"]),
+                storage=storage, settings=delivery_settings,
             )
             if ok:
                 sent += 1
                 last_sent_message_id = int(copied_message_id)
+                success_keys.append(item["file_key"])
                 completed.add(position)
                 await advance_progress()
             else:
@@ -1528,9 +1637,11 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                     user_id, share_key, offset + position,
                     item["file_key"], error_text,
                 )
-                return sent, failed, next_offset, last_sent_message_id
+                await flush_clears()
+                return sent, failed, skipped, next_offset, last_sent_message_id
 
-    return sent, failed, next_offset, last_sent_message_id
+    await flush_clears()
+    return sent, failed, skipped, next_offset, last_sent_message_id
 
 
 @app.on_message(filters.private & filters.command("start"))
@@ -4113,7 +4224,7 @@ async def user_catalog_callback_handler(client, query):
                 await message.reply_text("📭 暂时没有找到可发送的资源，请稍后重试。")
                 return
 
-            sent, failed, _, _last_sent_message_id = await send_catalog_batch(
+            sent, failed, skipped, _, _last_sent_message_id = await send_catalog_batch(
                 client, user.id, "random", 0, rows, track_progress=False
             )
             summary = f"🎲 随机发送完成：成功 {sent}/{len(rows)} 个文件。"
@@ -4559,20 +4670,37 @@ async def user_catalog_callback_handler(client, query):
             # delivery summary is sent only after every resource message.
             last_sent_message_id = None
             next_offset = offset
+            has_more = False
             try:
-                sent, failed, next_offset, last_sent_message_id = await send_catalog_batch(
+                sent, failed, skipped, next_offset, last_sent_message_id = await send_catalog_batch(
                     client, user.id, member_progress_key, offset, batch
                 )
-                text_result = (
-                    f"📦 本批资源发送完成！\n\n"
-                    f"📁 目录：{category['name']}\n"
-                    f"📥 本批处理：{len(batch)} 个\n"
-                    f"✅ 成功发送：{sent} 个\n"
-                    f"❌ 发送失败：{failed} 个\n"
-                    f"📊 领取进度：{next_offset}/{total}"
-                    + ("\n\n还有资源，点击下方按钮继续领取（单文件每批20个，相册整组）。"
-                       if next_offset < total else "\n\n🎉 该目录资源已全部领取完毕。")
+                # The stored folder count is refreshed lazily, so it can lag a
+                # fresh upload. Probe past the cursor before declaring "done".
+                has_more = next_offset < total
+                if not has_more and next_offset > 0:
+                    try:
+                        has_more = bool(await db.list_category_files(
+                            category["name"], limit=1, offset=next_offset
+                        ))
+                    except Exception:
+                        log.exception("Could not probe folder tail: share_key=%s", share_key)
+                lines = [
+                    "📦 本批资源发送完成！\n",
+                    f"📁 目录：{category['name']}",
+                    f"📥 本批处理：{len(batch)} 个",
+                    f"✅ 成功发送：{sent} 个",
+                ]
+                if failed:
+                    lines.append(f"❌ 发送失败：{failed} 个（已保留，下次继续尝试）")
+                if skipped:
+                    lines.append(f"⏭ 暂时无法取回、已跳过：{skipped} 个")
+                lines.append(f"📊 领取进度：{next_offset}/{max(total, next_offset)}")
+                lines.append(
+                    "\n还有资源，点击下方按钮继续领取（单文件每批20个，相册整组）。"
+                    if has_more else "\n🎉 该目录资源已全部领取完毕。"
                 )
+                text_result = "\n".join(lines) + "\n"
             except Exception as exc:
                 log.exception(
                     "Folder resource delivery aborted: user=%s share_key=%s",
@@ -4585,13 +4713,12 @@ async def user_catalog_callback_handler(client, query):
                 except Exception:
                     log.exception("Could not reload folder delivery progress")
                 text_result = (
-                    f"⚠️ 本批资源发送过程中出现异常，发送已中止。\n"
-                    f"请稍后继续领取，已成功处理的进度会保留。\n\n"
-                    f"原因：{str(exc)[:180]}"
+                    "⚠️ 本批资源发送过程中出现异常，发送已中止。\n"
+                    "请稍后继续领取，已成功处理的进度会保留。"
                 )
 
             button_rows = []
-            if next_offset < total:
+            if has_more:
                 button_rows.append([InlineKeyboardButton(
                     "📥 继续领取（单文件20个，相册整组）",
                     callback_data=f"uc:getfolder:{share_key}:{next_offset}",
@@ -4620,7 +4747,7 @@ async def user_catalog_callback_handler(client, query):
                         [[{
                             "text": "📥 继续领取（单文件20个，相册整组）",
                             "callback_data": f"uc:getfolder:{share_key}:{next_offset}",
-                        }]] if next_offset < total else []
+                        }]] if has_more else []
                     ) + [
                         [{"text": "📁 返回文件夹", "callback_data": f"uc:folderlink:{share_key}"}],
                         [{"text": "🏠 返回主菜单", "callback_data": "uc:home"}],
@@ -4649,11 +4776,19 @@ async def user_catalog_callback_handler(client, query):
             category_delivery_in_progress.discard(delivery_key)
 
     if action[1] == "open" and len(action) == 3:
-        if not await has_access(user.id, force_refresh=True):
-            await query.answer("⛔ 请先加入管理员指定的会员群，再获取资源。", show_alert=True)
+        guard = (int(user.id), str(action[2]))
+        if guard in file_open_in_progress:
+            await query.answer("⏳ 这个资源正在发送，请稍候，不要重复点击。")
             return
-        ok, result = await send_catalog_file(client, user.id, action[2])
-        await query.answer(result if ok else result, show_alert=not ok)
+        file_open_in_progress.add(guard)
+        try:
+            if not await has_access(user.id, force_refresh=True):
+                await query.answer("⛔ 请先加入管理员指定的会员群，再获取资源。", show_alert=True)
+                return
+            ok, result = await send_catalog_file(client, user.id, action[2])
+            await query.answer(result, show_alert=not ok)
+        finally:
+            file_open_in_progress.discard(guard)
         return
 
     if action[1] == "star" and len(action) >= 3:
@@ -5186,7 +5321,7 @@ async def admin_callback_handler(client, query):
                 f"📥 正在发送「{row['category']}」资源（单文件每批20个，相册整组）…"
             )
             try:
-                sent, failed, next_offset, _last_sent_message_id = await send_catalog_batch(
+                sent, failed, skipped, next_offset, _last_sent_message_id = await send_catalog_batch(
                     client, user.id, f"admin:{share_key}", offset, batch,
                     track_progress=False,
                 )
@@ -5821,6 +5956,7 @@ async def main():
         telegram_http_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=12, connect=5, sock_read=10)
         )
+        await resume_pending_deletions(app)
 
         if scanner is not None:
             try:

@@ -509,6 +509,52 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         rows = await self.db.list_files(50)
         self.assertEqual([row["file_key"] for row in rows], ["legacyrow"])
 
+    async def test_delivery_failure_attempts_accumulate_per_user_and_unit(self):
+        """A unit that keeps failing must be countable, and clearable on success."""
+        self.assertEqual(
+            await self.db.record_delivery_failure(7, ["broken"], "member:movies", "boom"),
+            1,
+        )
+        self.assertEqual(
+            await self.db.record_delivery_failure(7, ["broken"], "member:movies", "boom"),
+            2,
+        )
+        self.assertEqual(
+            await self.db.record_delivery_failure(7, ["broken"], "member:movies", "boom"),
+            3,
+        )
+        # Counting is per user: another member still gets a fresh budget.
+        self.assertEqual(
+            await self.db.record_delivery_failure(8, ["broken"], "member:movies", "boom"),
+            1,
+        )
+        await self.db.clear_delivery_failures(7, ["broken"], "member:movies")
+        self.assertEqual(
+            await self.db.record_delivery_failure(7, ["broken"], "member:movies", "boom"),
+            1,
+        )
+
+    async def test_album_failure_tracks_peak_across_members(self):
+        """An album is one unit: the member with the most failures drives the skip."""
+        await self.db.record_delivery_failure(9, ["a1"], "member:photos", "x")
+        await self.db.record_delivery_failure(9, ["a1"], "member:photos", "x")
+        peak = await self.db.record_delivery_failure(9, ["a1", "a2"], "member:photos", "x")
+        self.assertEqual(peak, 3)
+        rows = await self.db.list_delivery_failures(10)
+        self.assertEqual({row["file_key"] for row in rows}, {"a1", "a2"})
+
+    async def test_pending_deletions_roundtrip(self):
+        """Scheduled deletions survive a restart because they live in the database."""
+        now = "2026-11-13T00:00:00+00:00"
+        await self.db.add_pending_deletions(12345, [11, 12], now)
+        await self.db.add_pending_deletions(12345, [12, 13], now)  # duplicate ids are ignored
+        rows = await self.db.list_pending_deletions(10)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual({int(row["message_id"]) for row in rows}, {11, 12, 13})
+        await self.db.remove_pending_deletions(12345, [11, 12])
+        rows = await self.db.list_pending_deletions(10)
+        self.assertEqual([int(row["message_id"]) for row in rows], [13])
+
 
 if __name__ == "__main__":
     unittest.main()

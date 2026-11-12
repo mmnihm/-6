@@ -370,6 +370,21 @@ class Database:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(user_id, share_key)
             );
+            CREATE TABLE IF NOT EXISTS delivery_failures (
+                user_id BIGINT NOT NULL,
+                file_key TEXT NOT NULL,
+                share_key TEXT NOT NULL,
+                attempts BIGINT NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, file_key, share_key)
+            );
+            CREATE TABLE IF NOT EXISTS pending_deletions (
+                chat_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                delete_at TEXT NOT NULL,
+                PRIMARY KEY(chat_id, message_id)
+            );
             CREATE TABLE IF NOT EXISTS backup_retry_jobs (
                 file_key TEXT PRIMARY KEY,
                 primary_channel_id BIGINT NOT NULL,
@@ -1235,6 +1250,88 @@ class Database:
                     END,
                     updated_at=excluded.updated_at
             """, (user_id, share_key, max(0, int(next_offset)), iso_now()))
+            await db.commit()
+
+    async def record_delivery_failure(self, user_id, file_keys, share_key, error=""):
+        """Count failed retrieval attempts for one delivery unit and return the new peak.
+
+        A unit that keeps failing would otherwise pin the folder cursor forever,
+        because progress only advances over successful sends.
+        """
+        keys = [str(key) for key in file_keys if key]
+        if not keys:
+            return 0
+        now = iso_now()
+        async with self.connect() as db:
+            for key in keys:
+                await db.execute("""
+                    INSERT INTO delivery_failures(
+                        user_id, file_key, share_key, attempts, last_error, updated_at
+                    ) VALUES(?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(user_id, file_key, share_key) DO UPDATE SET
+                        attempts=delivery_failures.attempts+1,
+                        last_error=excluded.last_error,
+                        updated_at=excluded.updated_at
+                """, (int(user_id), key, str(share_key), str(error or "")[:300], now))
+            placeholders = ",".join("?" for _ in keys)
+            row = await (await db.execute(
+                "SELECT MAX(attempts) AS peak FROM delivery_failures "
+                f"WHERE user_id=? AND share_key=? AND file_key IN ({placeholders})",
+                [int(user_id), str(share_key)] + keys,
+            )).fetchone()
+            await db.commit()
+            return int(row["peak"] or 0) if row else 0
+
+    async def clear_delivery_failures(self, user_id, file_keys, share_key):
+        keys = [str(key) for key in file_keys if key]
+        if not keys:
+            return
+        placeholders = ",".join("?" for _ in keys)
+        async with self.connect() as db:
+            await db.execute(
+                "DELETE FROM delivery_failures "
+                f"WHERE user_id=? AND share_key=? AND file_key IN ({placeholders})",
+                [int(user_id), str(share_key)] + keys,
+            )
+            await db.commit()
+
+    async def list_delivery_failures(self, limit=50):
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT user_id, file_key, share_key, attempts, last_error, updated_at
+                FROM delivery_failures ORDER BY attempts DESC, updated_at DESC LIMIT ?
+            """, (int(limit),))).fetchall()
+
+    async def add_pending_deletions(self, chat_id, message_ids, delete_at):
+        """Persist scheduled deletions so a restart does not silently keep files forever."""
+        ids = [int(value) for value in message_ids if value]
+        if not ids:
+            return
+        async with self.connect() as db:
+            for message_id in ids:
+                await db.execute("""
+                    INSERT INTO pending_deletions(chat_id, message_id, delete_at)
+                    VALUES(?, ?, ?) ON CONFLICT(chat_id, message_id) DO NOTHING
+                """, (int(chat_id), message_id, str(delete_at)))
+            await db.commit()
+
+    async def list_pending_deletions(self, limit=1000):
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT chat_id, message_id, delete_at FROM pending_deletions
+                ORDER BY delete_at LIMIT ?
+            """, (int(limit),))).fetchall()
+
+    async def remove_pending_deletions(self, chat_id, message_ids):
+        ids = [int(value) for value in message_ids if value]
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        async with self.connect() as db:
+            await db.execute(
+                f"DELETE FROM pending_deletions WHERE chat_id=? AND message_id IN ({placeholders})",
+                [int(chat_id)] + ids,
+            )
             await db.commit()
 
     async def repair_category_delivery_progress_from_history(
