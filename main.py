@@ -379,12 +379,22 @@ def folder_storage_caption(category: str) -> str:
 
 
 async def set_storage_message_caption(chat_id: int, message_id: int, caption: str):
-    return await telegram_bot_api("editMessageCaption", {
+    result = await telegram_bot_api("editMessageCaption", {
         "chat_id": int(chat_id),
         "message_id": int(message_id),
         "caption": caption,
         "caption_entities": [],
+        "show_caption_above_media": True,
     })
+    if not isinstance(result, dict) or str(result.get("caption", "")) != caption:
+        raise RuntimeError(
+            f"Telegram did not confirm the expected album caption: chat={chat_id} message={message_id}"
+        )
+    log.info(
+        "Album folder caption confirmed: chat=%s message=%s caption=%s",
+        chat_id, message_id, caption,
+    )
+    return result
 
 
 app = Client(
@@ -1695,6 +1705,7 @@ async def _flush_album_upload(client, key):
             "chat_id": primary_channel_id,
             "from_chat_id": int(messages[0].chat.id),
             "message_ids": source_message_ids,
+            "remove_caption": True,
         })
         if not isinstance(primary_result, list) or len(primary_result) != len(prepared_items):
             raise RuntimeError(
@@ -1721,6 +1732,7 @@ async def _flush_album_upload(client, key):
                 "chat_id": backup_channel_id,
                 "from_chat_id": int(messages[0].chat.id),
                 "message_ids": source_message_ids,
+                "remove_caption": True,
             })
             if not isinstance(backup_result, list) or len(backup_result) != len(prepared_items):
                 raise RuntimeError("备份频道整组复制返回数量不完整")
