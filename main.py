@@ -58,6 +58,7 @@ backup_retry_manual_requested = False
 backup_worker_running = False
 last_user_activity = 0.0
 category_delivery_in_progress = set()
+last_getfolder_click_at = {}  # Per-user 5-second resource button cooldown
 search_sessions = {}
 
 # One shared gate for all metadata reads made by the user-account scanner.
@@ -4004,6 +4005,18 @@ async def user_catalog_callback_handler(client, query):
         return
 
     if action[1] == "getfolder":
+        # Apply a per-user cooldown across all folders, not just one folder.
+        # This prevents rapid repeated taps from starting consecutive batches.
+        now = asyncio.get_running_loop().time()
+        last_click = float(last_getfolder_click_at.get(int(user.id), 0.0))
+        remaining_cooldown = 5.0 - (now - last_click)
+        if remaining_cooldown > 0:
+            await query.answer(
+                f"⏳ 操作太快，请 {remaining_cooldown:.1f} 秒后再获取资源。",
+                show_alert=True,
+            )
+            return
+        last_getfolder_click_at[int(user.id)] = now
         await query.answer("📥 正在检查会员群资格并准备资源…")
         if not await has_access(user.id, force_refresh=True):
             await message.reply_text("⛔ 获取资源失败：请先加入管理员指定的会员群，再重新点击获取资源。")
