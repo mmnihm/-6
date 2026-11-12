@@ -378,11 +378,11 @@ def folder_storage_caption(category: str) -> str:
     return "#" + name.replace(" ", "_") if name else "#未分类"
 
 
-async def set_storage_message_caption(chat_id: int, message_id: int, category: str):
+async def set_storage_message_caption(chat_id: int, message_id: int, caption: str):
     return await telegram_bot_api("editMessageCaption", {
         "chat_id": int(chat_id),
         "message_id": int(message_id),
-        "caption": folder_storage_caption(category),
+        "caption": caption,
         "caption_entities": [],
     })
 
@@ -1701,9 +1701,11 @@ async def _flush_album_upload(client, key):
                 f"主频道整组复制不完整（预期 {len(prepared_items)} 条），整组未入库"
             )
         primary_ids = [int(item["message_id"]) for item in primary_result]
-        for stored_message_id in primary_ids:
+        for position, stored_message_id in enumerate(primary_ids):
             await set_storage_message_caption(
-                primary_channel_id, stored_message_id, category
+                primary_channel_id,
+                stored_message_id,
+                folder_storage_caption(category) if position == 0 else "",
             )
 
         backup_ids = [0] * len(prepared_items)
@@ -1717,9 +1719,11 @@ async def _flush_album_upload(client, key):
             if not isinstance(backup_result, list) or len(backup_result) != len(prepared_items):
                 raise RuntimeError("备份频道整组复制返回数量不完整")
             backup_ids = [int(item["message_id"]) for item in backup_result]
-            for stored_message_id in backup_ids:
+            for position, stored_message_id in enumerate(backup_ids):
                 await set_storage_message_caption(
-                    backup_channel_id, stored_message_id, category
+                    backup_channel_id,
+                    stored_message_id,
+                    folder_storage_caption(category) if position == 0 else "",
                 )
         except Exception as exc:
             backup_error = exc
