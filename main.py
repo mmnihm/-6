@@ -378,23 +378,50 @@ def folder_storage_caption(category: str) -> str:
     return "#" + name.replace(" ", "_") if name else "#未分类"
 
 
-async def set_storage_message_caption(chat_id: int, message_id: int, caption: str):
-    result = await telegram_bot_api("editMessageCaption", {
-        "chat_id": int(chat_id),
-        "message_id": int(message_id),
-        "caption": caption,
-        "caption_entities": [],
-        "show_caption_above_media": True,
-    })
-    if not isinstance(result, dict) or str(result.get("caption", "")) != caption:
-        raise RuntimeError(
-            f"Telegram did not confirm the expected album caption: chat={chat_id} message={message_id}"
-        )
-    log.info(
-        "Album folder caption confirmed: chat=%s message=%s caption=%s",
-        chat_id, message_id, caption,
-    )
-    return result
+async def queue_storage_message_caption(chat_id: int, message_id: int, caption: str):
+    # Persist caption work; the scanner user account edits channel posts asynchronously.
+    await db.enqueue_scanner_caption_job(int(chat_id), int(message_id), str(caption))
+    log.info("Scanner caption job queued: chat=%s message=%s", chat_id, message_id)
+
+
+async def scanner_caption_worker():
+    while True:
+        try:
+            if scanner is None or not scanner.is_connected:
+                await asyncio.sleep(5)
+                continue
+            jobs = await db.list_scanner_caption_jobs(20)
+            if not jobs:
+                await asyncio.sleep(2)
+                continue
+            for job in jobs:
+                if scanner is None or not scanner.is_connected:
+                    break
+                channel_id, message_id = int(job["channel_id"]), int(job["message_id"])
+                try:
+                    await scanner.edit_message_caption(
+                        chat_id=channel_id, message_id=message_id,
+                        caption=str(job["caption"] or ""), parse_mode=None,
+                        caption_entities=[],
+                    )
+                    await db.complete_scanner_caption_job(channel_id, message_id)
+                    log.info("Scanner caption confirmed: chat=%s message=%s", channel_id, message_id)
+                except Exception as exc:
+                    wait_seconds = max(2, min(60, int(getattr(exc, "value", 5) or 5)))
+                    await db.retry_scanner_caption_job(
+                        channel_id, message_id,
+                        f"{type(exc).__name__}: {str(exc)[:400]}",
+                    )
+                    log.warning(
+                        "Scanner caption edit failed; retained for retry: chat=%s message=%s error=%s",
+                        channel_id, message_id, exc,
+                    )
+                    await asyncio.sleep(wait_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Scanner caption worker iteration failed")
+            await asyncio.sleep(5)
 
 
 app = Client(
@@ -1712,18 +1739,10 @@ async def _flush_album_upload(client, key):
                 f"主频道整组复制不完整（预期 {len(prepared_items)} 条），整组未入库"
             )
         primary_ids = [int(item["message_id"]) for item in primary_result]
-        for position, (stored_message_id, prepared_item) in enumerate(
-            zip(primary_ids, prepared_items)
-        ):
-            # The first album item carries the folder tag. Only clear later
-            # captions when the source actually had text; skip needless API calls.
-            source_caption = str(getattr(prepared_item[0], "caption", "") or "").strip()
-            if position == 0 or source_caption:
-                await set_storage_message_caption(
-                    primary_channel_id,
-                    stored_message_id,
-                    folder_storage_caption(category) if position == 0 else "",
-                )
+        # copyMessages(remove_caption=True) clears source captions; tag only album item 1.
+        await queue_storage_message_caption(
+            primary_channel_id, primary_ids[0], folder_storage_caption(category)
+        )
 
         backup_ids = [0] * len(prepared_items)
         backup_error = None
@@ -1737,16 +1756,9 @@ async def _flush_album_upload(client, key):
             if not isinstance(backup_result, list) or len(backup_result) != len(prepared_items):
                 raise RuntimeError("备份频道整组复制返回数量不完整")
             backup_ids = [int(item["message_id"]) for item in backup_result]
-            for position, (stored_message_id, prepared_item) in enumerate(
-                zip(backup_ids, prepared_items)
-            ):
-                source_caption = str(getattr(prepared_item[0], "caption", "") or "").strip()
-                if position == 0 or source_caption:
-                    await set_storage_message_caption(
-                        backup_channel_id,
-                        stored_message_id,
-                        folder_storage_caption(category) if position == 0 else "",
-                    )
+            await queue_storage_message_caption(
+                backup_channel_id, backup_ids[0], folder_storage_caption(category)
+            )
         except Exception as exc:
             backup_error = exc
             backup_failed = len(prepared_items)
@@ -5727,6 +5739,7 @@ async def main():
     app_started = False
     runner = None
     backup_retry_task = None
+    scanner_caption_task = None
     try:
         # Keep database initialization inside the cleanup scope. A migration
         # error must not leave AsyncConnectionPool worker tasks behind.
@@ -5824,6 +5837,8 @@ async def main():
         backup_retry_task = asyncio.create_task(backup_retry_worker(app))
         backup_worker_running = True
         log.info("Durable backup retry worker started")
+        scanner_caption_task = asyncio.create_task(scanner_caption_worker())
+        log.info("Durable scanner caption worker started")
 
         runner = web.AppRunner(create_catalog_app(db, lambda: BOT_USERNAME))
         await runner.setup()
@@ -5836,6 +5851,14 @@ async def main():
         # Each resource is closed independently so one cleanup failure cannot
         # prevent the PostgreSQL pool from being closed.
         backup_worker_running = False
+        if scanner_caption_task is not None:
+            scanner_caption_task.cancel()
+            try:
+                await scanner_caption_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("Scanner caption worker stopped with an error")
         if backup_retry_task is not None:
             backup_retry_task.cancel()
             try:
