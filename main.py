@@ -1701,12 +1701,18 @@ async def _flush_album_upload(client, key):
                 f"主频道整组复制不完整（预期 {len(prepared_items)} 条），整组未入库"
             )
         primary_ids = [int(item["message_id"]) for item in primary_result]
-        for position, stored_message_id in enumerate(primary_ids):
-            await set_storage_message_caption(
-                primary_channel_id,
-                stored_message_id,
-                folder_storage_caption(category) if position == 0 else "",
-            )
+        for position, (stored_message_id, prepared_item) in enumerate(
+            zip(primary_ids, prepared_items)
+        ):
+            # The first album item carries the folder tag. Only clear later
+            # captions when the source actually had text; skip needless API calls.
+            source_caption = str(getattr(prepared_item[0], "caption", "") or "").strip()
+            if position == 0 or source_caption:
+                await set_storage_message_caption(
+                    primary_channel_id,
+                    stored_message_id,
+                    folder_storage_caption(category) if position == 0 else "",
+                )
 
         backup_ids = [0] * len(prepared_items)
         backup_error = None
@@ -1719,12 +1725,16 @@ async def _flush_album_upload(client, key):
             if not isinstance(backup_result, list) or len(backup_result) != len(prepared_items):
                 raise RuntimeError("备份频道整组复制返回数量不完整")
             backup_ids = [int(item["message_id"]) for item in backup_result]
-            for position, stored_message_id in enumerate(backup_ids):
-                await set_storage_message_caption(
-                    backup_channel_id,
-                    stored_message_id,
-                    folder_storage_caption(category) if position == 0 else "",
-                )
+            for position, (stored_message_id, prepared_item) in enumerate(
+                zip(backup_ids, prepared_items)
+            ):
+                source_caption = str(getattr(prepared_item[0], "caption", "") or "").strip()
+                if position == 0 or source_caption:
+                    await set_storage_message_caption(
+                        backup_channel_id,
+                        stored_message_id,
+                        folder_storage_caption(category) if position == 0 else "",
+                    )
         except Exception as exc:
             backup_error = exc
             backup_failed = len(prepared_items)
