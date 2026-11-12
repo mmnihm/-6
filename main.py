@@ -1823,9 +1823,8 @@ async def _flush_album_upload(client, key):
         if status is not None:
             try:
                 if "相册中存在已入库的重复文件" in str(exc):
-                    await status.edit_text(
-                        "⚠️ 这组相册包含已保存的文件，本次未重复入库。请检查后再上传。"
-                    )
+                    # Duplicate album: skip silently; do not expose internal dedupe details to users.
+                    await status.delete()
                 else:
                     await status.edit_text(
                         "❌ 相册处理失败，本组未能完整入库。请稍后重试或联系管理员。"
