@@ -372,6 +372,21 @@ async def telegram_bot_api(method: str, payload: dict, timeout=None):
 
         raise RuntimeError(f"Telegram {method} failed ({error_code}): {description}")
 
+
+def folder_storage_caption(category: str) -> str:
+    name = " ".join(str(category or "").strip().lstrip("#").split())
+    return "#" + name.replace(" ", "_") if name else "#未分类"
+
+
+async def set_storage_message_caption(chat_id: int, message_id: int, category: str):
+    return await telegram_bot_api("editMessageCaption", {
+        "chat_id": int(chat_id),
+        "message_id": int(message_id),
+        "caption": folder_storage_caption(category),
+        "caption_entities": [],
+    })
+
+
 app = Client(
     "member_cloud_bot",
     api_id=config.API_ID,
@@ -1686,6 +1701,10 @@ async def _flush_album_upload(client, key):
                 f"主频道整组复制不完整（预期 {len(prepared_items)} 条），整组未入库"
             )
         primary_ids = [int(item["message_id"]) for item in primary_result]
+        for stored_message_id in primary_ids:
+            await set_storage_message_caption(
+                primary_channel_id, stored_message_id, category
+            )
 
         backup_ids = [0] * len(prepared_items)
         backup_error = None
@@ -1698,6 +1717,10 @@ async def _flush_album_upload(client, key):
             if not isinstance(backup_result, list) or len(backup_result) != len(prepared_items):
                 raise RuntimeError("备份频道整组复制返回数量不完整")
             backup_ids = [int(item["message_id"]) for item in backup_result]
+            for stored_message_id in backup_ids:
+                await set_storage_message_caption(
+                    backup_channel_id, stored_message_id, category
+                )
         except Exception as exc:
             backup_error = exc
             backup_failed = len(prepared_items)
@@ -2749,6 +2772,8 @@ async def _upload_single_handler(client, message):
             "chat_id": primary_channel_id,
             "from_chat_id": message.chat.id,
             "message_id": message.id,
+            "caption": folder_storage_caption(category),
+            "caption_entities": [],
         })
         primary_id = int(primary["message_id"])
 
@@ -2759,6 +2784,8 @@ async def _upload_single_handler(client, message):
                 "chat_id": backup_channel_id,
                 "from_chat_id": message.chat.id,
                 "message_id": message.id,
+                "caption": folder_storage_caption(category),
+                "caption_entities": [],
             })
             backup_id = int(backup["message_id"])
         except Exception as exc:
