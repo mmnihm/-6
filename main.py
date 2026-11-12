@@ -2810,10 +2810,11 @@ async def _upload_single_handler(client, message):
             "chat_id": primary_channel_id,
             "from_chat_id": message.chat.id,
             "message_id": message.id,
-            "caption": folder_storage_caption(category),
-            "caption_entities": [],
         })
         primary_id = int(primary["message_id"])
+        await queue_storage_message_caption(
+            primary_channel_id, primary_id, folder_storage_caption(category)
+        )
 
         step = "保存备用存储"
         backup_error = None
@@ -2822,10 +2823,11 @@ async def _upload_single_handler(client, message):
                 "chat_id": backup_channel_id,
                 "from_chat_id": message.chat.id,
                 "message_id": message.id,
-                "caption": folder_storage_caption(category),
-                "caption_entities": [],
             })
             backup_id = int(backup["message_id"])
+            await queue_storage_message_caption(
+                backup_channel_id, backup_id, folder_storage_caption(category)
+            )
         except Exception as exc:
             backup_error = exc
             log.exception("Backup-channel copy failed; keeping primary copy")
