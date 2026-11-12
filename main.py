@@ -61,6 +61,10 @@ category_delivery_in_progress = set()
 last_getfolder_click_at = {}  # Per-user 5-second resource button cooldown
 file_open_in_progress = set()
 bot_admin_status_cache = {}
+# Ordinary members may browse and retrieve, but uploads belong to admins only.
+# The notice is throttled so a burst of files cannot flood the chat.
+member_upload_notice_at = {}
+UPLOAD_NOTICE_INTERVAL = 60.0
 search_sessions = {}
 
 # One shared gate for all metadata reads made by the user-account scanner.
@@ -457,10 +461,11 @@ async def mark_callback_activity(client, query):
 
 WELCOME = (
     "☁️ 会员文件网盘\n\n"
-    "• 发送文件：自动保存到主频道和备份频道\n"
-    "• 分享文件：使用机器人生成的分享链接\n"
-    "• 取回文件：打开分享链接即可\n\n"
-    "仅会员群成员及管理员可以使用。"
+    "• 浏览目录：按文件夹挑选需要的资源\n"
+    "• 一键领取：整批发送到你的私聊\n"
+    "• 收藏资源：把常用的文件加入收藏\n\n"
+    "仅会员群成员及管理员可以领取。\n"
+    "上传资源仅限管理员。"
 )
 
 
@@ -1943,7 +1948,31 @@ async def _flush_album_upload(client, key):
             except Exception:
                 log.exception("Could not report album upload failure")
 
+async def reject_member_upload(message):
+    """Tell an ordinary member once that uploading is admin-only, then stay quiet."""
+    user = message.from_user
+    uid = int(user.id) if user else 0
+    now = asyncio.get_running_loop().time()
+    if now - float(member_upload_notice_at.get(uid, 0.0)) < UPLOAD_NOTICE_INTERVAL:
+        return
+    member_upload_notice_at[uid] = now
+    if len(member_upload_notice_at) > 5000:
+        member_upload_notice_at.clear()
+    try:
+        await message.reply_text(
+            "⚠️ 目前只有管理员可以上传资源。\n"
+            "你可以在目录里直接挑选并领取需要的文件。"
+        )
+    except Exception:
+        log.exception("Could not send member upload notice: user=%s", uid)
+
+
 async def upload_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        # Members retrieve resources; they must not add files to the library.
+        await reject_member_upload(message)
+        return
     group_id = getattr(message, "media_group_id", None)
     if not group_id:
         user = message.from_user
