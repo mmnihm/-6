@@ -51,6 +51,36 @@ def iso_now():
     return utc_now().isoformat()
 
 
+def clean_file_name(value):
+    """Remove obvious promotional/contact fragments without touching the media itself."""
+    name = str(value or "").replace("\\u200b", "").replace("\\ufeff", "").strip()
+    if not name:
+        return "未命名资源"
+
+    # Remove Telegram handles and common public contact/invite URLs.
+    name = re.sub(r"(?i)(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/[^\\s]+", " ", name)
+    name = re.sub(r"(?i)www\\.[^\\s]+|https?://[^\\s]+", " ", name)
+    name = re.sub(r"(?<![\\w])@[a-z][a-z0-9_]{3,}(?![\\w])", " ", name)
+
+    # Remove clear advertising / solicitation phrases, including the trailing
+    # contact text commonly appended after a real resource title.
+    promo = re.compile(
+        r"(?i)(?:加群|进群|入群|私聊|联系(?:我|客服)?|商务合作|广告合作|推广|招代理|代理加盟|"
+        r"扫码(?:联系|加群)?|点击(?:链接|下方)|关注(?:频道|账号)?|订阅频道|"
+        r"更多资源|资源群|交流群|官方群|客服(?:号|微信|telegram)?|"
+        r"微信|威信|电报号|飞机号|频道号)"
+    )
+    match = promo.search(name)
+    if match:
+        name = name[:match.start()] + " "
+
+    # Trim separators left behind by removed ad fragments.
+    name = re.sub(r"[\\s:：|｜,，;；、~～·•_-]+$", "", name)
+    name = re.sub(r"^[\\s:：|｜,，;；、~～·•_-]+", "", name)
+    name = re.sub(r"\\s{2,}", " ", name).strip()
+    return name[:300] if name else "未命名资源"
+
+
 class PostgresCompat:
     """Small async adapter for the SQLite-style calls used by this project."""
 
@@ -536,6 +566,36 @@ class Database:
                 await db.execute(
                     "INSERT INTO settings(key, value) VALUES('category_size_stats_v1', 'completed')"
                 )
+            # One-time cleanup of obvious promotional fragments in stored display names.
+            # This only changes database labels; Telegram media/messages and file keys stay intact.
+            name_cleanup = await (await db.execute(
+                "SELECT value FROM settings WHERE key='filename_ad_cleanup_v1'"
+            )).fetchone()
+            if not name_cleanup:
+                for table, key_columns in (
+                    ("files", ("file_key",)),
+                    ("scanner_messages", ("channel_id", "message_id")),
+                    ("upload_batch_items", ("file_key",)),
+                    ("backup_retry_failures", ("file_key",)),
+                ):
+                    rows = await (await db.execute(
+                        f"SELECT {', '.join(key_columns)}, file_name FROM {table}"
+                    )).fetchall()
+                    updates = []
+                    for row in rows:
+                        cleaned = clean_file_name(row["file_name"])
+                        if cleaned != row["file_name"]:
+                            updates.append((cleaned, *(row[column] for column in key_columns)))
+                    if updates:
+                        where = " AND ".join(f"{column}=?" for column in key_columns)
+                        await db.executemany(
+                            f"UPDATE {table} SET file_name=? WHERE {where}", updates
+                        )
+                        log.info("Cleaned promotional fragments from %s stored names: %s", table, len(updates))
+                await db.execute(
+                    "INSERT INTO settings(key, value) VALUES('filename_ad_cleanup_v1', 'completed')"
+                )
+
             await db.commit()
 
         if self.uses_postgres:
