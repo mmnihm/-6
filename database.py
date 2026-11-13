@@ -2748,6 +2748,79 @@ class Database:
             """, (since, int(limit)))).fetchall()
             return dict(totals or {}), [dict(row) for row in top]
 
+
+    async def list_delivery_audit_details(self, limit=20):
+        """Return the newest individual delivery audit rows."""
+        limit = max(1, min(50, int(limit)))
+        async with self.connect() as db:
+            rows = await (await db.execute("""
+                SELECT a.created_at, a.user_id, a.file_key,
+                       COALESCE(f.file_name, a.file_key) AS file_name,
+                       a.category, a.media_type, a.status,
+                       a.source_chat_id, a.source_message_id,
+                       a.delivery_method, a.error_text
+                FROM delivery_audit a
+                LEFT JOIN files f ON f.file_key=a.file_key
+                ORDER BY a.created_at DESC, a.audit_id DESC
+                LIMIT ?
+            """, (limit,))).fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_delivery_audit_before(self, ban_time, hours=24, limit=10):
+        """Summarize deliveries in the window immediately before a supplied ban time."""
+        hours = max(1, min(168, int(hours)))
+        start_time = (ban_time - timedelta(hours=hours)).isoformat()
+        end_time = ban_time.isoformat()
+        async with self.connect() as db:
+            totals = await (await db.execute("""
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success,
+                       SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+                       SUM(CASE WHEN status='attempted' THEN 1 ELSE 0 END) AS pending,
+                       COUNT(DISTINCT user_id) AS users
+                FROM delivery_audit
+                WHERE created_at>=? AND created_at<?
+            """, (start_time, end_time))).fetchone()
+            resources = await (await db.execute("""
+                SELECT a.file_key,
+                       COALESCE(MAX(f.file_name), a.file_key) AS file_name,
+                       COALESCE(MAX(a.category), '') AS category,
+                       COUNT(*) AS sends,
+                       COUNT(DISTINCT a.user_id) AS users,
+                       MAX(a.created_at) AS last_sent
+                FROM delivery_audit a
+                LEFT JOIN files f ON f.file_key=a.file_key
+                WHERE a.created_at>=? AND a.created_at<?
+                GROUP BY a.file_key
+                ORDER BY sends DESC, last_sent DESC
+                LIMIT ?
+            """, (start_time, end_time, max(1, min(20, int(limit)))))).fetchall()
+            recipients = await (await db.execute("""
+                SELECT user_id, COUNT(*) AS sends,
+                       COUNT(DISTINCT file_key) AS resources,
+                       MAX(created_at) AS last_sent
+                FROM delivery_audit
+                WHERE created_at>=? AND created_at<?
+                GROUP BY user_id
+                ORDER BY sends DESC, last_sent DESC
+                LIMIT 20
+            """, (start_time, end_time))).fetchall()
+            latest = await (await db.execute("""
+                SELECT created_at, user_id, file_key,
+                       COALESCE(f.file_name, a.file_key) AS file_name,
+                       COALESCE(a.category, '') AS category,
+                       a.status, a.source_chat_id, a.source_message_id
+                FROM delivery_audit a
+                LEFT JOIN files f ON f.file_key=a.file_key
+                WHERE a.created_at>=? AND a.created_at<?
+                ORDER BY a.created_at DESC
+                LIMIT 1
+            """, (start_time, end_time))).fetchone()
+            return (dict(totals or {}),
+                    [dict(row) for row in resources],
+                    [dict(row) for row in recipients],
+                    dict(latest) if latest else None)
+
     async def record_history_batch(self, user_id, file_keys):
         keys = list(dict.fromkeys(str(key) for key in file_keys))
         if not keys:
