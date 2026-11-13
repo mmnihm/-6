@@ -4030,6 +4030,149 @@ async def delivery_audit_handler(client, message):
         await message.reply_text("⚠️ 审计报告暂时无法读取，请检查数据库初始化和部署日志。")
 
 
+
+
+@app.on_message(filters.private & filters.command("auditdetail"))
+async def delivery_audit_detail_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    try:
+        parts = (message.text or "").split()
+        limit = int(parts[1]) if len(parts) > 1 else 20
+        limit = max(1, min(50, limit))
+        rows = await db.list_delivery_audit_details(limit=limit)
+        if not rows:
+            await message.reply_text("暂无逐条发送记录。部署审计版本后产生的发送才会记录。")
+            return
+        lines = [f"🧾 最近 {len(rows)} 条资源发送明细（最多50条）"]
+        for row in rows:
+            stamp = str(row.get("created_at") or "").replace("T", " ")
+            name = str(row.get("file_name") or row.get("file_key") or "未知资源")[:65]
+            category = str(row.get("category") or "未分类")[:30]
+            status = {"success": "成功", "failed": "失败", "attempted": "未完成"}.get(
+                str(row.get("status")), str(row.get("status") or "未知")
+            )
+            source = ""
+            if row.get("source_chat_id") is not None or row.get("source_message_id") is not None:
+                source = f"\n来源：{row.get('source_chat_id') or '-'} / 消息 {row.get('source_message_id') or '-'}"
+            lines.append(
+                f"\n⏱ {stamp}\n📄 {name}\n📁 {category}"
+                f"\n接收用户：{row.get('user_id')}｜结果：{status}{source}"
+            )
+        # Keep Telegram messages below its practical text-size limit.
+        chunks, current = [], ""
+        for line in lines:
+            if len(current) + len(line) > 3500:
+                chunks.append(current)
+                current = ""
+            current += line + "\n"
+        if current:
+            chunks.append(current)
+        for chunk in chunks:
+            await message.reply_text(chunk)
+    except (ValueError, IndexError):
+        await message.reply_text("格式：/auditdetail 或 /auditdetail 50（最多50条）")
+    except Exception:
+        log.exception("Could not generate delivery audit detail report")
+        await message.reply_text("⚠️ 发送明细暂时无法读取，请检查数据库和部署日志。")
+
+
+@app.on_message(filters.private & filters.command("auditban"))
+async def delivery_audit_ban_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.reply_text(
+            "请填写 Telegram 封禁发生时间（必须带时区），例如：\n"
+            "/auditban 2026-11-13T02:00:00+09:00\n"
+            "默认分析封禁前24小时；也可指定小时数：\n"
+            "/auditban 2026-11-13T02:00:00+09:00 6"
+        )
+        return
+    try:
+        ban_time = datetime.fromisoformat(parts[1])
+        if ban_time.tzinfo is None or ban_time.utcoffset() is None:
+            raise ValueError("timezone required")
+        hours = int(parts[2]) if len(parts) > 2 else 24
+        if hours < 1 or hours > 168:
+            raise ValueError("hours out of range")
+        totals, resources, recipients, latest = await db.get_delivery_audit_before(
+            ban_time.astimezone(timezone.utc), hours=hours, limit=10
+        )
+        start_time = (ban_time - timedelta(hours=hours)).isoformat()
+        total = int(totals.get("total") or 0)
+        lines = [
+            f"🛡 封禁时间关联分析（前 {hours} 小时）",
+            f"封禁时间：{ban_time.isoformat()}",
+            f"分析区间：{start_time} 至 {ban_time.isoformat()}",
+            f"发送记录：{total}｜成功：{int(totals.get('success') or 0)}"
+            f"｜失败：{int(totals.get('failed') or 0)}｜未完成：{int(totals.get('pending') or 0)}",
+            f"涉及接收用户：{int(totals.get('users') or 0)} 人",
+            "",
+            "🔎 高频资源（最多10项）",
+        ]
+        if resources:
+            for index, row in enumerate(resources, 1):
+                lines.append(
+                    f"{index}. {str(row.get('file_name') or row.get('file_key') or '未知资源')[:55]}"
+                    f"\n目录：{str(row.get('category') or '未分类')[:30]}"
+                    f"｜发送 {int(row.get('sends') or 0)} 次"
+                    f"｜用户 {int(row.get('users') or 0)}"
+                    f"\n最后发送：{row.get('last_sent')}"
+                )
+        else:
+            lines.append("该时间段没有审计记录。")
+        lines.extend(["", "👥 接收用户（最多20人）"])
+        if recipients:
+            for row in recipients:
+                lines.append(
+                    f"用户 {row.get('user_id')}：{int(row.get('sends') or 0)} 次"
+                    f"｜{int(row.get('resources') or 0)} 项资源"
+                    f"｜最后发送 {row.get('last_sent')}"
+                )
+        else:
+            lines.append("无记录。")
+        if latest:
+            lines.extend([
+                "",
+                "🕒 封禁前最后一笔发送",
+                f"时间：{latest.get('created_at')}",
+                f"资源：{latest.get('file_name')}",
+                f"用户：{latest.get('user_id')}｜结果：{latest.get('status')}",
+                f"来源消息：{latest.get('source_chat_id')} / {latest.get('source_message_id')}",
+            ])
+        lines.extend([
+            "",
+            "注意：这是发送时间与封禁时间的统计关联，不代表这些资源或用户导致封禁。Telegram 不向机器人开放官方封禁原因。"
+        ])
+        report = "\n".join(lines)
+        if len(report) <= 3900:
+            await message.reply_text(report)
+        else:
+            # Split long reports without losing any rows.
+            chunk = ""
+            for line in lines:
+                if len(chunk) + len(line) > 3500:
+                    await message.reply_text(chunk)
+                    chunk = ""
+                chunk += line + "\n"
+            if chunk:
+                await message.reply_text(chunk)
+    except (ValueError, TypeError):
+        await message.reply_text(
+            "时间格式不正确。请使用带时区的 ISO 时间，例如：\n"
+            "/auditban 2026-11-13T02:00:00+09:00 24"
+        )
+    except Exception:
+        log.exception("Could not generate ban-time delivery audit report")
+        await message.reply_text("⚠️ 封禁关联报告暂时无法读取，请检查数据库和部署日志。")
+
+
 @app.on_message(filters.private & filters.command("catalogreset"))
 async def catalog_reset_prompt_handler(client, message):
     user = message.from_user
