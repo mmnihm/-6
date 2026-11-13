@@ -63,7 +63,17 @@ file_open_in_progress = set()
 bot_admin_status_cache = {}
 # Ordinary members may browse and retrieve; their uploads are ignored silently.
 search_sessions = {}
-pending_search_users = set()
+class PendingSearchUsers(set):
+    """Set-backed search state with compatibility for legacy dict-style writes."""
+
+    def __setitem__(self, user_id, enabled):
+        if enabled:
+            self.add(int(user_id))
+        else:
+            self.discard(int(user_id))
+
+
+pending_search_users = PendingSearchUsers()
 
 # One shared gate for all metadata reads made by the user-account scanner.
 # Telegram's channels.getMessages is especially sensitive to bursts of album lookups.
