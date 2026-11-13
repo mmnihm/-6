@@ -63,6 +63,7 @@ file_open_in_progress = set()
 bot_admin_status_cache = {}
 # Ordinary members may browse and retrieve; their uploads are ignored silently.
 search_sessions = {}
+pending_search_users = set()
 
 # One shared gate for all metadata reads made by the user-account scanner.
 # Telegram's channels.getMessages is especially sensitive to bursts of album lookups.
@@ -4113,6 +4114,25 @@ async def build_favorites_view(user_id):
     return "\n".join(sections), InlineKeyboardMarkup(rows)
 
 
+async def send_catalog_search_results(message, query_text):
+    query_text = str(query_text or "").strip()[:80]
+    if not query_text:
+        await message.reply_text("请输入要搜索的关键词。")
+        return
+    records, _, total = await db.public_catalog(query=query_text, limit=12, offset=0)
+    body = (
+        f"🔎 搜索结果：{query_text}\n"
+        f"📦 找到 {total} 个相关资源\n\n"
+        + ("\n".join(
+            f"{index}. {row['file_name'][:48]}\n   📁 {row['category']}"
+            for index, row in enumerate(records, 1)
+        ) if records else "暂时没有找到匹配资源。")
+    )
+    if total > len(records):
+        body += f"\n\n当前显示前 {len(records)} 条，请缩短关键词进一步筛选。"
+    await message.reply_text(body)
+
+
 @app.on_message(filters.private & filters.command("search"))
 async def catalog_search_handler(client, message):
     user = message.from_user
@@ -4120,29 +4140,27 @@ async def catalog_search_handler(client, message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await message.reply_text("请输入搜索关键词，例如：/search 电影")
+        pending_search_users.add(int(user.id))
+        await message.reply_text(
+            "🔎 资源搜索\n\n"
+            "请直接发送你要查找的资源名称、关键词或编号。\n"
+            "例如：电影、写真、视频编号\n\n"
+            "无需输入 /search，直接发送文字即可。"
+        )
         return
-    query_text = parts[1].strip()[:80]
-    token = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]
-    if len(search_sessions) >= 500:
-        search_sessions.pop(next(iter(search_sessions)))
-    search_sessions[token] = {"user_id": int(user.id), "query": query_text}
-    records, _, total = await db.public_catalog(query=query_text, limit=12, offset=0)
-    buttons = [[InlineKeyboardButton(
-        f"📄 {row['file_name'][:32]}",
-        callback_data=f"uc:open:{row['file_key']}",
-    )] for row in records]
-    if total > 12:
-        buttons.append([InlineKeyboardButton(
-            "下一页 ➡️", callback_data=f"uc:searchpage:{token}:12"
-        )])
-    buttons.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
-    await message.reply_text(
-        f"🔎 搜索：{query_text}\n共找到 {total} 个资源（最多每页12个）\n\n"
-        + ("\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
-           if records else "没有找到匹配资源。"),
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    await send_catalog_search_results(message, parts[1].strip())
+
+
+@app.on_message(filters.private & filters.text & ~filters.regex(r"^/"), group=-2)
+async def catalog_search_text_handler(client, message):
+    user = message.from_user
+    if not user:
+        return
+    user_id = int(user.id)
+    if user_id not in pending_search_users:
+        return
+    pending_search_users.discard(user_id)
+    await send_catalog_search_results(message, message.text)
 
 
 @app.on_callback_query(filters.regex(r"^uc:"))
@@ -4297,8 +4315,12 @@ async def user_catalog_callback_handler(client, query):
 
     if action[1] == "search":
         await query.answer()
+        pending_search_users[int(user.id)] = True
         await message.reply_text(
-            "🔎 资源搜索\\n\\n请发送：/search 关键词\\n例如：/search 电影"
+            "🔎 资源搜索\n\n"
+            "请直接发送你要查找的资源名称、关键词或编号。\n"
+            "例如：电影、写真、视频编号\n\n"
+            "无需输入 /search，直接发送文字即可。"
         )
         return
 
