@@ -4143,11 +4143,11 @@ async def build_catalog_search_page(user_id, query_text, offset=0, token=None):
     )
     buttons = []
     for row in records:
-        file_key = str(row.get("file_key") or "")
+        file_key = str(row["file_key"] or "")
         if not file_key:
             continue
-        name = str(row.get("file_name") or "未命名资源")
-        category = str(row.get("category") or "未分类")
+        name = str(row["file_name"] or "未命名资源")
+        category = str(row["category"] or "未分类")
         buttons.append([InlineKeyboardButton(
             f"📄 {name[:38]}",
             callback_data=f"uc:open:{file_key}",
@@ -4170,8 +4170,8 @@ async def build_catalog_search_page(user_id, query_text, offset=0, token=None):
 
     if records:
         lines = [
-            f"{offset + index}. {str(row.get('file_name') or '未命名资源')[:48]}",
-            f"   📁 {str(row.get('category') or '未分类')[:40]}",
+            f"{offset + index}. {str(row['file_name'] or '未命名资源')[:48]}",
+            f"   📁 {str(row['category'] or '未分类')[:40]}",
         ]
         body_rows = ["\n".join(lines) for index, row in enumerate(records, 1)]
         result_text = "\n\n".join(body_rows)
