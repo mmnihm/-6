@@ -4169,11 +4169,13 @@ async def build_catalog_search_page(user_id, query_text, offset=0, token=None):
     buttons.append([InlineKeyboardButton("🏠 返回首页", callback_data="uc:home")])
 
     if records:
-        lines = [
-            f"{offset + index}. {str(row['file_name'] or '未命名资源')[:48]}",
-            f"   📁 {str(row['category'] or '未分类')[:40]}",
+        body_rows = [
+            "\n".join([
+                f"{offset + index}. {str(row['file_name'] or '未命名资源')[:48]}",
+                f"   📁 {str(row['category'] or '未分类')[:40]}",
+            ])
+            for index, row in enumerate(records, 1)
         ]
-        body_rows = ["\n".join(lines) for index, row in enumerate(records, 1)]
         result_text = "\n\n".join(body_rows)
     else:
         result_text = "暂时没有找到匹配资源。"
