@@ -413,6 +413,30 @@ class Database:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(user_id, file_key, share_key)
             );
+            CREATE TABLE IF NOT EXISTS delivery_audit (
+                audit_id TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                share_key TEXT NOT NULL DEFAULT '',
+                file_key TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT '',
+                media_type TEXT NOT NULL DEFAULT '',
+                album_group_id TEXT NOT NULL DEFAULT '',
+                source_chat_id BIGINT,
+                source_message_id BIGINT,
+                delivery_method TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'attempted',
+                telegram_message_id BIGINT,
+                error_text TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                finished_at TEXT,
+                PRIMARY KEY(audit_id, file_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_delivery_audit_created
+                ON delivery_audit(created_at);
+            CREATE INDEX IF NOT EXISTS idx_delivery_audit_file
+                ON delivery_audit(file_key, created_at);
+            CREATE INDEX IF NOT EXISTS idx_delivery_audit_user
+                ON delivery_audit(user_id, created_at);
             CREATE TABLE IF NOT EXISTS pending_deletions (
                 chat_id BIGINT NOT NULL,
                 message_id BIGINT NOT NULL,
@@ -2637,6 +2661,89 @@ class Database:
                     accessed_at=excluded.accessed_at
             """, (user_id, file_key, iso_now()))
             await db.commit()
+
+    async def record_delivery_audit_batch(self, audit_id, user_id, share_key, entries):
+        """Persist one attempted-delivery row per resource in a single batch."""
+        rows = []
+        created_at = iso_now()
+        for item in entries:
+            file_key = str(item.get("file_key") or "")
+            if not file_key:
+                continue
+            rows.append((
+                str(audit_id), int(user_id), str(share_key or ""), file_key,
+                str(item.get("category") or "")[:120],
+                str(item.get("media_type") or "")[:40],
+                str(item.get("album_group_id") or "")[:120],
+                int(item["source_chat_id"]) if item.get("source_chat_id") is not None else None,
+                int(item["source_message_id"]) if item.get("source_message_id") is not None else None,
+                str(item.get("delivery_method") or "")[:40],
+                "attempted", None, "", created_at, None,
+            ))
+        if not rows:
+            return
+        async with self.connect() as db:
+            await db.executemany("""
+                INSERT INTO delivery_audit(
+                    audit_id, user_id, share_key, file_key, category, media_type,
+                    album_group_id, source_chat_id, source_message_id,
+                    delivery_method, status, telegram_message_id, error_text,
+                    created_at, finished_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(audit_id, file_key) DO NOTHING
+            """, rows)
+            await db.commit()
+
+    async def finish_delivery_audit(self, audit_id, status, message_ids=None, error=""):
+        """Finalize every resource row for one delivery unit."""
+        ids = list(message_ids or [])
+        async with self.connect() as db:
+            rows = await (await db.execute(
+                "SELECT file_key FROM delivery_audit WHERE audit_id=?",
+                (str(audit_id),),
+            )).fetchall()
+            now = iso_now()
+            updates = []
+            for index, row in enumerate(rows):
+                message_id = int(ids[index]) if index < len(ids) and ids[index] else None
+                updates.append((
+                    str(status), message_id, str(error or "")[:300], now,
+                    str(audit_id), str(row["file_key"]),
+                ))
+            if updates:
+                await db.executemany("""
+                    UPDATE delivery_audit
+                    SET status=?, telegram_message_id=?, error_text=?, finished_at=?
+                    WHERE audit_id=? AND file_key=?
+                """, updates)
+            await db.commit()
+
+    async def get_delivery_audit_summary(self, hours=24, limit=10):
+        """Return recent delivery totals and resources most frequently delivered."""
+        since = (utc_now() - timedelta(hours=max(1, int(hours)))).isoformat()
+        async with self.connect() as db:
+            totals = await (await db.execute("""
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success,
+                       SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+                       SUM(CASE WHEN status='attempted' THEN 1 ELSE 0 END) AS pending
+                FROM delivery_audit WHERE created_at>=?
+            """, (since,))).fetchone()
+            top = await (await db.execute("""
+                SELECT a.file_key, COALESCE(MAX(f.file_name), a.file_key) AS file_name,
+                       COALESCE(MAX(a.category), '') AS category,
+                       COUNT(*) AS sends,
+                       COUNT(DISTINCT a.user_id) AS users,
+                       SUM(CASE WHEN a.status='failed' THEN 1 ELSE 0 END) AS failures,
+                       MAX(a.created_at) AS last_sent
+                FROM delivery_audit a
+                LEFT JOIN files f ON f.file_key=a.file_key
+                WHERE a.created_at>=? AND a.status IN ('success','failed')
+                GROUP BY a.file_key
+                ORDER BY sends DESC, failures DESC, last_sent DESC
+                LIMIT ?
+            """, (since, int(limit)))).fetchall()
+            return dict(totals or {}), [dict(row) for row in top]
 
     async def record_history_batch(self, user_id, file_keys):
         keys = list(dict.fromkeys(str(key) for key in file_keys))
