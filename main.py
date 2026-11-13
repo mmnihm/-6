@@ -4227,8 +4227,29 @@ async def catalog_search_text_handler(client, message):
     user_id = int(user.id)
     if user_id not in pending_search_users:
         return
-    pending_search_users.discard(user_id)
-    await send_catalog_search_results(message, message.text)
+
+    query_text = str(message.text or "").strip()
+    log.info(
+        "Catalog search input received: user=%s chars=%s",
+        user_id, len(query_text),
+    )
+    if not query_text:
+        await message.reply_text("请输入要搜索的关键词。")
+        return
+
+    try:
+        await send_catalog_search_results(message, query_text)
+        pending_search_users.discard(user_id)
+    except Exception as exc:
+        # Keep the pending state so the user can retry without reopening search.
+        log.exception("Catalog search failed for user %s", user_id)
+        try:
+            await message.reply_text(
+                "⚠️ 搜索暂时失败，资源数据没有被修改。请稍后重新发送关键词；"
+                "如果连续失败，请联系管理员检查运行日志。"
+            )
+        except Exception:
+            log.exception("Could not send catalog search error notice to user %s", user_id)
 
 
 @app.on_callback_query(filters.regex(r"^uc:"))
