@@ -165,6 +165,29 @@ async def get_upload_status_message(message, user_id, text):
     return status
 
 
+background_tasks = set()
+
+
+def spawn_background(name, coro):
+    """Run a fire-and-forget task while keeping a reference and logging crashes."""
+    task = asyncio.create_task(coro, name=name)
+    background_tasks.add(task)
+
+    def _finished(completed):
+        background_tasks.discard(completed)
+        if completed.cancelled():
+            return
+        error = completed.exception()
+        if error:
+            log.error(
+                "Background task crashed: name=%s error=%r",
+                name, error, exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(_finished)
+    return task
+
+
 def track_upload_task(user_id, task):
     uid = int(user_id)
     tasks = pending_upload_tasks.setdefault(uid, set())
@@ -1281,7 +1304,93 @@ async def schedule_member_delivery_delete(client, chat_id, message_ids):
         await db.add_pending_deletions(chat_id, ids, delete_at)
     except Exception:
         log.exception("Could not persist pending deletion: chat=%s", chat_id)
-    asyncio.create_task(_delete_later(client, chat_id, ids, delete_at))
+    spawn_background("delivery-delete", _delete_later(client, chat_id, ids, delete_at))
+
+
+async def startup_self_check(client):
+    """One startup pass over the things that silently break resource delivery."""
+    problems = []
+    try:
+        await db.get_setting("storage_primary_channel_id")
+    except Exception:
+        log.exception("Self-check: database is unreachable")
+        log.error("Self-check: database unreachable; skipping the remaining checks")
+        return ["数据库连接失败"]
+
+    primary_id, backup_id = await get_storage_channels()
+    if not primary_id:
+        problems.append("主存储频道未绑定")
+    if not backup_id:
+        problems.append("备用存储未绑定")
+    if primary_id and backup_id and int(primary_id) == int(backup_id):
+        problems.append("主存储与备用存储是同一个频道")
+
+    bot_id = BOT_ID
+    if not bot_id:
+        try:
+            bot_id = (await app.get_me()).id
+        except Exception:
+            bot_id = 0
+    for label, chat_id in (("主存储", primary_id), ("备用存储", backup_id)):
+        if not chat_id or not bot_id:
+            continue
+        try:
+            member = await telegram_bot_api(
+                "getChatMember", {"chat_id": int(chat_id), "user_id": int(bot_id)},
+            )
+            status = str(member.get("status", ""))
+            if status not in ("administrator", "creator"):
+                problems.append(f"{label}频道里机器人不是管理员（当前状态：{status or '未知'}）")
+        except Exception as exc:
+            problems.append(f"无法检查{label}频道权限：{str(exc)[:120]}")
+
+    group_id = await get_member_group_id()
+    if not group_id:
+        problems.append("会员群未绑定（会员校验会全部失败）")
+    elif bot_id:
+        try:
+            member = await telegram_bot_api(
+                "getChatMember",
+                {"chat_id": int(group_id), "user_id": int(bot_id)},
+            )
+            status = str(member.get("status", ""))
+            if status not in ("administrator", "creator"):
+                problems.append(f"会员群里机器人不是管理员（当前状态：{status or '未知'}），会员校验会失败")
+        except Exception as exc:
+            problems.append(f"无法检查会员群权限：{str(exc)[:120]}")
+
+    try:
+        session = await db.get_setting(SCANNER_SESSION_SETTING_KEY)
+        if session and (scanner is None or not scanner.is_connected):
+            problems.append("扫描账号已保存但当前未连接（重启后可能需要重新 /scanlogin）")
+    except Exception:
+        log.exception("Self-check: could not read scanner session state")
+
+    if problems:
+        log.warning("Self-check found %s problem(s): %s", len(problems), "；".join(problems))
+        try:
+            admin_ids = []
+            if config.ADMIN_ID:
+                admin_ids.append(int(config.ADMIN_ID))
+            stored = await db.get_admin_id()
+            if stored and int(stored) not in admin_ids:
+                admin_ids.append(int(stored))
+            body = "⚠️ 机器人启动自检发现问题\n\n" + "\n".join(
+                f"• {item}" for item in problems
+            ) + "\n\n资源领取、上传或会员校验可能受影响，请尽快处理。"
+            for admin_id in admin_ids:
+                try:
+                    await client.send_message(admin_id, body)
+                except Exception:
+                    log.exception("Self-check could not notify admin %s", admin_id)
+        except Exception:
+            log.exception("Self-check could not dispatch admin notice")
+    else:
+        log.info(
+            "Self-check passed: db=ok primary=%s backup=%s member_group=%s",
+            primary_id, backup_id, group_id,
+        )
+    return problems
 
 
 async def resume_pending_deletions(client):
@@ -1299,7 +1408,7 @@ async def resume_pending_deletions(client):
             int(row["message_id"])
         )
     for (chat_id, delete_at), ids in batched.items():
-        asyncio.create_task(_delete_later(client, chat_id, ids, delete_at))
+        spawn_background("delivery-delete", _delete_later(client, chat_id, ids, delete_at))
     log.info("Resumed %s pending member deletions across %s chats", len(rows), len(batched))
     return len(rows)
 
@@ -2473,7 +2582,9 @@ async def backup_retry_worker(client):
                         continue
                     await db.reset_scan_progress_for_full_rescan(primary_channel_id)
                     await db.set_setting("backup_full_scan_started", "1")
-                    scan_task = asyncio.create_task(run_history_scan(primary_channel_id))
+                    scan_task = spawn_background(
+                        "history-scan", run_history_scan(primary_channel_id)
+                    )
                     log.warning(
                         "Full backup restart: fresh source history scan started at offset_id=0 "
                         "for channel=%s",
@@ -3920,7 +4031,7 @@ async def scan_history_handler(client, message):
             "如需重新建立索引，请先发送 /catalogreset，再发送 /scan。"
         )
         return
-    scan_task = asyncio.create_task(run_history_scan(primary))
+    scan_task = spawn_background("history-scan", run_history_scan(primary))
     await message.reply_text(
         "🚀 已启动主存储频道历史扫描。\n"
         "只读取主频道并建立数据库索引，不扫描备份频道、不下载或删除原始文件。\n\n"
@@ -5286,9 +5397,12 @@ async def admin_callback_handler(client, query):
         except Exception:
             directory_import_running = False
             raise
-        asyncio.create_task(run_backup_tag_folder_scan(
-            client, int(user.id), int(backup_channel_id), message
-        ))
+        spawn_background(
+            "backup-tag-scan",
+            run_backup_tag_folder_scan(
+                client, int(user.id), int(backup_channel_id), message
+            ),
+        )
         return
     elif action == "directories" or action.startswith("directories:"):
         categories = await db.list_categories()
@@ -6116,6 +6230,7 @@ async def main():
             timeout=aiohttp.ClientTimeout(total=12, connect=5, sock_read=10)
         )
         await resume_pending_deletions(app)
+        await startup_self_check(app)
 
         if scanner is not None:
             try:
@@ -6143,10 +6258,10 @@ async def main():
         BOT_ID = me.id
         log.info("Bot started: @%s", me.username)
 
-        backup_retry_task = asyncio.create_task(backup_retry_worker(app))
+        backup_retry_task = spawn_background("backup-worker", backup_retry_worker(app))
         backup_worker_running = True
         log.info("Durable backup retry worker started")
-        scanner_caption_task = asyncio.create_task(scanner_caption_worker())
+        scanner_caption_task = spawn_background("caption-worker", scanner_caption_worker())
         log.info("Durable scanner caption worker started")
 
         runner = web.AppRunner(create_catalog_app(db, lambda: BOT_USERNAME))
