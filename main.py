@@ -4315,7 +4315,7 @@ async def user_catalog_callback_handler(client, query):
 
     if action[1] == "search":
         await query.answer()
-        pending_search_users[int(user.id)] = True
+        pending_search_users.add(int(user.id))
         await message.reply_text(
             "🔎 资源搜索\n\n"
             "请直接发送你要查找的资源名称、关键词或编号。\n"
