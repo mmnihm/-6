@@ -320,6 +320,7 @@ def admin_keyboard():
          InlineKeyboardButton("📢 群发广播", callback_data="mc:broadcast")],
         [InlineKeyboardButton("📊 数据统计", callback_data="mc:stats"),
          InlineKeyboardButton("🔐 扫描账号", callback_data="mc:scannerlogin")],
+        [InlineKeyboardButton("🧾 资源发放审计", callback_data="mc:audit")],
         [InlineKeyboardButton("🛡 内容保护与删除", callback_data="mc:contentguard")],
         [InlineKeyboardButton("🛡 管理员管理", callback_data="mc:admins"),
          InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
@@ -5562,6 +5563,79 @@ async def admin_callback_handler(client, query):
             f"用户：{users}  |  文件：{files}\n手动会员：{members}  |  封禁：{banned}\n\n请选择下方按钮管理机器人。"
         )
         await message.edit_text(text, reply_markup=admin_keyboard())
+    elif action == "audit":
+        try:
+            totals, top = await db.get_delivery_audit_summary(hours=24, limit=5)
+            total = int(totals.get("total") or 0)
+            success = int(totals.get("success") or 0)
+            failed = int(totals.get("failed") or 0)
+            pending = int(totals.get("pending") or 0)
+            lines = [
+                "🧾 资源发放审计",
+                "━━━━━━━━━━━━━━",
+                "最近24小时",
+                f"发放记录：{total} 条",
+                f"✅ 成功：{success}｜❌ 失败：{failed}｜⏳ 未完成：{pending}",
+                "",
+                "🔎 高频资源",
+            ]
+            if top:
+                for index, row in enumerate(top, 1):
+                    name = str(row.get("file_name") or row.get("file_key") or "未知资源")[:45]
+                    lines.append(
+                        f"{index}. {name}\n"
+                        f"目录：{str(row.get('category') or '未分类')[:25]}"
+                        f"｜发送 {int(row.get('sends') or 0)} 次"
+                    )
+            else:
+                lines.append("暂无记录；部署审计版本后产生的发送才会累计。")
+            lines.extend([
+                "",
+                "可查看每次发送的资源、接收用户和时间；封禁时间回溯请使用 /auditban。",
+            ])
+            await message.edit_text(
+                "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🧾 查看最近发送明细", callback_data="mc:auditdetail")],
+                    [InlineKeyboardButton("🔄 刷新审计", callback_data="mc:audit")],
+                    [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+                ]),
+            )
+        except Exception:
+            log.exception("Could not render delivery audit settings")
+            await message.edit_text(
+                "⚠️ 审计数据暂时无法读取，请检查数据库初始化和部署日志。",
+                reply_markup=back_keyboard(),
+            )
+    elif action == "auditdetail":
+        try:
+            rows = await db.list_delivery_audit_details(limit=20)
+            lines = ["🧾 最近20条资源发送明细"]
+            if not rows:
+                lines.append("暂无逐条发送记录。新版本部署后产生的发送才会记录。")
+            else:
+                for row in rows:
+                    stamp = str(row.get("created_at") or "").replace("T", " ")
+                    name = str(row.get("file_name") or row.get("file_key") or "未知资源")[:45]
+                    category = str(row.get("category") or "未分类")[:25]
+                    status = {"success": "成功", "failed": "失败", "attempted": "未完成"}.get(
+                        str(row.get("status")), str(row.get("status") or "未知")
+                    )
+                    lines.append(
+                        f"\n⏱ {stamp}\n📄 {name}\n📁 {category}"
+                        f"\n用户：{row.get('user_id')}｜{status}"
+                    )
+            body = "\n".join(lines)
+            await message.edit_text(
+                body[:3900],
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ 返回发放审计", callback_data="mc:audit")],
+                    [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+                ]),
+            )
+        except Exception:
+            log.exception("Could not render delivery audit details")
+            await message.edit_text("⚠️ 发送明细暂时无法读取。", reply_markup=back_keyboard())
     elif action == "storage":
         primary, backup = await get_storage_channels()
         group_id = await get_member_group_id()
