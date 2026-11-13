@@ -2704,8 +2704,11 @@ class Database:
             )).fetchall()
             now = iso_now()
             updates = []
-            for index, row in enumerate(rows):
-                message_id = int(ids[index]) if index < len(ids) and ids[index] else None
+            for row in rows:
+                # A single-file result maps unambiguously. Album result order is
+                # not guaranteed by a SELECT without a persisted position, so do
+                # not attach a potentially incorrect Telegram message ID.
+                message_id = int(ids[0]) if len(rows) == 1 and ids and ids[0] else None
                 updates.append((
                     str(status), message_id, str(error or "")[:300], now,
                     str(audit_id), str(row["file_key"]),
