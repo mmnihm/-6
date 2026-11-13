@@ -576,5 +576,81 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("加群", row["file_name"])
 
 
+    async def test_media_kind_matches_the_old_extension_rules(self):
+        """The stored classifier must agree with the LIKE rules it replaced."""
+        cases = [
+            ("photo", "IMG_0001.jpg", "image"),
+            ("document", "电影.mp4", "video"),
+            ("video", "clip.mkv", "video"),
+            ("document", "动图.gif", "animation"),
+            ("animation", "anim", "animation"),
+            ("document", "音频.mp3", "audio"),
+            ("audio", "track.flac", "audio"),
+            ("voice", "voice.ogg", "audio"),
+            ("document", "报告.pdf", "document"),
+            ("document", "包.zip", "document"),
+            ("document", "无扩展名", "document"),
+            ("video_note", "round", "video"),
+        ]
+        for media_type, file_name, expected in cases:
+            self.assertEqual(
+                database.media_kind_of(media_type, file_name), expected,
+                f"{media_type}/{file_name}",
+            )
+
+    async def test_folder_stats_count_by_stored_kind(self):
+        """Image/video/audio/document counts come from media_kind, not name scans."""
+        now = "2026-11-13T00:00:00+00:00"
+        for index, (media_type, name) in enumerate([
+            ("photo", "a.jpg"),
+            ("document", "b.mp4"),
+            ("document", "c.gif"),
+            ("document", "d.mp3"),
+            ("document", "e.pdf"),
+        ]):
+            await self.db.add_file(
+                f"k{index}", 1, name, media_type, 100 + index, 0, "统计",
+                f"cangou:1:{index}", created_at=now,
+            )
+        async with self.db.connect() as db:
+            row = await (await db.execute(
+                "SELECT image_count, video_count, animation_count, audio_count, "
+                "document_count, file_count FROM categories WHERE name='统计'"
+            )).fetchone()
+        self.assertEqual(
+            (int(row["image_count"]), int(row["video_count"]),
+             int(row["animation_count"]), int(row["audio_count"]),
+             int(row["document_count"]), int(row["file_count"])),
+            (1, 1, 1, 1, 1, 5),
+        )
+
+    async def test_backfill_classifies_legacy_rows_once(self):
+        """Rows created before the column existed get classified at startup."""
+        now = "2026-11-13T00:00:00+00:00"
+        async with self.db.connect() as db:
+            await db.execute("""
+                INSERT INTO files(file_key, owner_id, file_name, media_type, category,
+                    primary_message_id, backup_message_id, created_at, media_kind)
+                VALUES('legacy1', 1, '旧视频.mp4', 'document', '旧目录', 7001, 0, ?, '')
+            """, (now,))
+            await db.execute("DELETE FROM settings WHERE key='media_kind_backfill_v1'")
+            await db.commit()
+        await self.db.initialize()
+        async with self.db.connect() as db:
+            row = await (await db.execute(
+                "SELECT media_kind FROM files WHERE file_key='legacy1'"
+            )).fetchone()
+        self.assertEqual(row["media_kind"], "video")
+
+    async def test_settings_cache_reflects_immediate_writes(self):
+        """Cached settings must never hide a value the same process just saved."""
+        await self.db.set_setting("member_auto_delete_seconds", "600")
+        self.assertEqual(await self.db.get_setting("member_auto_delete_seconds"), "600")
+        # Second read is served from cache and must return the same value.
+        self.assertEqual(await self.db.get_setting("member_auto_delete_seconds"), "600")
+        await self.db.set_setting("member_auto_delete_seconds", "120")
+        self.assertEqual(await self.db.get_setting("member_auto_delete_seconds"), "120")
+        self.assertIsNone(await self.db.get_setting("never_configured_key"))
+
 if __name__ == "__main__":
     unittest.main()

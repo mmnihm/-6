@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 # so writes now coalesce: at most one recount per folder per interval, with a
 # catch-up recount scheduled once the interval ends. Folder counts can lag the
 # truth by at most this many seconds.
+SETTING_CACHE_TTL = 60.0
 CATEGORY_STATS_MIN_INTERVAL = 30.0
 
 
@@ -49,6 +50,35 @@ def utc_now():
 
 def iso_now():
     return utc_now().isoformat()
+
+
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif", ".tif", ".tiff")
+VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".mpeg", ".mpg", ".3gp", ".ts", ".wmv", ".flv")
+ANIMATION_EXTS = (".gif", ".apng")
+AUDIO_EXTS = (".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".wma")
+
+
+def media_kind_of(media_type, file_name):
+    """Classify a stored media once, so folder stats need no per-row LIKE checks."""
+    kind_type = str(media_type or "").strip().lower()
+    if kind_type in ("photo", "image"):
+        return "image"
+    if kind_type in ("video", "video_note"):
+        return "video"
+    if kind_type == "animation":
+        return "animation"
+    if kind_type in ("audio", "voice"):
+        return "audio"
+    name = str(file_name or "").strip().lower()
+    for extensions, kind in (
+        (IMAGE_EXTS, "image"),
+        (ANIMATION_EXTS, "animation"),
+        (VIDEO_EXTS, "video"),
+        (AUDIO_EXTS, "audio"),
+    ):
+        if name.endswith(extensions):
+            return kind
+    return "document"
 
 
 def clean_file_name(value):
@@ -141,6 +171,9 @@ class Database:
         # Per-folder throttling for summary recounts (see CATEGORY_STATS_MIN_INTERVAL).
         self._category_stats_last = {}
         self._category_stats_pending = {}
+        # Settings are read on nearly every interaction. On SQLite each read used
+        # to open a fresh connection (~2-4 ms), so cache the value with a write-through.
+        self._setting_cache = {}
 
     @property
     def uses_postgres(self):
@@ -298,7 +331,8 @@ class Database:
                 created_at TEXT NOT NULL,
                 source_fingerprint TEXT,
                 album_group_id TEXT,
-                album_position BIGINT NOT NULL DEFAULT 0
+                album_position BIGINT NOT NULL DEFAULT 0,
+                media_kind TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS manual_members (
                 user_id BIGINT PRIMARY KEY,
@@ -455,6 +489,10 @@ class Database:
                 await db.execute("ALTER TABLE files ADD COLUMN album_group_id TEXT")
             if "album_position" not in column_names:
                 await db.execute("ALTER TABLE files ADD COLUMN album_position BIGINT NOT NULL DEFAULT 0")
+            if "media_kind" not in column_names:
+                await db.execute(
+                    "ALTER TABLE files ADD COLUMN media_kind TEXT NOT NULL DEFAULT ''"
+                )
             batch_columns = await (await db.execute(
                 "SELECT column_name AS name FROM information_schema.columns "
                 "WHERE table_schema=current_schema() AND table_name='upload_batch_items'"
@@ -637,13 +675,19 @@ class Database:
 
         if self.uses_postgres:
             await self._import_legacy_sqlite()
+        await self._backfill_media_kind()
 
     async def get_setting(self, key: str):
+        cached = self._setting_cache.get(key)
+        if cached is not None and time.monotonic() - cached[1] < SETTING_CACHE_TTL:
+            return cached[0]
         async with self.connect() as db:
             row = await (await db.execute(
                 "SELECT value FROM settings WHERE key=?", (key,)
             )).fetchone()
-            return row["value"] if row else None
+        value = row["value"] if row else None
+        self._setting_cache[key] = (value, time.monotonic())
+        return value
 
     async def set_setting(self, key: str, value: str):
         async with self.connect() as db:
@@ -652,6 +696,8 @@ class Database:
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value
             """, (key, str(value)))
             await db.commit()
+        # Write-through keeps the panel showing the value that was just saved.
+        self._setting_cache[key] = (str(value), time.monotonic())
 
     async def enqueue_scanner_caption_job(self, channel_id: int, message_id: int, caption: str):
         now = iso_now()
@@ -939,14 +985,16 @@ class Database:
                     INSERT OR IGNORE INTO files(
                         file_key, owner_id, file_name, media_type, category,
                         primary_message_id, backup_message_id, created_at,
-                        source_fingerprint, file_size, album_group_id, album_position
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source_fingerprint, file_size, album_group_id, album_position,
+                        media_kind
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     item["file_key"], item["owner_id"], item["file_name"],
                     item["media_type"], item["category"], item["primary_message_id"],
                     item["backup_message_id"], item["created_at"],
                     item["source_fingerprint"], item["file_size"],
                     item["album_group_id"], item["album_position"],
+                    media_kind_of(item["media_type"], item["file_name"]),
                 ))
                 if cur.rowcount == 1:
                     published += 1
@@ -986,14 +1034,16 @@ class Database:
                 INSERT OR IGNORE INTO files(
                     file_key, owner_id, file_name, media_type, category,
                     primary_message_id, backup_message_id, created_at,
-                    source_fingerprint, file_size, album_group_id, album_position
+                    source_fingerprint, file_size, album_group_id, album_position,
+                    media_kind
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (key, owner_id, file_name, media_type, category,
                   primary_id, backup_id, created_at or iso_now(),
                   source_fingerprint, max(0, int(file_size or 0)),
                   str(album_group_id) if album_group_id else None,
-                  max(0, int(album_position or 0))))
+                  max(0, int(album_position or 0)),
+                  media_kind_of(media_type, file_name)))
             if cur.rowcount == 1:
                 if refresh_stats:
                     await self._refresh_category_stats(db, category)
@@ -1120,14 +1170,16 @@ class Database:
                     INSERT OR IGNORE INTO files(
                         file_key, owner_id, file_name, media_type, category,
                         primary_message_id, backup_message_id, created_at,
-                        source_fingerprint, album_group_id, album_position
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source_fingerprint, album_group_id, album_position,
+                        media_kind
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     file_key, owner_id, primary["file_name"],
                     primary["media_type"], primary["category"],
                     primary_id, backup_id, primary["created_at"], fingerprint,
                     str(album_group_id) if album_group_id else None,
                     max(0, int(album_position or 0)),
+                    media_kind_of(primary["media_type"], primary["file_name"]),
                 ))
                 inserted = cur.rowcount == 1
                 if backup:
@@ -1168,12 +1220,13 @@ class Database:
                     INSERT OR IGNORE INTO files(
                         file_key, owner_id, file_name, media_type, category,
                         primary_message_id, backup_message_id, created_at,
-                        source_fingerprint
-                    ) VALUES(?, ?, ?, ?, ?, ?, 0, ?, ?)
+                        source_fingerprint, media_kind
+                    ) VALUES(?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                 """, (
                     key, owner_id, row["file_name"], row["media_type"],
                     row["category"], row["message_id"], row["created_at"],
-                    row["fingerprint"]
+                    row["fingerprint"],
+                    media_kind_of(row["media_type"], row["file_name"]),
                 ))
                 if cur.rowcount == 1:
                     created += 1
@@ -2098,6 +2151,54 @@ class Database:
                 ORDER BY granted_at DESC LIMIT ?
             """, (limit,))).fetchall()
 
+    async def _backfill_media_kind(self):
+        """Classify existing rows once, then keep the column correct on every insert."""
+        async with self.connect() as db:
+            done = await (await db.execute(
+                "SELECT value FROM settings WHERE key='media_kind_backfill_v1'"
+            )).fetchone()
+            if done:
+                return
+            page_size = 5000
+            offset = 0
+            updated = 0
+            while True:
+                rows = await (await db.execute(
+                    "SELECT file_key, media_type, file_name FROM files "
+                    "ORDER BY file_key LIMIT ? OFFSET ?",
+                    (page_size, offset),
+                )).fetchall()
+                if not rows:
+                    break
+                payload = [
+                    (media_kind_of(row["media_type"], row["file_name"]), row["file_key"])
+                    for row in rows
+                ]
+                await db.executemany(
+                    "UPDATE files SET media_kind=? WHERE file_key=?", payload
+                )
+                updated += len(payload)
+                offset += len(rows)
+            await db.execute(
+                "INSERT OR IGNORE INTO settings(key, value) "
+                "VALUES('media_kind_backfill_v1', 'completed')"
+            )
+            await db.commit()
+            if updated:
+                log.info("Backfilled media_kind for %s stored files", updated)
+
+        if updated:
+            # Counts stored on categories predate the classifier; recompute them
+            # once so the panel and filters agree with the new column.
+            async with self.connect() as db:
+                names = await (await db.execute("SELECT name FROM categories")).fetchall()
+                for item in names:
+                    await self._refresh_category_stats(
+                        db, str(item["name"]), create=False, force=True
+                    )
+                self._invalidate_catalog_stats()
+                await db.commit()
+
     async def stats(self):
         # One round trip instead of four: the four counts are independent, and
         # the admin panel asks for them together every time it renders.
@@ -2134,35 +2235,19 @@ class Database:
                            UNION
                            SELECT name AS category FROM categories
                        )) AS folders,
-                       SUM(CASE WHEN lower(media_type) IN ('photo', 'image')
-                           OR (lower(media_type)='document' AND (
-                               lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
-                               OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
-                               OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
-                               OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
-                               OR lower(file_name) LIKE '%.tiff'
-                           )) THEN 1 ELSE 0 END) AS images,
-                       SUM(CASE WHEN lower(media_type)='video'
-                           OR (lower(media_type)='document' AND (
-                               lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
-                               OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
-                               OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
-                               OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
-                               OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
-                               OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
-                           )) THEN 1 ELSE 0 END) AS videos,
-                       SUM(CASE WHEN lower(media_type)='animation'
-                           OR (lower(media_type)='document' AND (
-                               lower(file_name) LIKE '%.gif' OR lower(file_name) LIKE '%.apng'
-                           )) THEN 1 ELSE 0 END) AS animations,
-                       SUM(CASE WHEN lower(media_type) IN ('audio', 'voice')
-                           OR (lower(media_type)='document' AND (
-                               lower(file_name) LIKE '%.mp3' OR lower(file_name) LIKE '%.m4a'
-                               OR lower(file_name) LIKE '%.aac' OR lower(file_name) LIKE '%.flac'
-                               OR lower(file_name) LIKE '%.wav' OR lower(file_name) LIKE '%.ogg'
-                               OR lower(file_name) LIKE '%.opus' OR lower(file_name) LIKE '%.wma'
-                           )) THEN 1 ELSE 0 END) AS audios
-                FROM files
+                       SUM(CASE WHEN kind='image' THEN 1 ELSE 0 END) AS images,
+                       SUM(CASE WHEN kind='video' THEN 1 ELSE 0 END) AS videos,
+                       SUM(CASE WHEN kind='animation' THEN 1 ELSE 0 END) AS animations,
+                       SUM(CASE WHEN kind='audio' THEN 1 ELSE 0 END) AS audios
+                FROM (
+                    SELECT CASE WHEN media_kind IS NOT NULL AND media_kind <> '' THEN media_kind
+                                WHEN lower(media_type) IN ('photo', 'image') THEN 'image'
+                                WHEN lower(media_type) IN ('video', 'video_note') THEN 'video'
+                                WHEN lower(media_type) = 'animation' THEN 'animation'
+                                WHEN lower(media_type) IN ('audio', 'voice') THEN 'audio'
+                                ELSE 'document' END AS kind
+                    FROM files
+                ) AS classified
             """)).fetchone()
             result = {
                 "folders": int(row["folders"] or 0),
@@ -2198,97 +2283,32 @@ class Database:
                 (category, iso_now(), iso_now(),
                  secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]),
             )
-        # Counts and byte sizes in one statement: the two scans used to read the
-        # same rows twice and each carried its own ~40 LIKE comparisons.
+        # Counts and byte sizes in one statement. Classification comes from the
+        # stored media_kind column, so this no longer evaluates ~40 LIKE
+        # comparisons per row.
         row = await (await db.execute("""
             SELECT COUNT(*) AS file_count,
-                   SUM(CASE WHEN lower(media_type) IN ('photo', 'image')
-                       OR (lower(media_type)='document' AND (
-                           lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
-                           OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
-                           OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
-                           OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
-                           OR lower(file_name) LIKE '%.tiff'
-                       ))
-                       THEN 1 ELSE 0 END) AS image_count,
-                   SUM(CASE WHEN lower(media_type)='video'
-                       OR (lower(media_type)='document' AND (
-                           lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
-                           OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
-                           OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
-                           OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
-                           OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
-                           OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
-                       ))
-                       THEN 1 ELSE 0 END) AS video_count,
-                   SUM(CASE WHEN lower(media_type)='animation'
-                       OR (lower(media_type)='document' AND (
-                           lower(file_name) LIKE '%.gif' OR lower(file_name) LIKE '%.apng'
-                       )) THEN 1 ELSE 0 END) AS animation_count,
-                   SUM(CASE WHEN lower(media_type) IN ('audio', 'voice')
-                       OR (lower(media_type)='document' AND (
-                           lower(file_name) LIKE '%.mp3' OR lower(file_name) LIKE '%.m4a'
-                           OR lower(file_name) LIKE '%.aac' OR lower(file_name) LIKE '%.flac'
-                           OR lower(file_name) LIKE '%.wav' OR lower(file_name) LIKE '%.ogg'
-                           OR lower(file_name) LIKE '%.opus' OR lower(file_name) LIKE '%.wma'
-                       )) THEN 1 ELSE 0 END) AS audio_count,
-                   SUM(CASE WHEN lower(media_type)='document'
-                       AND NOT (
-                           lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
-                           OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
-                           OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
-                           OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
-                           OR lower(file_name) LIKE '%.tiff'
-                           OR lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
-                           OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
-                           OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
-                           OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
-                           OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
-                           OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
-                           OR lower(file_name) LIKE '%.gif' OR lower(file_name) LIKE '%.apng'
-                           OR lower(file_name) LIKE '%.mp3' OR lower(file_name) LIKE '%.m4a'
-                           OR lower(file_name) LIKE '%.aac' OR lower(file_name) LIKE '%.flac'
-                           OR lower(file_name) LIKE '%.wav' OR lower(file_name) LIKE '%.ogg'
-                           OR lower(file_name) LIKE '%.opus' OR lower(file_name) LIKE '%.wma'
-                       ) THEN 1 ELSE 0 END) AS document_count,
+                   SUM(CASE WHEN kind='image' THEN 1 ELSE 0 END) AS image_count,
+                   SUM(CASE WHEN kind='video' THEN 1 ELSE 0 END) AS video_count,
+                   SUM(CASE WHEN kind='animation' THEN 1 ELSE 0 END) AS animation_count,
+                   SUM(CASE WHEN kind='audio' THEN 1 ELSE 0 END) AS audio_count,
+                   SUM(CASE WHEN kind='document' THEN 1 ELSE 0 END) AS document_count,
                    COALESCE(SUM(file_size), 0) AS total_size,
                    SUM(CASE WHEN COALESCE(file_size, 0)>0 THEN 1 ELSE 0 END) AS sized_count,
-                   COALESCE(SUM(CASE WHEN lower(media_type) IN ('video', 'video_note')
-                       OR (lower(media_type)='document' AND (
-                           lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
-                           OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
-                           OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
-                           OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
-                           OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
-                           OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
-                       ))
-                       THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS video_size,
-                   COALESCE(SUM(CASE WHEN lower(media_type) IN ('photo', 'image')
-                       OR (lower(media_type)='document' AND (
-                           lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
-                           OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
-                           OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
-                           OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
-                           OR lower(file_name) LIKE '%.tiff'
-                       ))
-                       THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS image_size,
-                   COALESCE(SUM(CASE WHEN NOT (
-                       lower(media_type) IN ('video', 'video_note', 'photo', 'image')
-                       OR (lower(media_type)='document' AND (
-                           lower(file_name) LIKE '%.mp4' OR lower(file_name) LIKE '%.mkv'
-                           OR lower(file_name) LIKE '%.mov' OR lower(file_name) LIKE '%.avi'
-                           OR lower(file_name) LIKE '%.webm' OR lower(file_name) LIKE '%.m4v'
-                           OR lower(file_name) LIKE '%.mpeg' OR lower(file_name) LIKE '%.mpg'
-                           OR lower(file_name) LIKE '%.3gp' OR lower(file_name) LIKE '%.ts'
-                           OR lower(file_name) LIKE '%.wmv' OR lower(file_name) LIKE '%.flv'
-                           OR lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg'
-                           OR lower(file_name) LIKE '%.png' OR lower(file_name) LIKE '%.webp'
-                           OR lower(file_name) LIKE '%.bmp' OR lower(file_name) LIKE '%.heic'
-                           OR lower(file_name) LIKE '%.heif' OR lower(file_name) LIKE '%.tif'
-                           OR lower(file_name) LIKE '%.tiff'
-                       ))
-                   ) THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS other_size
-            FROM files WHERE category=?
+                   COALESCE(SUM(CASE WHEN kind='video' THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS video_size,
+                   COALESCE(SUM(CASE WHEN kind='image' THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS image_size,
+                   COALESCE(SUM(CASE WHEN kind NOT IN ('image', 'video')
+                       THEN COALESCE(file_size, 0) ELSE 0 END), 0) AS other_size
+            FROM (
+                SELECT file_size,
+                       CASE WHEN media_kind IS NOT NULL AND media_kind <> '' THEN media_kind
+                            WHEN lower(media_type) IN ('photo', 'image') THEN 'image'
+                            WHEN lower(media_type) IN ('video', 'video_note') THEN 'video'
+                            WHEN lower(media_type) = 'animation' THEN 'animation'
+                            WHEN lower(media_type) IN ('audio', 'voice') THEN 'audio'
+                            ELSE 'document' END AS kind
+                FROM files WHERE category=?
+            ) AS classified
         """,
             (category,))).fetchone()
         await db.execute("""
