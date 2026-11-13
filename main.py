@@ -1649,6 +1649,28 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 completed.update(entry[0] for entry in unit)
                 await advance_progress()
                 continue
+        audit_id = secrets.token_urlsafe(12)
+        audit_entries = []
+        for audit_entry in unit:
+            audit_item = audit_entry[1]
+            audit_entries.append({
+                "file_key": audit_item.get("file_key"),
+                "category": audit_item.get("category") or (
+                    audit_entry[2]["category"] if audit_entry[2] else ""
+                ),
+                "media_type": audit_entry[2]["media_type"] if audit_entry[2] else "",
+                "album_group_id": audit_item.get("album_group_id") or "",
+                "source_chat_id": audit_entry[3],
+                "source_message_id": audit_entry[4],
+                "delivery_method": "copyMessages" if is_album else "copyMessage",
+            })
+        try:
+            await db.record_delivery_audit_batch(
+                audit_id, user_id, share_key, audit_entries
+            )
+        except Exception:
+            log.exception("Could not persist delivery audit attempt: user=%s", user_id)
+
         delivered = False
         album_error = None
         if is_album and str(unit[0][1]["album_group_id"]) not in invalid_album_groups:
@@ -1723,6 +1745,13 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                     )
 
         if delivered:
+            try:
+                await db.finish_delivery_audit(
+                    audit_id, "success",
+                    [item.get("message_id") for item in delivered],
+                )
+            except Exception:
+                log.exception("Could not finalize successful album audit: user=%s", user_id)
             last_sent_message_id = int(delivered[-1]["message_id"])
             keys = [entry[1]["file_key"] for entry in unit]
             history_keys.extend(keys)
@@ -1741,6 +1770,12 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
             str(album_error)[:220] if is_album else "",
         )
         if attempts >= DELIVERY_MAX_ATTEMPTS:
+            try:
+                await db.finish_delivery_audit(
+                    audit_id, "failed", error=str(album_error or "资源不可用或 Telegram 发送失败")
+                )
+            except Exception:
+                log.exception("Could not finalize failed delivery audit: user=%s", user_id)
             # Repeatedly unreachable unit: skip it so the folder keeps flowing.
             skipped += len(unit)
             completed.update(entry[0] for entry in unit)
@@ -1751,6 +1786,12 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
             )
             continue
         if is_album:
+            try:
+                await db.finish_delivery_audit(
+                    audit_id, "failed", error=str(album_error or "相册整组发送失败")
+                )
+            except Exception:
+                log.exception("Could not finalize pending album audit: user=%s", user_id)
             # Never split an album. A failed unit must remain pending; for
             # paginated folder delivery, stop here so the next request retries
             # this exact album instead of advancing past it.
@@ -1772,6 +1813,12 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 defer_side_effects=True,
             )
             if ok:
+                try:
+                    await db.finish_delivery_audit(
+                        audit_id, "success", [copied_message_id]
+                    )
+                except Exception:
+                    log.exception("Could not finalize successful file audit: user=%s", user_id)
                 sent += 1
                 last_sent_message_id = int(copied_message_id)
                 pending_delete_ids.append(int(copied_message_id))
@@ -1780,6 +1827,12 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 completed.add(position)
                 await advance_progress()
             else:
+                try:
+                    await db.finish_delivery_audit(
+                        audit_id, "failed", error=str(error_text or "Telegram 发送失败")
+                    )
+                except Exception:
+                    log.exception("Could not finalize failed file audit: user=%s", user_id)
                 failed += 1
                 log.warning(
                     "File delivery failed and remains pending: user=%s share_key=%s offset=%s file=%s reason=%s",
@@ -3934,6 +3987,47 @@ async def build_info_handler(client, message):
         f"扫描账号：{scanner_id if scanner_id is not None else '未连接'}\n"
         f"运行文件：{os.path.abspath(__file__)}"
     )
+
+
+@app.on_message(filters.private & filters.command("audit"))
+async def delivery_audit_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    try:
+        totals, top = await db.get_delivery_audit_summary(hours=24, limit=10)
+        total = int(totals.get("total") or 0)
+        success = int(totals.get("success") or 0)
+        failed = int(totals.get("failed") or 0)
+        pending = int(totals.get("pending") or 0)
+        lines = [
+            "📊 资源发放审计（最近24小时）",
+            f"发放记录：{total} 条",
+            f"成功：{success} 条｜失败：{failed} 条｜未完成：{pending} 条",
+            "",
+            "🔎 高频资源（按发放次数）",
+        ]
+        if not top:
+            lines.append("暂无审计记录。新版本部署后开始累计。")
+        else:
+            for index, row in enumerate(top, 1):
+                name = str(row.get("file_name") or row.get("file_key") or "未知资源")[:55]
+                category = str(row.get("category") or "未分类")[:35]
+                lines.append(
+                    f"{index}. {name}\n"
+                    f"目录：{category}｜发送：{int(row.get('sends') or 0)} 次"
+                    f"｜用户：{int(row.get('users') or 0)}"
+                    f"｜失败：{int(row.get('failures') or 0)}"
+                )
+        lines.extend([
+            "",
+            "说明：审计用于关联资源、目录、用户和发送时间；Telegram 不会通过机器人接口公开官方封禁的具体原因或文件内部标记。",
+        ])
+        await message.reply_text("\n".join(lines))
+    except Exception:
+        log.exception("Could not generate delivery audit report")
+        await message.reply_text("⚠️ 审计报告暂时无法读取，请检查数据库初始化和部署日志。")
 
 
 @app.on_message(filters.private & filters.command("catalogreset"))
