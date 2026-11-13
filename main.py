@@ -4124,23 +4124,81 @@ async def build_favorites_view(user_id):
     return "\n".join(sections), InlineKeyboardMarkup(rows)
 
 
+async def build_catalog_search_page(user_id, query_text, offset=0, token=None):
+    query_text = str(query_text or "").strip()[:80]
+    offset = max(0, int(offset or 0))
+    page_size = 8
+    if not token:
+        token = secrets.token_urlsafe(6).replace("-", "").replace("_", "")
+        # Keep the in-memory navigation cache bounded.
+        while len(search_sessions) >= 300:
+            search_sessions.pop(next(iter(search_sessions)), None)
+        search_sessions[token] = {
+            "user_id": int(user_id),
+            "query": query_text,
+        }
+
+    records, _, total = await db.public_catalog(
+        query=query_text, limit=page_size, offset=offset
+    )
+    buttons = []
+    for row in records:
+        file_key = str(row.get("file_key") or "")
+        if not file_key:
+            continue
+        name = str(row.get("file_name") or "未命名资源")
+        category = str(row.get("category") or "未分类")
+        buttons.append([InlineKeyboardButton(
+            f"📄 {name[:38]}",
+            callback_data=f"uc:open:{file_key}",
+        )])
+
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton(
+            "⬅️ 上一页",
+            callback_data=f"uc:searchpage:{token}:{max(0, offset - page_size)}",
+        ))
+    if offset + page_size < total:
+        nav.append(InlineKeyboardButton(
+            "下一页 ➡️",
+            callback_data=f"uc:searchpage:{token}:{offset + page_size}",
+        ))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🏠 返回首页", callback_data="uc:home")])
+
+    if records:
+        lines = [
+            f"{offset + index}. {str(row.get('file_name') or '未命名资源')[:48]}",
+            f"   📁 {str(row.get('category') or '未分类')[:40]}",
+        ]
+        body_rows = ["\n".join(lines) for index, row in enumerate(records, 1)]
+        result_text = "\n\n".join(body_rows)
+    else:
+        result_text = "暂时没有找到匹配资源。"
+
+    body = (
+        f"🔎 搜索：{query_text}\n"
+        f"📦 共找到 {total} 个资源"
+        + (f"（第 {offset // page_size + 1} 页）" if total else "")
+        + "\n\n" + result_text
+        + "\n\n点击下方资源按钮即可获取对应文件。"
+    )
+    return body, InlineKeyboardMarkup(buttons), token
+
+
 async def send_catalog_search_results(message, query_text):
     query_text = str(query_text or "").strip()[:80]
     if not query_text:
         await message.reply_text("请输入要搜索的关键词。")
         return
-    records, _, total = await db.public_catalog(query=query_text, limit=12, offset=0)
-    body = (
-        f"🔎 搜索结果：{query_text}\n"
-        f"📦 找到 {total} 个相关资源\n\n"
-        + ("\n".join(
-            f"{index}. {row['file_name'][:48]}\n   📁 {row['category']}"
-            for index, row in enumerate(records, 1)
-        ) if records else "暂时没有找到匹配资源。")
-    )
-    if total > len(records):
-        body += f"\n\n当前显示前 {len(records)} 条，请缩短关键词进一步筛选。"
-    await message.reply_text(body)
+    user = getattr(message, "from_user", None)
+    if not user:
+        await message.reply_text("无法识别用户，请重新打开机器人搜索。")
+        return
+    body, markup, _ = await build_catalog_search_page(user.id, query_text)
+    await message.reply_text(body, reply_markup=markup, disable_web_page_preview=True)
 
 
 @app.on_message(filters.private & filters.command("search"))
@@ -4346,31 +4404,14 @@ async def user_catalog_callback_handler(client, query):
             await query.answer("搜索已过期，请重新发送 /search 关键词", show_alert=True)
             return
         search_query = session["query"]
-        records, _, total = await db.public_catalog(
-            query=search_query, limit=12, offset=offset
+        body, markup, _ = await build_catalog_search_page(
+            user.id, search_query, offset=offset, token=token
         )
-        buttons = [[InlineKeyboardButton(
-            f"📄 {row['file_name'][:32]}",
-            callback_data=f"uc:open:{row['file_key']}",
-        )] for row in records]
-        nav = []
-        if offset > 0:
-            nav.append(InlineKeyboardButton(
-                "⬅️ 上一页", callback_data=f"uc:searchpage:{token}:{max(0, offset - 12)}"
-            ))
-        if offset + 12 < total:
-            nav.append(InlineKeyboardButton(
-                "下一页 ➡️", callback_data=f"uc:searchpage:{token}:{offset + 12}"
-            ))
-        if nav:
-            buttons.append(nav)
-        buttons.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
         await query.answer()
         await message.edit_text(
-            f"🔎 搜索：{search_query}\n共找到 {total} 个资源（第 {offset // 12 + 1} 页）\n\n"
-            + ("\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
-               if records else "没有找到匹配资源。"),
-            reply_markup=InlineKeyboardMarkup(buttons),
+            body,
+            reply_markup=markup,
+            disable_web_page_preview=True,
         )
         return
 
