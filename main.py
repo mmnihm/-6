@@ -4138,16 +4138,33 @@ async def build_catalog_search_page(user_id, query_text, offset=0, token=None):
             "query": query_text,
         }
 
+    # Search saved folders separately so a folder can be opened directly.
+    all_categories = await db.list_categories()
+    matched_categories = [
+        row for row in all_categories
+        if query_text.casefold() in str(row["category"] or "").casefold()
+    ][:8]
+
     records, _, total = await db.public_catalog(
         query=query_text, limit=page_size, offset=offset
     )
     buttons = []
+    if matched_categories:
+        for category_row in matched_categories:
+            folder_name = str(category_row["category"] or "未命名文件夹")
+            share_key = str(category_row["share_key"] or "")
+            if not share_key:
+                continue
+            buttons.append([InlineKeyboardButton(
+                f"📁 {folder_name[:32]}（{int(category_row['file_count'] or 0)}）",
+                callback_data=f"uc:folderlink:{share_key}",
+            )])
+
     for row in records:
         file_key = str(row["file_key"] or "")
         if not file_key:
             continue
         name = str(row["file_name"] or "未命名资源")
-        category = str(row["category"] or "未分类")
         buttons.append([InlineKeyboardButton(
             f"📄 {name[:38]}",
             callback_data=f"uc:open:{file_key}",
@@ -4168,6 +4185,13 @@ async def build_catalog_search_page(user_id, query_text, offset=0, token=None):
         buttons.append(nav)
     buttons.append([InlineKeyboardButton("🏠 返回首页", callback_data="uc:home")])
 
+    sections = [f"🔎 搜索：{query_text}"]
+    if matched_categories:
+        sections.extend([
+            "",
+            f"📁 找到 {len(matched_categories)} 个匹配文件夹（最多显示 8 个）",
+            "点击文件夹名称即可进入目录，再选择获取资源。",
+        ])
     if records:
         body_rows = [
             "\n".join([
@@ -4176,19 +4200,18 @@ async def build_catalog_search_page(user_id, query_text, offset=0, token=None):
             ])
             for index, row in enumerate(records, 1)
         ]
-        result_text = "\n\n".join(body_rows)
-    else:
-        result_text = "暂时没有找到匹配资源。"
+        sections.extend([
+            "",
+            f"📄 找到 {total} 个匹配资源（第 {offset // page_size + 1} 页）",
+            "\n\n".join(body_rows),
+        ])
+    elif not matched_categories:
+        sections.extend(["", "暂时没有找到匹配的文件夹或资源。"])
 
-    body = (
-        f"🔎 搜索：{query_text}\n"
-        f"📦 共找到 {total} 个资源"
-        + (f"（第 {offset // page_size + 1} 页）" if total else "")
-        + "\n\n" + result_text
-        + "\n\n点击下方资源按钮即可获取对应文件。"
-    )
+    body = "\n".join(sections)
+    if records or matched_categories:
+        body += "\n\n点击上方文件夹进入目录，或点击资源按钮直接获取文件。"
     return body, InlineKeyboardMarkup(buttons), token
-
 
 async def send_catalog_search_results(message, query_text):
     query_text = str(query_text or "").strip()[:80]
