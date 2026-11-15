@@ -691,5 +691,16 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         by_code = {row["watermark"]: row for row in rows}
         self.assertEqual(int(by_code["AAA111"]["user_id"]), 11)
 
+    async def test_split_search_query_multi_keyword(self):
+        self.assertEqual(
+            Database.split_search_query(" 影视  教程 "), ["影视", "教程"]
+        )
+        self.assertEqual(
+            Database.split_search_query("影视,教程、课程;教材/视频"),
+            ["影视", "教程", "课程", "教材", "视频"],
+        )
+        self.assertEqual(Database.split_search_query("   "), [])
+        self.assertEqual(Database.split_search_query("single"), ["single"])
+
 if __name__ == "__main__":
     unittest.main()

@@ -54,6 +54,7 @@ upload_progress_state = {}
 pending_home_button_actions = {}
 pending_admin_actions = {}
 pending_welcome_edit = set()
+pending_announce_edit = set()
 directory_import_running = False
 cangku_backup_in_progress = set()
 backup_retry_manual_requested = False
@@ -404,6 +405,7 @@ def admin_keyboard():
         [InlineKeyboardButton("🆔 领取编号查询", callback_data="mc:wm")],
         [InlineKeyboardButton("🛡 内容保护与删除", callback_data="mc:contentguard"),
          InlineKeyboardButton("👋 进群欢迎", callback_data="mc:welcome")],
+        [InlineKeyboardButton("📢 首页公告", callback_data="mc:announce")],
         [InlineKeyboardButton("🛡 管理员管理", callback_data="mc:admins"),
          InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
     ])
@@ -499,6 +501,31 @@ async def render_welcome_admin(message, notice=""):
             )],
             [InlineKeyboardButton("✏️ 修改欢迎文案", callback_data="mc:welcome:edit")],
             [InlineKeyboardButton("♻️ 恢复默认文案", callback_data="mc:welcome:reset")],
+            [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+        ]),
+    )
+
+
+ANNOUNCEMENT_KEY = "home_announcement"
+ANNOUNCEMENT_MAX_LEN = 300
+
+
+async def get_home_announcement():
+    value = await db.get_setting(ANNOUNCEMENT_KEY)
+    return str(value or "").strip()[:ANNOUNCEMENT_MAX_LEN]
+
+
+async def render_announce_admin(message, notice=""):
+    announcement = await get_home_announcement()
+    body = "📢 首页公告设置\n\n"
+    body += "当前公告：\n" + (announcement if announcement else "（未设置）") + "\n"
+    if notice:
+        body += f"\n{notice}\n"
+    await message.edit_text(
+        body,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ 编辑公告", callback_data="mc:announce:edit")],
+            [InlineKeyboardButton("🗑 清空公告", callback_data="mc:announce:clear")],
             [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
         ]),
     )
@@ -1369,16 +1396,20 @@ async def user_home_keyboard():
 async def user_home_text(user_id):
     tier = await get_membership_tier(user_id)
     stats = await db.catalog_stats()
+    announcement = await get_home_announcement()
+    head = "📂 会员资源中心\n\n"
+    if announcement:
+        head += f"📢 {announcement}\n\n"
+    head += "欢迎使用会员专属资源库。\n\n"
     return (
-        "📂 会员资源中心\n\n"
-        "欢迎使用会员专属资源库。\n\n"
-        f"🏅 会员级别：{tier or '未开通'}\n\n"
-        "📊 资源统计\n"
-        f"• 文件夹：{stats['folders']} 个\n"
-        f"• 消息：{stats['messages']} 条\n"
-        f"• 图片：{stats['images']} 张\n"
-        f"• 视频：{stats['videos']} 个\n\n"
-        "请选择下方功能："
+        head
+        + f"🏅 会员级别：{tier or '未开通'}\n\n"
+        + "📊 资源统计\n"
+        + f"• 文件夹：{stats['folders']} 个\n"
+        + f"• 消息：{stats['messages']} 条\n"
+        + f"• 图片：{stats['images']} 张\n"
+        + f"• 视频：{stats['videos']} 个\n\n"
+        + "请选择下方功能："
     )
 
 
@@ -1577,6 +1608,22 @@ async def resume_pending_deletions(client):
 
 
 # A delivery unit that keeps failing must not pin the folder cursor forever.
+def humanize_delivery_error(exc):
+    """Turn a raw Telegram/DB error into a short, member-friendly reason."""
+    text = str(exc or "").lower()
+    if any(k in text for k in ("429", "floodwait", "too many requests", "retry_after")):
+        return "发送太频繁，请稍等几分钟后再试。"
+    if any(k in text for k in ("forbidden", "blocked", "deactivated", "chat not found", "user is deactivated", "can't initiate")):
+        return "暂时联系不到该用户：可能已屏蔽机器人或没开启私聊，请提醒用户先打开机器人对话。"
+    if any(k in text for k in ("message not found", "message_id_invalid", "msg_id_invalid", "message to forward not found", "deleted", "empty message")):
+        return "原文件在存储频道已失效或被删除，请联系管理员补充资源。"
+    if "400" in text or "bad request" in text:
+        return "这条资源的格式不被 Telegram 接受，请联系管理员检查。"
+    if "403" in text or "not enough rights" in text:
+        return "机器人没有转发该资源的权限，请联系管理员检查存储频道设置。"
+    return "该资源暂时无法取回，已记录，请稍后重试。"
+
+
 # After this many failed attempts the unit is skipped (and reported), so the
 # member can still receive the rest of the folder.
 DELIVERY_MAX_ATTEMPTS = 3
@@ -1621,7 +1668,7 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False,
         candidates.append(("original", cangku_source[0], cangku_source[1]))
 
     if not candidates:
-        reason = "该资源暂时无法取回，已记录，请稍后重试。"
+        reason = "这条资源还没存到可转发的位置，请联系管理员补充资源。"
         return (False, reason, None) if return_message_id else (False, reason)
 
     last_error = None
@@ -1680,7 +1727,7 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False,
             "All catalog sources failed: file=%s user=%s error=%s",
             file_key, user_id, str(last_error)[:220],
         )
-        reason = "该资源暂时无法取回，已记录，请稍后重试。"
+        reason = humanize_delivery_error(last_error)
         return (False, reason, None) if return_message_id else (False, reason)
 
     if not defer_side_effects:
@@ -3768,6 +3815,9 @@ async def cancel_pending_admin_handler(client, message):
     if int(user.id) in pending_welcome_edit:
         pending_welcome_edit.discard(int(user.id))
         await message.reply_text("已取消编辑欢迎文案。")
+    if int(user.id) in pending_announce_edit:
+        pending_announce_edit.discard(int(user.id))
+        await message.reply_text("已取消编辑公告。")
 
 
 @app.on_message(filters.private & filters.command("scancancel"))
@@ -3807,6 +3857,15 @@ async def scanner_login_input_handler(client, message):
         preview = render_welcome_message(value, ["新成员"], bot_url)
         await message.reply_text(
             f"✅ 欢迎文案已保存。\n\n预览：\n{preview}",
+            reply_markup=back_keyboard(),
+        )
+        return
+
+    if int(user.id) in pending_announce_edit:
+        pending_announce_edit.discard(int(user.id))
+        await db.set_setting(ANNOUNCEMENT_KEY, value[:ANNOUNCEMENT_MAX_LEN])
+        await message.reply_text(
+            "✅ 首页公告已保存。\n\n当前公告：\n" + value[:ANNOUNCEMENT_MAX_LEN],
             reply_markup=back_keyboard(),
         )
         return
@@ -4824,14 +4883,33 @@ async def build_catalog_search_page(user_id, query_text, offset=0, token=None):
 
     # Search saved folders separately so a folder can be opened directly.
     all_categories = await db.list_categories()
+    tokens = db.split_search_query(query_text)
+
+    def folder_matches(row, mode="all"):
+        name = str(row["category"] or "").casefold()
+        if not tokens:
+            return True
+        if mode == "all":
+            return all(token.casefold() in name for token in tokens)
+        return any(token.casefold() in name for token in tokens)
+
     matched_categories = [
-        row for row in all_categories
-        if query_text.casefold() in str(row["category"] or "").casefold()
+        row for row in all_categories if folder_matches(row, "all")
     ][:8]
 
     records, _, total = await db.public_catalog(
         query=query_text, limit=page_size, offset=offset
     )
+
+    # No exact match: suggest folders that share at least one keyword, else the
+    # first few folders as a fallback so the search page never feels dead.
+    recommended_categories = []
+    if not records and not matched_categories:
+        recommended_categories = [
+            row for row in all_categories if folder_matches(row, "any")
+        ][:5]
+        if not recommended_categories:
+            recommended_categories = list(all_categories)[:5]
     buttons = []
     if matched_categories:
         for category_row in matched_categories:
@@ -4852,6 +4930,16 @@ async def build_catalog_search_page(user_id, query_text, offset=0, token=None):
         buttons.append([InlineKeyboardButton(
             f"📄 {name[:38]}",
             callback_data=f"uc:open:{file_key}",
+        )])
+
+    for category_row in recommended_categories:
+        folder_name = str(category_row["category"] or "未命名文件夹")
+        share_key = str(category_row["share_key"] or "")
+        if not share_key:
+            continue
+        buttons.append([InlineKeyboardButton(
+            f"💡 {folder_name[:32]}（{int(category_row['file_count'] or 0)}）",
+            callback_data=f"uc:folderlink:{share_key}",
         )])
 
     nav = []
@@ -4890,10 +4978,17 @@ async def build_catalog_search_page(user_id, query_text, offset=0, token=None):
             "\n\n".join(body_rows),
         ])
     elif not matched_categories:
-        sections.extend(["", "暂时没有找到匹配的文件夹或资源。"])
+        if recommended_categories:
+            sections.extend([
+                "",
+                "没有同时包含全部关键词的资源或文件夹。",
+                "可以先看看这些相近目录：",
+            ])
+        else:
+            sections.extend(["", "暂时没有找到匹配的文件夹或资源。"])
 
     body = "\n".join(sections)
-    if records or matched_categories:
+    if records or matched_categories or recommended_categories:
         body += "\n\n点击上方文件夹进入目录，或点击资源按钮直接获取文件。"
     return body, InlineKeyboardMarkup(buttons), token
 
@@ -5953,6 +6048,22 @@ async def admin_callback_handler(client, query):
             )
             return
         await render_welcome_admin(message, notice)
+    elif action == "announce" or action.startswith("announce:"):
+        parts = action.split(":")
+        op = parts[1] if len(parts) > 1 else ""
+        if op == "edit":
+            pending_announce_edit.add(int(user.id))
+            await message.edit_text(
+                "✏️ 编辑首页公告\n\n请直接发送要展示在首页的公告内容（最多 300 字）。\n"
+                "发送 /cancel 可取消。",
+                reply_markup=back_keyboard(),
+            )
+            return
+        if op == "clear":
+            await db.set_setting(ANNOUNCEMENT_KEY, "")
+            await render_announce_admin(message, "🗑 公告已清空。")
+            return
+        await render_announce_admin(message)
     elif action == "home":
         users, files, members, banned = await db.stats()
         group_id = await get_member_group_id()
@@ -6012,6 +6123,7 @@ async def admin_callback_handler(client, query):
         try:
             rows = await db.list_delivery_audit_details(limit=20)
             lines = ["🧾 最近20条资源发送明细"]
+            resend_buttons = []
             if not rows:
                 lines.append("暂无逐条发送记录。新版本部署后产生的发送才会记录。")
             else:
@@ -6019,24 +6131,60 @@ async def admin_callback_handler(client, query):
                     stamp = format_cn_datetime(row.get("created_at"))
                     name = str(row.get("file_name") or row.get("file_key") or "未知资源")[:45]
                     category = str(row.get("category") or "未分类")[:25]
+                    status_key = str(row.get("status"))
                     status = {"success": "成功", "failed": "失败", "attempted": "未完成"}.get(
-                        str(row.get("status")), str(row.get("status") or "未知")
+                        status_key, status_key or "未知"
                     )
                     lines.append(
                         f"\n⏱ {stamp}\n📄 {name}\n📁 {category}"
                         f"\n用户：{row.get('user_id')}｜{status}"
                     )
+                    if status_key == "failed":
+                        reason = humanize_delivery_error(row.get("error_text"))
+                        lines.append(f"原因：{reason}")
+                        audit_id = str(row.get("audit_id") or "")
+                        resend_key = str(row.get("file_key") or "")
+                        if audit_id:
+                            resend_data = (
+                                f"mc:resend:{audit_id}:{resend_key}"
+                                if resend_key else f"mc:resend:{audit_id}"
+                            )
+                            resend_buttons.append([InlineKeyboardButton(
+                                f"🔁 重发：{name[:24]}",
+                                callback_data=resend_data,
+                            )])
             body = "\n".join(lines)
+            nav = [
+                [InlineKeyboardButton("⬅️ 返回发放审计", callback_data="mc:audit")],
+                [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+            ]
             await message.edit_text(
                 body[:3900],
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ 返回发放审计", callback_data="mc:audit")],
-                    [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
-                ]),
+                reply_markup=InlineKeyboardMarkup(resend_buttons + nav),
             )
         except Exception:
             log.exception("Could not render delivery audit details")
             await message.edit_text("⚠️ 发送明细暂时无法读取。", reply_markup=back_keyboard())
+    elif action == "resend" or action.startswith("resend:"):
+        parts = action.split(":")
+        if len(parts) < 2 or not parts[1]:
+            await query.answer("记录不存在。", show_alert=True)
+            return
+        resend_key = parts[2] if len(parts) > 2 else ""
+        audit = await db.get_delivery_audit_row(parts[1], resend_key or None)
+        if not audit:
+            await query.answer("该领取记录已找不到，可能已被清理。", show_alert=True)
+            return
+        target_user = int(audit.get("user_id") or 0)
+        file_key = str(audit.get("file_key") or "")
+        if not target_user or not file_key:
+            await query.answer("记录缺少接收人或资源信息，无法补发。", show_alert=True)
+            return
+        ok, reason = await send_catalog_file(client, target_user, file_key)
+        if ok:
+            await query.answer("✅ 已重新发送给该用户。", show_alert=False)
+        else:
+            await query.answer(reason, show_alert=True)
     elif action == "wm":
         try:
             rows = await db.list_recent_watermarks(limit=10)

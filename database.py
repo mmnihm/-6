@@ -2033,13 +2033,24 @@ class Database:
             )).fetchall()
 
     @staticmethod
+    def split_search_query(query=""):
+        """Split a search box input into normalized keywords (AND matched)."""
+        return [
+            token for token in re.split(r"[\s,，、;；/]+", str(query or "").strip())
+            if token
+        ]
+
+    @staticmethod
     def _catalog_filter(query="", category=""):
-        """Build the shared WHERE clause so page and count queries stay identical."""
+        """Build the shared WHERE clause so page and count queries stay identical.
+
+        Every keyword must appear in either the file name or its category (AND).
+        """
         conditions = []
         params = []
-        if query:
+        for token in Database.split_search_query(query):
             conditions.append("(f.file_name LIKE ? OR f.category LIKE ?)")
-            params.extend((f"%{query}%", f"%{query}%"))
+            params.extend((f"%{token}%", f"%{token}%"))
         if category:
             conditions.append("f.category=?")
             params.append(category)
@@ -2805,7 +2816,7 @@ class Database:
         limit = max(1, min(50, int(limit)))
         async with self.connect() as db:
             rows = await (await db.execute("""
-                SELECT a.created_at, a.user_id, a.file_key,
+                SELECT a.audit_id, a.created_at, a.user_id, a.file_key,
                        COALESCE(f.file_name, a.file_key) AS file_name,
                        a.category, a.media_type, a.status,
                        a.source_chat_id, a.source_message_id,
@@ -2816,6 +2827,29 @@ class Database:
                 LIMIT ?
             """, (limit,))).fetchall()
             return [dict(row) for row in rows]
+
+    async def get_delivery_audit_row(self, audit_id, file_key=None):
+        """Fetch one audit row by audit_id for an admin manual resend."""
+        async with self.connect() as db:
+            if file_key:
+                row = await (await db.execute("""
+                    SELECT audit_id, user_id, file_key, share_key, category, status,
+                           error_text, created_at
+                    FROM delivery_audit
+                    WHERE audit_id=? AND file_key=?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (str(audit_id), str(file_key)))).fetchone()
+            else:
+                row = await (await db.execute("""
+                    SELECT audit_id, user_id, file_key, share_key, category, status,
+                           error_text, created_at
+                    FROM delivery_audit
+                    WHERE audit_id=?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (str(audit_id),))).fetchone()
+            return dict(row) if row else None
 
     async def list_recent_watermarks(self, limit=10):
         """Most recent delivery codes, one row per code (a unit can span rows)."""
