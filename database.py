@@ -2487,6 +2487,39 @@ class Database:
                 ORDER BY c.created_at DESC
             """, (category, category))).fetchall()
 
+    async def list_categories_latest(self, limit=12):
+        """Folders ordered by the newest file inside them, then folder creation time."""
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT c.name AS category,
+                       COALESCE(c.file_count, 0) AS file_count,
+                       c.share_key AS share_key,
+                       MAX(f.created_at) AS latest_at,
+                       c.created_at AS created_at
+                FROM categories c
+                LEFT JOIN files f ON f.category=c.name
+                GROUP BY c.name, c.file_count, c.share_key, c.created_at
+                ORDER BY MAX(f.created_at) DESC, c.created_at DESC
+                LIMIT ?
+            """, (int(limit),))).fetchall()
+
+    async def get_top_categories(self, limit=12):
+        """Folders ranked by successful delivery count, then unique recipient count."""
+        async with self.connect() as db:
+            return await (await db.execute("""
+                SELECT c.name AS category,
+                       c.share_key AS share_key,
+                       COALESCE(c.file_count, 0) AS file_count,
+                       COUNT(a.audit_id) AS sends,
+                       COUNT(DISTINCT a.user_id) AS users
+                FROM delivery_audit a
+                JOIN categories c ON c.name=a.category
+                WHERE a.status='success' AND a.category<>''
+                GROUP BY c.name, c.share_key, c.file_count
+                ORDER BY sends DESC, users DESC, c.name ASC
+                LIMIT ?
+            """, (int(limit),))).fetchall()
+
     async def rename_category(self, old_name: str, new_name: str) -> bool:
         old_name = str(old_name or "").strip()[:120]
         new_name = str(new_name or "").strip()[:120]

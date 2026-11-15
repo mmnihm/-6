@@ -53,6 +53,7 @@ upload_latest_messages = {}
 upload_progress_state = {}
 pending_home_button_actions = {}
 pending_admin_actions = {}
+pending_welcome_edit = set()
 directory_import_running = False
 cangku_backup_in_progress = set()
 backup_retry_manual_requested = False
@@ -401,7 +402,8 @@ def admin_keyboard():
          InlineKeyboardButton("🔐 扫描账号", callback_data="mc:scannerlogin")],
         [InlineKeyboardButton("🧾 资源发放审计", callback_data="mc:audit")],
         [InlineKeyboardButton("🆔 领取编号查询", callback_data="mc:wm")],
-        [InlineKeyboardButton("🛡 内容保护与删除", callback_data="mc:contentguard")],
+        [InlineKeyboardButton("🛡 内容保护与删除", callback_data="mc:contentguard"),
+         InlineKeyboardButton("👋 进群欢迎", callback_data="mc:welcome")],
         [InlineKeyboardButton("🛡 管理员管理", callback_data="mc:admins"),
          InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
     ])
@@ -477,6 +479,29 @@ async def get_welcome_settings():
 def render_welcome_message(template, names, bot_url):
     name_text = "、".join(names)
     return template.replace("{name}", name_text).replace("{bot}", bot_url)
+
+
+async def render_welcome_admin(message, notice=""):
+    enabled, template = await get_welcome_settings()
+    body = (
+        "👋 进群欢迎设置\n\n"
+        f"当前状态：{'开启' if enabled else '关闭'}\n\n"
+        f"当前文案：\n{template}\n"
+    )
+    if notice:
+        body += f"\n{notice}\n"
+    await message.edit_text(
+        body,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"{'✅' if enabled else '⏸'} 自动欢迎开关",
+                callback_data="mc:welcome:toggle",
+            )],
+            [InlineKeyboardButton("✏️ 修改欢迎文案", callback_data="mc:welcome:edit")],
+            [InlineKeyboardButton("♻️ 恢复默认文案", callback_data="mc:welcome:reset")],
+            [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+        ]),
+    )
 
 
 async def telegram_bot_api(method: str, payload: dict, timeout=None):
@@ -1251,6 +1276,8 @@ DEFAULT_HOME_BUTTONS = [
     {"key": "history", "text": "🕘 最近获取", "type": "action", "enabled": True},
     {"key": "folders", "text": "🗂️ 文件夹列表", "type": "action", "enabled": True},
     {"key": "latest", "text": "🆕 最新资源", "type": "action", "enabled": True},
+    {"key": "latest_new", "text": "🆕 最近上新", "type": "action", "enabled": True},
+    {"key": "top", "text": "🔥 领取最多", "type": "action", "enabled": True},
     {"key": "random", "text": "🎲 随机探索", "type": "action", "enabled": True},
     {"key": "favorites", "text": "⭐ 收藏列表", "type": "action", "enabled": True},
     {"key": "notifications", "text": "🔔 新资源订阅", "type": "action", "enabled": True},
@@ -1281,14 +1308,14 @@ async def get_home_buttons():
         if current is None:
             buttons.append(dict(default))
             continue
-        if default["key"] in ("random", "latest", "folders", "favorites", "search", "history", "notifications", "member"):
+        if default["key"] in ("random", "latest", "latest_new", "top", "folders", "favorites", "search", "history", "notifications", "member"):
             current["text"] = default["text"]
             current["type"] = "action"
             current["enabled"] = True
     # "再来一批" is a result-screen action, never a home-menu button.
     buttons = [item for item in buttons if item.get("key") != "random_again"]
     # Keep built-in actions in a clear two-column order; custom URL buttons follow.
-    built_in_order = ["folders", "random", "notifications", "favorites", "member", "search", "history", "latest"]
+    built_in_order = ["folders", "latest_new", "top", "random", "notifications", "favorites", "member", "search", "history", "latest"]
     built_ins = {str(item.get("key")): item for item in buttons if item.get("key") in built_in_order}
     custom = [item for item in buttons if item.get("key") not in built_in_order]
     buttons = [built_ins[key] for key in built_in_order if key in built_ins] + custom
@@ -1315,7 +1342,8 @@ async def user_home_keyboard():
     # Existing search/history/latest features remain available below them.
     rows = []
     for group in (
-        ("folders", "random"),
+        ("folders", "latest_new"),
+        ("top", "random"),
         ("notifications", "favorites"),
         ("member",),
         ("search", "history"),
@@ -1328,7 +1356,7 @@ async def user_home_keyboard():
     # Preserve any custom buttons added by the administrator.
     custom = [item for item in enabled if item.get("key") not in {
         "search", "history", "folders", "latest", "random", "favorites",
-        "notifications", "member", "random_again",
+        "notifications", "member", "random_again", "latest_new", "top",
     }]
     for index in range(0, len(custom), 2):
         rows.append([make_button(item) for item in custom[index:index + 2]])
@@ -3737,6 +3765,9 @@ async def cancel_pending_admin_handler(client, message):
         return
     if pending_admin_actions.pop(user.id, None):
         await message.reply_text("已取消添加管理员。")
+    if int(user.id) in pending_welcome_edit:
+        pending_welcome_edit.discard(int(user.id))
+        await message.reply_text("已取消编辑欢迎文案。")
 
 
 @app.on_message(filters.private & filters.command("scancancel"))
@@ -3767,6 +3798,17 @@ async def scanner_login_input_handler(client, message):
     login_client = scanner_login_clients.get(user.id)
     value = (message.text or "").strip()
     if not value:
+        return
+
+    if int(user.id) in pending_welcome_edit:
+        pending_welcome_edit.discard(int(user.id))
+        await db.set_setting(WELCOME_MESSAGE_KEY, value)
+        bot_url = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
+        preview = render_welcome_message(value, ["新成员"], bot_url)
+        await message.reply_text(
+            f"✅ 欢迎文案已保存。\n\n预览：\n{preview}",
+            reply_markup=back_keyboard(),
+        )
         return
 
     if value == "✅ 结束上传":
@@ -5009,6 +5051,38 @@ async def user_catalog_callback_handler(client, query):
         await message.edit_text(body, reply_markup=InlineKeyboardMarkup(rows))
         return
 
+    if action[1] == "latest_new":
+        await query.answer("正在整理最近上新…")
+        records = await db.list_categories_latest(limit=12)
+        rows = [[InlineKeyboardButton(
+            f"📁 {str(item['category'])[:36]}（{int(item['file_count'] or 0)}）",
+            callback_data=f"uc:folderstats:{item['share_key']}:0",
+        )] for item in records]
+        rows.append([InlineKeyboardButton("🏠 返回主页", callback_data="uc:home")])
+        body = "🆕 最近上新（按目录内最新资源排序）\n\n"
+        body += ("\n".join(
+            f"{i}. {item['category']}（{int(item['file_count'] or 0)} 个资源）"
+            for i, item in enumerate(records, start=1)
+        ) if records else "暂时没有目录。")
+        await message.edit_text(body, reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if action[1] == "top":
+        await query.answer("正在整理热门目录…")
+        records = await db.get_top_categories(limit=12)
+        rows = [[InlineKeyboardButton(
+            f"📁 {str(item['category'])[:34]}（领 {int(item['sends'] or 0)} 次）",
+            callback_data=f"uc:folderstats:{item['share_key']}:0",
+        )] for item in records]
+        rows.append([InlineKeyboardButton("🏠 返回主页", callback_data="uc:home")])
+        body = "🔥 领取最多（按成功领取次数排序）\n\n"
+        body += ("\n".join(
+            f"{i}. {item['category']} — {int(item['sends'] or 0)} 次领取，{int(item['users'] or 0)} 位会员"
+            for i, item in enumerate(records, start=1)
+        ) if records else "暂时还没有领取记录。")
+        await message.edit_text(body, reply_markup=InlineKeyboardMarkup(rows))
+        return
+
     if action[1] == "random":
         # Acknowledge the button immediately; database and Telegram delivery
         # must not leave the user's callback spinner hanging.
@@ -5857,6 +5931,28 @@ async def admin_callback_handler(client, query):
                 [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
             ]),
         )
+    elif action == "welcome" or action.startswith("welcome:"):
+        parts = action.split(":")
+        op = parts[1] if len(parts) > 1 else ""
+        notice = ""
+        if op == "toggle":
+            enabled, _ = await get_welcome_settings()
+            await db.set_setting(WELCOME_ENABLED_KEY, "0" if enabled else "1")
+            notice = "✅ 已切换自动欢迎开关。"
+        elif op == "reset":
+            await db.set_setting(WELCOME_MESSAGE_KEY, "")
+            notice = "♻️ 已恢复默认欢迎文案。"
+        elif op == "edit":
+            pending_welcome_edit.add(int(user.id))
+            await message.edit_text(
+                "✏️ 编辑进群欢迎文案\n\n"
+                "请直接发送新的欢迎文案。\n"
+                "可用占位：{name}=新人称呼，{bot}=机器人入口。\n"
+                "发送 /cancel 可取消。",
+                reply_markup=back_keyboard(),
+            )
+            return
+        await render_welcome_admin(message, notice)
     elif action == "home":
         users, files, members, banned = await db.stats()
         group_id = await get_member_group_id()
@@ -6554,6 +6650,7 @@ async def welcome_admin_handler(client, message):
         await reply_admin_only(message)
         return
 
+    pending_welcome_edit.discard(int(user.id))
     enabled, template = await get_welcome_settings()
     parts = message.command[1:] if len(message.command) > 1 else []
     bot_url = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
