@@ -778,6 +778,30 @@ def format_folder_size(value):
     return f"{amount:.2f} TB"
 
 
+CN_TZ = timezone(timedelta(hours=8))
+
+
+def parse_cn_datetime(value):
+    """Parse a stored UTC timestamp into a Beijing-time datetime, or None."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(CN_TZ)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def format_cn_datetime(value, fmt="%Y-%m-%d %H:%M:%S"):
+    """Render a stored UTC timestamp in Beijing time; fall back to raw text."""
+    parsed = parse_cn_datetime(value)
+    if parsed is None:
+        return str(value or "")[:19]
+    return parsed.strftime(fmt)
+
+
 def format_folder_datetime(value):
     if not value:
         return "暂无记录"
@@ -4191,7 +4215,7 @@ def watermark_detail_text(code, rows):
     status_names = {"success": "成功", "failed": "失败", "attempted": "未完成"}
     lines = [f"🆔 领取编号：{code}", "━━━━━━━━━━━━━━"]
     for row in rows:
-        stamp = str(row["created_at"] or "").replace("T", " ")[:19]
+        stamp = format_cn_datetime(row["created_at"])
         status = status_names.get(str(row["status"]), str(row["status"] or "未知"))
         lines.extend([
             f"👤 用户：{int(row['user_id'])}",
@@ -4248,7 +4272,7 @@ async def delivery_audit_detail_handler(client, message):
             return
         lines = [f"🧾 最近 {len(rows)} 条资源发送明细（最多50条）"]
         for row in rows:
-            stamp = str(row.get("created_at") or "").replace("T", " ")
+            stamp = format_cn_datetime(row.get("created_at"))
             name = str(row.get("file_name") or row.get("file_key") or "未知资源")[:65]
             category = str(row.get("category") or "未分类")[:30]
             status = {"success": "成功", "failed": "失败", "attempted": "未完成"}.get(
@@ -4323,7 +4347,7 @@ async def delivery_audit_ban_handler(client, message):
                     f"\n目录：{str(row.get('category') or '未分类')[:30]}"
                     f"｜发送 {int(row.get('sends') or 0)} 次"
                     f"｜用户 {int(row.get('users') or 0)}"
-                    f"\n最后发送：{row.get('last_sent')}"
+                    f"\n最后发送：{format_cn_datetime(row.get('last_sent'))}"
                 )
         else:
             lines.append("该时间段没有审计记录。")
@@ -4333,7 +4357,7 @@ async def delivery_audit_ban_handler(client, message):
                 lines.append(
                     f"用户 {row.get('user_id')}：{int(row.get('sends') or 0)} 次"
                     f"｜{int(row.get('resources') or 0)} 项资源"
-                    f"｜最后发送 {row.get('last_sent')}"
+                    f"｜最后发送 {format_cn_datetime(row.get('last_sent'))}"
                 )
         else:
             lines.append("无记录。")
@@ -4341,7 +4365,7 @@ async def delivery_audit_ban_handler(client, message):
             lines.extend([
                 "",
                 "🕒 封禁前最后一笔发送",
-                f"时间：{latest.get('created_at')}",
+                f"时间：{format_cn_datetime(latest.get('created_at'))}",
                 f"资源：{latest.get('file_name')}",
                 f"用户：{latest.get('user_id')}｜结果：{latest.get('status')}",
                 f"来源消息：{latest.get('source_chat_id')} / {latest.get('source_message_id')}",
@@ -5826,7 +5850,7 @@ async def admin_callback_handler(client, query):
                 lines.append("暂无逐条发送记录。新版本部署后产生的发送才会记录。")
             else:
                 for row in rows:
-                    stamp = str(row.get("created_at") or "").replace("T", " ")
+                    stamp = format_cn_datetime(row.get("created_at"))
                     name = str(row.get("file_name") or row.get("file_key") or "未知资源")[:45]
                     category = str(row.get("category") or "未分类")[:25]
                     status = {"success": "成功", "failed": "失败", "attempted": "未完成"}.get(
@@ -5863,7 +5887,7 @@ async def admin_callback_handler(client, query):
             else:
                 for index, row in enumerate(rows, 1):
                     code = str(row["watermark"])
-                    stamp = str(row["created_at"] or "").replace("T", " ")[5:16]
+                    stamp = format_cn_datetime(row["created_at"], "%m-%d %H:%M")
                     name = str(row["file_key"] or "")[:34]
                     lines.append(
                         f"{index}. {code}｜用户 {int(row['user_id'])}｜{stamp}"
