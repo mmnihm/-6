@@ -1,10 +1,26 @@
 import html
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 from aiohttp import web
 
 
 PAGE_SIZE = 30
+CN_TZ = timezone(timedelta(hours=8))
+
+
+def format_catalog_date(value):
+    """Show a stored UTC timestamp as a Beijing-time YYYY-MM-DD date."""
+    raw = str(value or "")
+    if not raw:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return raw[:10]
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(CN_TZ).strftime("%Y-%m-%d")
 
 
 def create_catalog_app(database, username_provider):
@@ -53,7 +69,7 @@ def create_catalog_app(database, username_provider):
             name = html.escape(row["file_name"])
             group = html.escape(row["category"] or "未分类")
             media_type = html.escape(row["media_type"])
-            created = html.escape((row["created_at"] or "")[:10])
+            created = html.escape(format_catalog_date(row["created_at"]))
             link = f'https://t.me/{username}?start=file_{row["file_key"]}'
             cards.append(
                 '<article class="file">'

@@ -55,7 +55,19 @@ pending_home_button_actions = {}
 pending_admin_actions = {}
 pending_welcome_edit = set()
 pending_announce_edit = set()
+pending_member_group_url = set()
 directory_import_running = False
+
+# A light global pacing guard for outgoing Bot API sends. Telegram still owns the
+# authoritative limits; the existing 429/retry_after handling below is untouched.
+TELEGRAM_SEND_MIN_INTERVAL = 0.15
+TELEGRAM_SEND_METHODS = frozenset({
+    "copyMessage", "copyMessages", "forwardMessage", "forwardMessages",
+    "sendMessage", "sendPhoto", "sendVideo", "sendDocument", "sendAudio",
+    "sendAnimation", "sendVoice", "sendMediaGroup",
+})
+telegram_send_lock = asyncio.Lock()
+last_telegram_send_at = 0.0
 cangku_backup_in_progress = set()
 backup_retry_manual_requested = False
 backup_worker_running = False
@@ -454,6 +466,44 @@ async def get_member_group_id():
     return int(value) if value else None
 
 
+MEMBER_GROUP_URL_KEY = "member_group_url"
+
+
+def normalize_member_group_url(raw):
+    """Accept only http/https/t.me links; anything else counts as "not set"."""
+    value = str(raw or "").strip()[:200]
+    if not value:
+        return ""
+    if not value.lower().startswith(("http://", "https://", "t.me/")):
+        return ""
+    return value
+
+
+async def get_member_group_url():
+    return normalize_member_group_url(await db.get_setting(MEMBER_GROUP_URL_KEY))
+
+
+async def membership_gate_markup():
+    """Join button for the membership gate replies; None keeps them plain text."""
+    url = await get_member_group_url()
+    if not url:
+        return None
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 加入会员群", url=url)]
+    ])
+
+
+MEMBERSHIP_GATE_TEXT = "⛔ 获取资源失败：请先加入管理员指定的会员群，再重新点击获取资源。"
+
+
+async def reply_membership_gate(message):
+    """Membership gate reply: plain text unless an invitation link is configured."""
+    await message.reply_text(
+        MEMBERSHIP_GATE_TEXT,
+        reply_markup=await membership_gate_markup(),
+    )
+
+
 WELCOME_ENABLED_KEY = "welcome_enabled"
 WELCOME_MESSAGE_KEY = "welcome_message"
 
@@ -531,12 +581,28 @@ async def render_announce_admin(message, notice=""):
     )
 
 
+async def wait_telegram_send_slot():
+    """Space out outgoing sends so bursts never reach Telegram back to back."""
+    global last_telegram_send_at
+    async with telegram_send_lock:
+        now = time.monotonic()
+        delay = TELEGRAM_SEND_MIN_INTERVAL - (now - last_telegram_send_at)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        last_telegram_send_at = time.monotonic()
+
+
 async def telegram_bot_api(method: str, payload: dict, timeout=None):
     """Call Telegram Bot API directly, retrying rate-limited media transfers safely."""
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/{method}"
     session = telegram_http_session
     if session is None or session.closed:
         raise RuntimeError("Telegram HTTP session is not initialized")
+
+    # Only active sending/copying methods are paced; callback answers and other
+    # read-only calls must stay immediate.
+    if method in TELEGRAM_SEND_METHODS:
+        await wait_telegram_send_slot()
 
     # Telegram explicitly tells us when a 429 may be retried. Retry both copy
     # and forward operations so backup jobs survive rate limits.
@@ -896,7 +962,36 @@ def format_folder_datetime(value):
         return str(value)[:32]
 
 
-def folder_detail_text(category_row, files, page, member_group_id):
+MEDIA_TYPE_ICONS = {
+    "photo": "🖼",
+    "video": "🎬",
+    "animation": "🎞",
+    "audio": "🎵",
+    "voice": "🎵",
+}
+
+
+def media_type_icon(media_type):
+    """Emoji for one stored media_type; unknown types fall back to a document."""
+    return MEDIA_TYPE_ICONS.get(str(media_type or "").lower(), "📄")
+
+
+async def user_claimed_file_keys(user_id, files):
+    """Which of these single files this member already received (one query)."""
+    keys = [
+        str(row["file_key"]) for row in files
+        if row["file_key"] and not row["album_group_id"]
+    ]
+    if not keys:
+        return set()
+    try:
+        return {str(key) for key in await db.get_user_history_keys(int(user_id), keys)}
+    except Exception:
+        log.exception("Could not read claimed keys for user %s", user_id)
+        return set()
+
+
+def folder_detail_text(category_row, files, page, member_group_id, claimed_keys=None):
     name = str(category_row["category"])
     body = [
         f"📁 #{name}",
@@ -932,6 +1027,7 @@ def folder_detail_text(category_row, files, page, member_group_id):
     body.extend(["", f"📄 资源列表（第 {page + 1} 页）："])
     file_labels = []
     seen_album_ids = set()
+    claimed = claimed_keys or set()
     for row in files:
         album_id = row["album_group_id"]
         if album_id:
@@ -940,7 +1036,11 @@ def folder_detail_text(category_row, files, page, member_group_id):
             seen_album_ids.add(str(album_id))
             file_labels.append(f"• 🗂 相册组（{int(row['album_size'] or 0)} 个文件）")
         else:
-            file_labels.append(f"• {row['file_name'][:48]}")
+            file_name = str(row["file_name"] or "未命名资源")[:48]
+            claimed_mark = "✅ " if str(row["file_key"]) in claimed else ""
+            file_labels.append(
+                f"• {claimed_mark}{media_type_icon(row['media_type'])} {file_name}"
+            )
     body.append("\n".join(file_labels) if file_labels else "这个目录暂时没有资源。")
     return "\n".join(body)
 
@@ -1017,6 +1117,21 @@ def folder_detail_keyboard(category_row, page, has_next, is_favorite):
         ))
     if nav:
         rows.append(nav)
+    total = int(category_row["file_count"] or 0)
+    last_page = max(0, (total - 1) // 20) if total > 0 else 0
+    jump = []
+    if page > 0:
+        jump.append(InlineKeyboardButton(
+            "⏮ 回顶部",
+            callback_data=f"uc:folderkey:{share_key}:0",
+        ))
+    if page < last_page:
+        jump.append(InlineKeyboardButton(
+            "⏭ 到末页",
+            callback_data=f"uc:folderkey:{share_key}:{last_page * 20}",
+        ))
+    if jump:
+        rows.append(jump)
     rows.append([InlineKeyboardButton("⬅️ 文件夹列表", callback_data="uc:folders")])
     return InlineKeyboardMarkup(rows)
 
@@ -1409,6 +1524,7 @@ async def user_home_text(user_id):
         + f"• 消息：{stats['messages']} 条\n"
         + f"• 图片：{stats['images']} 张\n"
         + f"• 视频：{stats['videos']} 个\n\n"
+        + "💡 使用提示：先加入会员群完成验证，再逛「文件夹列表」挑目录；找不到资源时直接发送关键词搜索。\n\n"
         + "请选择下方功能："
     )
 
@@ -2160,7 +2276,10 @@ async def start_handler(client, message):
             category_row = dict(category_row)
             category_row["category_index"] = category_index
             await message.reply_text(
-                folder_detail_text(category_row, files, 0, await get_member_group_id()),
+                folder_detail_text(
+                    category_row, files, 0, await get_member_group_id(),
+                    await user_claimed_file_keys(user.id, files),
+                ),
                 reply_markup=folder_detail_keyboard(
                     category_row, 0, len(files) == 20,
                     await db.is_category_favorite(user.id, category_row["share_key"])
@@ -2170,7 +2289,7 @@ async def start_handler(client, message):
             return
         if payload.startswith("file_"):
             if not await has_access(user.id, force_refresh=True):
-                await message.reply_text("⛔ 获取资源失败：请先加入管理员指定的会员群，再重新点击获取资源。")
+                await reply_membership_gate(message)
                 return
             pace = None if await is_admin(user.id) else delivery_pace_hint(user.id)
             if pace:
@@ -3818,6 +3937,9 @@ async def cancel_pending_admin_handler(client, message):
     if int(user.id) in pending_announce_edit:
         pending_announce_edit.discard(int(user.id))
         await message.reply_text("已取消编辑公告。")
+    if int(user.id) in pending_member_group_url:
+        pending_member_group_url.discard(int(user.id))
+        await message.reply_text("已取消设置群邀请链接。")
 
 
 @app.on_message(filters.private & filters.command("scancancel"))
@@ -3866,6 +3988,33 @@ async def scanner_login_input_handler(client, message):
         await db.set_setting(ANNOUNCEMENT_KEY, value[:ANNOUNCEMENT_MAX_LEN])
         await message.reply_text(
             "✅ 首页公告已保存。\n\n当前公告：\n" + value[:ANNOUNCEMENT_MAX_LEN],
+            reply_markup=back_keyboard(),
+        )
+        return
+
+    if int(user.id) in pending_member_group_url:
+        if value in ("清空", "清除", "无", "删除"):
+            pending_member_group_url.discard(int(user.id))
+            await db.set_setting(MEMBER_GROUP_URL_KEY, "")
+            await message.reply_text(
+                "✅ 已清空会员群邀请链接，未入群提示将恢复纯文本。",
+                reply_markup=back_keyboard(),
+            )
+            return
+        url = normalize_member_group_url(value)
+        if not url:
+            # Keep the input state so the admin can simply resend a valid link.
+            await message.reply_text(
+                "❌ 链接格式不正确。请发送以 http://、https:// 或 t.me/ 开头的链接，"
+                "或发送「清空」。",
+                reply_markup=back_keyboard(),
+            )
+            return
+        pending_member_group_url.discard(int(user.id))
+        await db.set_setting(MEMBER_GROUP_URL_KEY, url)
+        await message.reply_text(
+            f"✅ 会员群邀请链接已保存：\n{url}\n\n"
+            "未入群提示会附带「👥 加入会员群」按钮。",
             reply_markup=back_keyboard(),
         )
         return
@@ -4862,7 +5011,11 @@ async def build_favorites_view(user_id):
                 callback_data=f"uc:folderlink:{item['share_key']}",
             )])
     if not files and not folders:
-        sections.extend(["", "你还没有收藏文件或文件夹。"])
+        sections.extend([
+            "",
+            "你还没有收藏文件或文件夹。",
+            "去「文件夹列表」打开目录并点「⭐ 收藏目录」，或在资源消息里点「⭐ 收藏」。",
+        ])
     rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
     return "\n".join(sections), InlineKeyboardMarkup(rows)
 
@@ -4922,15 +5075,36 @@ async def build_catalog_search_page(user_id, query_text, offset=0, token=None):
                 callback_data=f"uc:folderlink:{share_key}",
             )])
 
+    share_key_by_category = {
+        str(row["category"] or ""): str(row["share_key"] or "")
+        for row in all_categories
+    }
+    matched_names = {str(row["category"] or "") for row in matched_categories}
+    # Group one page of search hits by folder so the text and the keyboard read
+    # in the same order: folder heading first, then its files.
+    record_groups = {}
+    number = offset
     for row in records:
-        file_key = str(row["file_key"] or "")
-        if not file_key:
-            continue
-        name = str(row["file_name"] or "未命名资源")
-        buttons.append([InlineKeyboardButton(
-            f"📄 {name[:38]}",
-            callback_data=f"uc:open:{file_key}",
-        )])
+        number += 1
+        group_name = str(row["category"] or "未分类")
+        record_groups.setdefault(group_name, []).append((number, row))
+
+    for group_name, group_records in record_groups.items():
+        share_key = share_key_by_category.get(group_name, "")
+        if share_key and group_name not in matched_names:
+            buttons.append([InlineKeyboardButton(
+                f"📁 {group_name[:28]}（{len(group_records)}）",
+                callback_data=f"uc:folderlink:{share_key}",
+            )])
+        for seq, row in group_records:
+            file_key = str(row["file_key"] or "")
+            if not file_key:
+                continue
+            name = str(row["file_name"] or "未命名资源")
+            buttons.append([InlineKeyboardButton(
+                f"{seq}. {media_type_icon(row['media_type'])} {name[:32]}",
+                callback_data=f"uc:open:{file_key}",
+            )])
 
     for category_row in recommended_categories:
         folder_name = str(category_row["category"] or "未命名文件夹")
@@ -4965,18 +5139,17 @@ async def build_catalog_search_page(user_id, query_text, offset=0, token=None):
             "点击文件夹名称即可进入目录，再选择获取资源。",
         ])
     if records:
-        body_rows = [
-            "\n".join([
-                f"{offset + index}. {str(row['file_name'] or '未命名资源')[:48]}",
-                f"   📁 {str(row['category'] or '未分类')[:40]}",
-            ])
-            for index, row in enumerate(records, 1)
-        ]
         sections.extend([
             "",
             f"📄 找到 {total} 个匹配资源（第 {offset // page_size + 1} 页）",
-            "\n\n".join(body_rows),
         ])
+        for group_name, group_records in record_groups.items():
+            sections.extend(["", f"📁 {group_name[:40]}"])
+            for seq, row in group_records:
+                sections.append(
+                    f"{seq}. {media_type_icon(row['media_type'])} "
+                    f"{str(row['file_name'] or '未命名资源')[:48]}"
+                )
     elif not matched_categories:
         if recommended_categories:
             sections.extend([
@@ -5080,7 +5253,7 @@ async def user_catalog_callback_handler(client, query):
         last_getfolder_click_at[int(user.id)] = now
         await query.answer("📥 正在检查会员群资格并准备资源…")
         if not await has_access(user.id, force_refresh=True):
-            await message.reply_text("⛔ 获取资源失败：请先加入管理员指定的会员群，再重新点击获取资源。")
+            await reply_membership_gate(message)
             return
 
     if action[1] == "home":
@@ -5184,7 +5357,7 @@ async def user_catalog_callback_handler(client, query):
         await query.answer("🎲 正在随机选择资源（相册整组发送）")
         try:
             if not await has_access(user.id, force_refresh=True):
-                await message.reply_text("⛔ 获取资源失败：请先加入管理员指定的会员群，再重新点击获取资源。")
+                await reply_membership_gate(message)
                 return
             total = await db.catalog_total()
             if not total:
@@ -5520,8 +5693,9 @@ async def user_catalog_callback_handler(client, query):
         page = offset // 20
         category_row = dict(category_row)
         category_row["category_index"] = index
+        claimed = await user_claimed_file_keys(user.id, files)
         await message.edit_text(
-            folder_detail_text(category_row, files, page, group_id),
+            folder_detail_text(category_row, files, page, group_id, claimed),
             reply_markup=folder_detail_keyboard(
                 category_row, page, len(files) == 20, is_favorite
             ),
@@ -5539,7 +5713,8 @@ async def user_catalog_callback_handler(client, query):
             )] for row in records]
             body = "🕘 最近获取\n\n" + (
                 "\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
-                if records else "你还没有获取过资源。"
+                if records else "你还没有获取过资源。\n"
+                "去首页「文件夹列表」里挑一个目录领取，领取记录会保存在这里。"
             )
             rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
             await message.edit_text(body, reply_markup=InlineKeyboardMarkup(rows))
@@ -5566,7 +5741,10 @@ async def user_catalog_callback_handler(client, query):
             files = await db.list_category_files(row["category"], limit=20, offset=offset)
             page = offset // 20
             await message.edit_text(
-                folder_detail_text(row, files, page, await get_member_group_id()),
+                folder_detail_text(
+                    row, files, page, await get_member_group_id(),
+                    await user_claimed_file_keys(user.id, files),
+                ),
                 reply_markup=folder_detail_keyboard(row, page, len(files) == 20, added),
                 disable_web_page_preview=True,
             )
@@ -5590,7 +5768,10 @@ async def user_catalog_callback_handler(client, query):
         page = offset // 20
         await query.answer()
         await message.edit_text(
-            folder_detail_text(row, files, page, await get_member_group_id()),
+            folder_detail_text(
+                row, files, page, await get_member_group_id(),
+                await user_claimed_file_keys(user.id, files),
+            ),
             reply_markup=folder_detail_keyboard(
                 row, page, len(files) == 20,
                 await db.is_category_favorite(user.id, action[2])
@@ -6248,9 +6429,20 @@ async def admin_callback_handler(client, query):
             f"会员群：{group_id or '未绑定'}\n主存储频道：{primary or '未绑定'}\n备用存储（频道/群组）：{backup or '未绑定'}\n\n选择需要绑定或刷新状态：",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("👥 绑定会员群", callback_data="mc:bindgroup")],
+                [InlineKeyboardButton("🔗 设置群邀请链接", callback_data="mc:setgroupurl")],
                 [InlineKeyboardButton("📥 绑定主频道", callback_data="mc:bindmain"), InlineKeyboardButton("📥 绑定备份频道", callback_data="mc:bindbackup")],
                 [InlineKeyboardButton("⬅️ 返回", callback_data="mc:home")],
             ]),
+        )
+    elif action == "setgroupurl":
+        current = await get_member_group_url()
+        pending_member_group_url.add(int(user.id))
+        await message.edit_text(
+            "🔗 会员群邀请链接\n\n"
+            f"当前：{current or '未设置'}\n\n"
+            "请直接发送邀请链接（以 http://、https:// 或 t.me/ 开头）。\n"
+            "发送「清空」可移除；发送 /cancel 放弃本次设置。",
+            reply_markup=back_keyboard(),
         )
     elif action in ("bindgroup", "bindmain", "bindbackup"):
         setting = {"bindgroup": "member_group_id", "bindmain": "storage_primary_channel_id", "bindbackup": "storage_backup_channel_id"}[action]
@@ -6274,11 +6466,12 @@ async def admin_callback_handler(client, query):
                 if expiry is None:
                     label = "永久"
                 else:
-                    try:
-                        expiry_dt = datetime.fromisoformat(expiry)
-                        label = "已过期" if expiry_dt <= now else expiry_dt.strftime("%Y-%m-%d %H:%M UTC")
-                    except ValueError:
+                    expiry_dt = parse_cn_datetime(expiry)
+                    if expiry_dt is None:
                         label = "日期异常"
+                    else:
+                        # Display only: Beijing time for the admin, expiry check untouched.
+                        label = "已过期" if expiry_dt <= now else expiry_dt.strftime("%Y-%m-%d %H:%M")
                 lines.append(f"{row['user_id']} — {label}")
             body = "👥 手动会员列表\n" + "\n".join(lines) + "\n\n授权：/grant 用户ID 天数|永久\n取消：/revoke 用户ID"
         await message.edit_text(body, reply_markup=back_keyboard())
@@ -7013,11 +7206,12 @@ async def members_handler(client, message):
         if expiry is None:
             label = "永久"
         else:
-            try:
-                dt = datetime.fromisoformat(expiry)
-                label = "已过期" if dt <= now else dt.strftime("%Y-%m-%d %H:%M UTC")
-            except ValueError:
+            dt = parse_cn_datetime(expiry)
+            if dt is None:
                 label = "日期异常"
+            else:
+                # Display only: Beijing time for the admin, expiry check untouched.
+                label = "已过期" if dt <= now else dt.strftime("%Y-%m-%d %H:%M")
         lines.append(f'{row["user_id"]} — {label}')
     await message.reply_text("手动授权列表：\n" + "\n".join(lines))
 
