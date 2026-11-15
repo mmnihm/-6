@@ -438,8 +438,6 @@ class Database:
                 ON delivery_audit(file_key, created_at);
             CREATE INDEX IF NOT EXISTS idx_delivery_audit_user
                 ON delivery_audit(user_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_delivery_audit_watermark
-                ON delivery_audit(watermark);
             CREATE TABLE IF NOT EXISTS pending_deletions (
                 chat_id BIGINT NOT NULL,
                 message_id BIGINT NOT NULL,
