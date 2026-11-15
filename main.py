@@ -4,6 +4,7 @@ import aiohttp
 import logging
 import os
 import secrets
+import time
 from datetime import datetime, timezone, timedelta
 
 from aiohttp import web
@@ -60,6 +61,37 @@ last_user_activity = 0.0
 category_delivery_in_progress = set()
 last_getfolder_click_at = {}  # Per-user 5-second resource button cooldown
 file_open_in_progress = set()
+# Per-member delivery pacing. A member requesting resources in a tight loop looks
+# exactly like scraping, and it also floods Telegram with repeated sends; a short
+# per-action interval plus an hourly ceiling keeps normal browsing untouched
+# (one batch click still delivers its whole batch) while stopping click loops.
+DELIVERY_MIN_INTERVAL = 1.5
+DELIVERY_HOURLY_LIMIT = 120
+_delivery_last_at = {}
+_delivery_window = {}
+
+
+def delivery_pace_hint(user_id):
+    """Return a short hint when the member is clicking too fast, else None."""
+    now = time.monotonic()
+    window = _delivery_window.get(int(user_id))
+    if window is None:
+        window = []
+        _delivery_window[int(user_id)] = window
+    while window and now - window[0] > 3600:
+        window.pop(0)
+    last = _delivery_last_at.get(int(user_id))
+    if last is not None and now - last < DELIVERY_MIN_INTERVAL:
+        return "⏳ 点得有点快，稍等一下再取。"
+    if len(window) >= DELIVERY_HOURLY_LIMIT:
+        return "⏳ 这一小时取得太多了，稍后再来。"
+    _delivery_last_at[int(user_id)] = now
+    window.append(now)
+    if len(_delivery_window) > 5000:
+        for key in list(_delivery_window)[:2500]:
+            _delivery_window.pop(key, None)
+            _delivery_last_at.pop(key, None)
+    return None
 bot_admin_status_cache = {}
 # Ordinary members may browse and retrieve; their uploads are ignored silently.
 search_sessions = {}
@@ -1898,6 +1930,10 @@ async def start_handler(client, message):
         if payload.startswith("file_"):
             if not await has_access(user.id, force_refresh=True):
                 await message.reply_text("⛔ 获取资源失败：请先加入管理员指定的会员群，再重新点击获取资源。")
+                return
+            pace = None if await is_admin(user.id) else delivery_pace_hint(user.id)
+            if pace:
+                await message.reply_text(pace)
                 return
             ok, result = await send_catalog_file(client, user.id, payload[5:])
             if not ok:
@@ -4745,6 +4781,10 @@ async def user_catalog_callback_handler(client, query):
                 await message.reply_text("📭 暂时没有找到可发送的资源，请稍后重试。")
                 return
 
+            pace = None if await is_admin(user.id) else delivery_pace_hint(user.id)
+            if pace:
+                await message.reply_text(pace)
+                return
             sent, failed, skipped, _, _last_sent_message_id = await send_catalog_batch(
                 client, user.id, "random", 0, rows, track_progress=False
             )
@@ -5180,6 +5220,10 @@ async def user_catalog_callback_handler(client, query):
             next_offset = offset
             has_more = False
             try:
+                pace = None if await is_admin(user.id) else delivery_pace_hint(user.id)
+                if pace:
+                    await message.reply_text(pace)
+                    return
                 sent, failed, skipped, next_offset, last_sent_message_id = await send_catalog_batch(
                     client, user.id, member_progress_key, offset, batch
                 )
@@ -5292,6 +5336,10 @@ async def user_catalog_callback_handler(client, query):
         try:
             if not await has_access(user.id, force_refresh=True):
                 await query.answer("⛔ 请先加入管理员指定的会员群，再获取资源。", show_alert=True)
+                return
+            pace = None if await is_admin(user.id) else delivery_pace_hint(user.id)
+            if pace:
+                await query.answer(pace, show_alert=False)
                 return
             ok, result = await send_catalog_file(client, user.id, action[2])
             await query.answer(result, show_alert=not ok)
