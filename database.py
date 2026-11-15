@@ -429,6 +429,7 @@ class Database:
                 error_text TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 finished_at TEXT,
+                watermark TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY(audit_id, file_key)
             );
             CREATE INDEX IF NOT EXISTS idx_delivery_audit_created
@@ -437,6 +438,8 @@ class Database:
                 ON delivery_audit(file_key, created_at);
             CREATE INDEX IF NOT EXISTS idx_delivery_audit_user
                 ON delivery_audit(user_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_delivery_audit_watermark
+                ON delivery_audit(watermark);
             CREATE TABLE IF NOT EXISTS pending_deletions (
                 chat_id BIGINT NOT NULL,
                 message_id BIGINT NOT NULL,
@@ -534,6 +537,22 @@ class Database:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_upload_batch_dedupe_key "
                 "ON upload_batch_items(upload_dedupe_key) WHERE upload_dedupe_key IS NOT NULL"
             )
+            audit_columns = await (await db.execute(
+                "SELECT column_name AS name FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='delivery_audit'"
+            )).fetchall() if self.uses_postgres else await (await db.execute(
+                "PRAGMA table_info(delivery_audit)"
+            )).fetchall()
+            audit_column_names = {row["name"] for row in audit_columns}
+            if audit_column_names and "watermark" not in audit_column_names:
+                await db.execute(
+                    "ALTER TABLE delivery_audit ADD COLUMN watermark TEXT NOT NULL DEFAULT ''"
+                )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_delivery_audit_watermark "
+                "ON delivery_audit(watermark)"
+            )
+
             category_columns = await (await db.execute(
                 "SELECT column_name AS name FROM information_schema.columns "
                 "WHERE table_schema=current_schema() AND table_name='categories'"
@@ -2679,6 +2698,7 @@ class Database:
                 int(item["source_message_id"]) if item.get("source_message_id") is not None else None,
                 str(item.get("delivery_method") or "")[:40],
                 "attempted", None, "", created_at, None,
+                str(item.get("watermark") or "")[:12],
             ))
         if not rows:
             return
@@ -2688,8 +2708,8 @@ class Database:
                     audit_id, user_id, share_key, file_key, category, media_type,
                     album_group_id, source_chat_id, source_message_id,
                     delivery_method, status, telegram_message_id, error_text,
-                    created_at, finished_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, finished_at, watermark
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(audit_id, file_key) DO NOTHING
             """, rows)
             await db.commit()
@@ -2765,6 +2785,23 @@ class Database:
                 LIMIT ?
             """, (limit,))).fetchall()
             return [dict(row) for row in rows]
+
+    async def find_delivery_by_watermark(self, watermark, limit=20):
+        """Trace one delivery code back to who received which resource."""
+        code = str(watermark or "").strip().upper()
+        if not code:
+            return []
+        async with self.connect() as db:
+            rows = await (await db.execute("""
+                SELECT audit_id, user_id, share_key, file_key, category, media_type,
+                       delivery_method, status, telegram_message_id, error_text,
+                       created_at, finished_at, watermark
+                FROM delivery_audit
+                WHERE upper(watermark)=?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (code, int(limit)))).fetchall()
+            return rows
 
     async def get_delivery_audit_before(self, ban_time, hours=24, limit=10):
         """Summarize deliveries in the window immediately before a supplied ban time."""

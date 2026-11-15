@@ -92,6 +92,53 @@ def delivery_pace_hint(user_id):
             _delivery_window.pop(key, None)
             _delivery_last_at.pop(key, None)
     return None
+
+# Delivery watermark: one short code per delivered unit, written into the audit
+# row and shown in the caption the member receives, so a leaked or resold file
+# can be traced back to the account that received it.
+WATERMARK_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+WATERMARK_LENGTH = 6
+
+
+def make_watermark():
+    """Six unambiguous characters; ~1e9 combinations, no O/0/I/1 confusion."""
+    return "".join(secrets.choice(WATERMARK_ALPHABET) for _ in range(WATERMARK_LENGTH))
+
+
+def delivery_caption(category, file_name, watermark, user_id):
+    """Caption shown with every delivered file or album."""
+    lines = []
+    if category:
+        lines.append(f"📁 {category}")
+    if file_name:
+        lines.append(f"📄 {file_name}")
+    lines.append(f"🆔 领取编号：{watermark}")
+    lines.append(f"👤 用户 #{int(user_id)} · 仅限本人使用，转卖可追溯")
+    return "\n".join(lines)[:1000]
+
+
+async def apply_delivery_watermark(client, chat_id, message_ids, category, file_name,
+                                   watermark, user_id):
+    """Stamp the caption after delivery so the send path itself stays fast.
+
+    Albums share one caption, so the first message of the unit is enough.
+    """
+    caption = delivery_caption(category, file_name, watermark, user_id)
+    for message_id in message_ids:
+        if not message_id:
+            continue
+        try:
+            await telegram_bot_api("editMessageCaption", {
+                "chat_id": int(chat_id),
+                "message_id": int(message_id),
+                "caption": caption,
+            })
+        except Exception as exc:
+            log.warning(
+                "Watermark caption edit failed: user=%s message=%s code=%s error=%s",
+                user_id, message_id, watermark, str(exc)[:180],
+            )
+        return
 bot_admin_status_cache = {}
 # Ordinary members may browse and retrieve; their uploads are ignored silently.
 search_sessions = {}
@@ -1454,7 +1501,7 @@ DELIVERY_MAX_ATTEMPTS = 3
 
 async def send_catalog_file(client, user_id, file_key, return_message_id=False,
                             record=None, storage=None, settings=None,
-                            defer_side_effects=False):
+                            defer_side_effects=False, watermark=None):
     record = record if record is not None else await db.get_file(file_key)
     if not record:
         return (False, "文件不存在或已被移除。", None) if return_message_id else (False, "文件不存在或已被移除。")
@@ -1531,6 +1578,14 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False,
     if not defer_side_effects:
         await schedule_member_delivery_delete(client, user_id, [copied_message_id])
         await db.record_history(user_id, file_key)
+    spawn_background(
+        "delivery-watermark",
+        apply_delivery_watermark(
+            client, user_id, [copied_message_id],
+            str(record["category"] or ""), str(record["file_name"] or ""),
+            watermark or make_watermark(), user_id,
+        ),
+    )
     if return_message_id:
         return True, "文件已发送。", copied_message_id
     return True, "文件已发送。"
@@ -1683,6 +1738,7 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 await advance_progress()
                 continue
         audit_id = secrets.token_urlsafe(12)
+        unit_watermark = make_watermark()
         audit_entries = []
         for audit_entry in unit:
             audit_item = audit_entry[1]
@@ -1696,6 +1752,7 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 "source_chat_id": audit_entry[3],
                 "source_message_id": audit_entry[4],
                 "delivery_method": "copyMessages" if is_album else "copyMessage",
+                "watermark": unit_watermark,
             })
         try:
             await db.record_delivery_audit_batch(
@@ -1786,6 +1843,17 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
             except Exception:
                 log.exception("Could not finalize successful album audit: user=%s", user_id)
             last_sent_message_id = int(delivered[-1]["message_id"])
+            first_record = unit[0][2]
+            spawn_background(
+                "delivery-watermark",
+                apply_delivery_watermark(
+                    client, user_id,
+                    [int(item["message_id"]) for item in delivered if item.get("message_id")],
+                    str((first_record or {}).get("category") or ""),
+                    str((first_record or {}).get("file_name") or ""),
+                    unit_watermark, user_id,
+                ),
+            )
             keys = [entry[1]["file_key"] for entry in unit]
             history_keys.extend(keys)
             pending_delete_ids.extend(
@@ -1843,7 +1911,7 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
                 client, user_id, item["file_key"], return_message_id=True,
                 record=records_by_key.get(item["file_key"]),
                 storage=storage, settings=delivery_settings,
-                defer_side_effects=True,
+                defer_side_effects=True, watermark=unit_watermark,
             )
             if ok:
                 try:
@@ -4069,6 +4137,47 @@ async def delivery_audit_handler(client, message):
 
 
 
+@app.on_message(filters.private & filters.command("wm"))
+async def watermark_lookup_handler(client, message):
+    """Trace a delivery code printed in a member's caption back to its recipient."""
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    code = parts[1].strip().upper() if len(parts) > 1 else ""
+    if not code:
+        await message.reply_text(
+            "用法：/wm 领取编号\n\n"
+            "领取编号是会员收到文件时说明里那行「🆔 领取编号」的六位字符。\n"
+            "示例：/wm AB23CD"
+        )
+        return
+    try:
+        rows = await db.find_delivery_by_watermark(code, limit=10)
+    except Exception:
+        log.exception("Could not look up delivery watermark: %s", code)
+        await message.reply_text("⚠️ 查询失败，请检查数据库状态。")
+        return
+    if not rows:
+        await message.reply_text(f"没有找到编号 {code} 的发放记录。请确认编号抄写正确。")
+        return
+    lines = [f"🆔 领取编号：{code}", ""]
+    for row in rows:
+        lines.append(
+            f"👤 用户：{int(row['user_id'])}（{row['user_id']}）\n"
+            f"📄 资源：{str(row['file_key'])[:60]}\n"
+            f"📁 目录：{str(row['category'] or '未分类')}\n"
+            f"🎬 类型：{str(row['media_type'] or '未知')}\n"
+            f"📌 结果：{str(row['status'] or '')}"
+            f"{('｜' + str(row['error_text'])[:80]) if row['error_text'] else ''}\n"
+            f"🕒 时间：{str(row['created_at'] or '')[:19]}"
+        )
+        lines.append("")
+    lines.append("用途：会员把文件转卖或外传时，可凭此编号定位到领取人。")
+    await message.reply_text("\n".join(lines)[:3800])
+
+
 @app.on_message(filters.private & filters.command("auditdetail"))
 async def delivery_audit_detail_handler(client, message):
     user = message.from_user
@@ -6230,7 +6339,7 @@ async def admin_callback_handler(client, query):
             "📖 管理命令速查\n\n管理员名单：打开 /admin → 管理员管理（仅超级管理员）\n\n"
             "/bindgroup — 绑定会员群\n/membercheck [用户ID] — 检查会员群和成员权限\n/bindmain [Chat ID] — 绑定主存储频道\n/bindbackup [Chat ID] — 绑定备用频道或群组\n/storage — 查看绑定状态\n"
             "/grant 用户ID 天数|永久 — 授权会员\n/revoke 用户ID — 取消授权\n/ban 用户ID 原因 — 封禁\n/unban 用户ID — 解封\n"
-            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scancheck — 检查主存储频道访问和历史读取权限\n/catalogreset — 预览清理旧资源索引\n/catalogresetconfirm — 确认清理资源索引（保留用户会员设置）\n/scan — 只扫描主存储频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/broadcast 内容 — 广播",
+            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scancheck — 检查主存储频道访问和历史读取权限\n/catalogreset — 预览清理旧资源索引\n/catalogresetconfirm — 确认清理资源索引（保留用户会员设置）\n/scan — 只扫描主存储频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/wm 领取编号 — 按编号查领取人\n/broadcast 内容 — 广播",
             reply_markup=back_keyboard(),
         )
 

@@ -652,5 +652,24 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.get_setting("member_auto_delete_seconds"), "120")
         self.assertIsNone(await self.db.get_setting("never_configured_key"))
 
+    async def test_watermark_roundtrip_and_lookup(self):
+        """A delivery code must be traceable back to the member who received it."""
+        await self.db.record_delivery_audit_batch(
+            "audit-wm", 4242, "share-key", [{
+                "file_key": "cangku:1:9",
+                "category": "影视",
+                "media_type": "video",
+                "watermark": "AB23CD",
+            }],
+        )
+        rows = await self.db.find_delivery_by_watermark("ab23cd")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(int(rows[0]["user_id"]), 4242)
+        self.assertEqual(rows[0]["watermark"], "AB23CD")
+        self.assertEqual(rows[0]["status"], "attempted")
+        # Unknown codes and empty codes return nothing instead of raising.
+        self.assertEqual(await self.db.find_delivery_by_watermark("ZZZZZZ"), [])
+        self.assertEqual(await self.db.find_delivery_by_watermark(""), [])
+
 if __name__ == "__main__":
     unittest.main()
