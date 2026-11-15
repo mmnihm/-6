@@ -671,5 +671,25 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.find_delivery_by_watermark("ZZZZZZ"), [])
         self.assertEqual(await self.db.find_delivery_by_watermark(""), [])
 
+    async def test_recent_watermarks_dedupes_units(self):
+        """An album records several rows per code; the list must show one entry."""
+        await self.db.record_delivery_audit_batch(
+            "audit-a", 11, "share1", [
+                {"file_key": "k1", "category": "影视", "watermark": "AAA111"},
+                {"file_key": "k2", "category": "影视", "watermark": "AAA111"},
+            ],
+        )
+        await self.db.record_delivery_audit_batch(
+            "audit-b", 22, "share2", [
+                {"file_key": "k3", "category": "课程", "watermark": "BBB222"},
+            ],
+        )
+        rows = await self.db.list_recent_watermarks(limit=10)
+        codes = [row["watermark"] for row in rows]
+        self.assertEqual(len(codes), 2)
+        self.assertEqual(set(codes), {"AAA111", "BBB222"})
+        by_code = {row["watermark"]: row for row in rows}
+        self.assertEqual(int(by_code["AAA111"]["user_id"]), 11)
+
 if __name__ == "__main__":
     unittest.main()

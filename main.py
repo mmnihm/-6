@@ -400,6 +400,7 @@ def admin_keyboard():
         [InlineKeyboardButton("📊 数据统计", callback_data="mc:stats"),
          InlineKeyboardButton("🔐 扫描账号", callback_data="mc:scannerlogin")],
         [InlineKeyboardButton("🧾 资源发放审计", callback_data="mc:audit")],
+        [InlineKeyboardButton("🆔 领取编号查询", callback_data="mc:wm")],
         [InlineKeyboardButton("🛡 内容保护与删除", callback_data="mc:contentguard")],
         [InlineKeyboardButton("🛡 管理员管理", callback_data="mc:admins"),
          InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
@@ -4137,6 +4138,32 @@ async def delivery_audit_handler(client, message):
 
 
 
+def watermark_detail_text(code, rows):
+    """Shared rendering for the /wm command and the admin button detail page."""
+    if not rows:
+        return (
+            f"没有找到编号 {code} 的发放记录。\n\n"
+            "请确认编号抄写正确（六位字母或数字，不含 O/0/I/1）。"
+        )
+    status_names = {"success": "成功", "failed": "失败", "attempted": "未完成"}
+    lines = [f"🆔 领取编号：{code}", "━━━━━━━━━━━━━━"]
+    for row in rows:
+        stamp = str(row["created_at"] or "").replace("T", " ")[:19]
+        status = status_names.get(str(row["status"]), str(row["status"] or "未知"))
+        lines.extend([
+            f"👤 用户：{int(row['user_id'])}",
+            f"📄 资源：{str(row['file_key'])[:60]}",
+            f"📁 目录：{str(row['category'] or '未分类')}",
+            f"🎬 类型：{str(row['media_type'] or '未知')}",
+            f"📌 结果：{status}"
+            + (f"（{str(row['error_text'])[:80]}）" if row["error_text"] else ""),
+            f"🕒 时间：{stamp}",
+            "─────────────",
+        ])
+    lines.append("用途：会员外传或转卖文件时，凭此编号定位到领取人。")
+    return "\n".join(lines)[:3800]
+
+
 @app.on_message(filters.private & filters.command("wm"))
 async def watermark_lookup_handler(client, message):
     """Trace a delivery code printed in a member's caption back to its recipient."""
@@ -4159,23 +4186,7 @@ async def watermark_lookup_handler(client, message):
         log.exception("Could not look up delivery watermark: %s", code)
         await message.reply_text("⚠️ 查询失败，请检查数据库状态。")
         return
-    if not rows:
-        await message.reply_text(f"没有找到编号 {code} 的发放记录。请确认编号抄写正确。")
-        return
-    lines = [f"🆔 领取编号：{code}", ""]
-    for row in rows:
-        lines.append(
-            f"👤 用户：{int(row['user_id'])}（{row['user_id']}）\n"
-            f"📄 资源：{str(row['file_key'])[:60]}\n"
-            f"📁 目录：{str(row['category'] or '未分类')}\n"
-            f"🎬 类型：{str(row['media_type'] or '未知')}\n"
-            f"📌 结果：{str(row['status'] or '')}"
-            f"{('｜' + str(row['error_text'])[:80]) if row['error_text'] else ''}\n"
-            f"🕒 时间：{str(row['created_at'] or '')[:19]}"
-        )
-        lines.append("")
-    lines.append("用途：会员把文件转卖或外传时，可凭此编号定位到领取人。")
-    await message.reply_text("\n".join(lines)[:3800])
+    await message.reply_text(watermark_detail_text(code, rows))
 
 
 @app.on_message(filters.private & filters.command("auditdetail"))
@@ -5793,6 +5804,61 @@ async def admin_callback_handler(client, query):
         except Exception:
             log.exception("Could not render delivery audit details")
             await message.edit_text("⚠️ 发送明细暂时无法读取。", reply_markup=back_keyboard())
+    elif action == "wm":
+        try:
+            rows = await db.list_recent_watermarks(limit=10)
+            lines = [
+                "🆔 领取编号查询",
+                "━━━━━━━━━━━━━━",
+                "下面是最近 10 个发放编号，点一行看详情；",
+                "也可以直接发送命令 /wm 编号 精确查询。",
+                "",
+            ]
+            buttons = []
+            if not rows:
+                lines.append("暂无编号记录（部署新版后产生领取才会有）。")
+            else:
+                for index, row in enumerate(rows, 1):
+                    code = str(row["watermark"])
+                    stamp = str(row["created_at"] or "").replace("T", " ")[5:16]
+                    name = str(row["file_key"] or "")[:34]
+                    lines.append(
+                        f"{index}. {code}｜用户 {int(row['user_id'])}｜{stamp}"
+                    )
+                    buttons.append([
+                        InlineKeyboardButton(
+                            f"🔍 {code} · 用户{int(row['user_id'])}",
+                            callback_data=f"mc:wm:{code}",
+                        )
+                    ])
+            lines.append("")
+            lines.append("编号写在会员收到的文件说明里，可用于定位外传/转卖的人。")
+            buttons.append([InlineKeyboardButton("🔄 刷新编号列表", callback_data="mc:wm")])
+            buttons.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
+            await message.edit_text(
+                "\n".join(lines)[:3800],
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        except Exception:
+            log.exception("Could not render watermark index")
+            await message.edit_text(
+                "⚠️ 编号列表暂时无法读取，请检查数据库状态。",
+                reply_markup=back_keyboard(),
+            )
+    elif action.startswith("wm:"):
+        code = action.split(":", 1)[1].strip().upper()
+        try:
+            rows = await db.find_delivery_by_watermark(code, limit=10)
+            await message.edit_text(
+                watermark_detail_text(code, rows),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ 返回编号列表", callback_data="mc:wm")],
+                    [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+                ]),
+            )
+        except Exception:
+            log.exception("Could not render watermark detail: %s", code)
+            await message.edit_text("⚠️ 编号详情暂时无法读取。", reply_markup=back_keyboard())
     elif action == "storage":
         primary, backup = await get_storage_channels()
         group_id = await get_member_group_id()

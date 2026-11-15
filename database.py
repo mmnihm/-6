@@ -2786,6 +2786,24 @@ class Database:
             """, (limit,))).fetchall()
             return [dict(row) for row in rows]
 
+    async def list_recent_watermarks(self, limit=10):
+        """Most recent delivery codes, one row per code (a unit can span rows)."""
+        async with self.connect() as db:
+            rows = await (await db.execute("""
+                SELECT watermark,
+                       MIN(user_id) AS user_id,
+                       MIN(file_key) AS file_key,
+                       MIN(category) AS category,
+                       MAX(created_at) AS created_at,
+                       MIN(status) AS status
+                FROM delivery_audit
+                WHERE watermark<>''
+                GROUP BY watermark
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (int(limit),))).fetchall()
+            return rows
+
     async def find_delivery_by_watermark(self, watermark, limit=20):
         """Trace one delivery code back to who received which resource."""
         code = str(watermark or "").strip().upper()
