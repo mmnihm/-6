@@ -1543,17 +1543,42 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False,
         return (False, reason, None) if return_message_id else (False, reason)
 
     last_error = None
+    watermark_code = watermark or make_watermark()
+    caption_in_request = True
     for source_name, source_chat_id, source_message_id in candidates:
         try:
             if settings is None:
                 settings = await get_member_delivery_settings()
             protect_content, _ = settings
-            copied = await telegram_bot_api("copyMessage", {
+            # copyMessage accepts a caption, so the watermark travels with the
+            # file in the same request: no second edit call, no later rewrite.
+            copy_caption = delivery_caption(
+                str(record["category"] or ""), str(record["file_name"] or ""),
+                watermark_code, user_id,
+            )
+            payload = {
                 "chat_id": int(user_id),
                 "from_chat_id": int(source_chat_id),
                 "message_id": int(source_message_id),
                 "protect_content": protect_content,
-            })
+                "caption": copy_caption,
+            }
+            try:
+                copied = await telegram_bot_api("copyMessage", payload)
+                caption_in_request = True
+            except Exception as caption_error:
+                # If Telegram refuses the inline caption (older API behaviour or
+                # a rejected payload), copy without it and stamp the message
+                # afterwards so delivery never depends on that one field.
+                log.warning(
+                    "Inline caption rejected; retrying without it: file=%s error=%s",
+                    file_key, str(caption_error)[:180],
+                )
+                copied = await telegram_bot_api(
+                    "copyMessage",
+                    {key: value for key, value in payload.items() if key != "caption"},
+                )
+                caption_in_request = False
             copied_message_id = int(copied["message_id"])
             log.info(
                 "Delivered catalog file from %s storage: file=%s user=%s",
@@ -1579,14 +1604,32 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False,
     if not defer_side_effects:
         await schedule_member_delivery_delete(client, user_id, [copied_message_id])
         await db.record_history(user_id, file_key)
-    spawn_background(
-        "delivery-watermark",
-        apply_delivery_watermark(
-            client, user_id, [copied_message_id],
-            str(record["category"] or ""), str(record["file_name"] or ""),
-            watermark or make_watermark(), user_id,
-        ),
-    )
+        try:
+            await db.record_delivery_audit_batch(
+                secrets.token_urlsafe(12), user_id, "",
+                [{
+                    "file_key": file_key,
+                    "category": str(record["category"] or ""),
+                    "media_type": str(record["media_type"] or ""),
+                    "source_chat_id": source_chat_id,
+                    "source_message_id": source_message_id,
+                    "delivery_method": "copyMessage",
+                    "watermark": watermark_code,
+                }],
+            )
+        except Exception:
+            log.exception("Could not record standalone delivery audit: file=%s user=%s",
+                          file_key, user_id)
+
+    if not caption_in_request:
+        spawn_background(
+            "delivery-watermark",
+            apply_delivery_watermark(
+                client, user_id, [copied_message_id],
+                str(record["category"] or ""), str(record["file_name"] or ""),
+                watermark_code, user_id,
+            ),
+        )
     if return_message_id:
         return True, "文件已发送。", copied_message_id
     return True, "文件已发送。"
