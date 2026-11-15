@@ -449,6 +449,36 @@ async def get_member_group_id():
     value = await db.get_setting("member_group_id")
     return int(value) if value else None
 
+
+WELCOME_ENABLED_KEY = "welcome_enabled"
+WELCOME_MESSAGE_KEY = "welcome_message"
+
+DEFAULT_WELCOME_MESSAGE = (
+    "👋 欢迎 {name} 加入会员资源群！\n\n"
+    "在这里可以按文件夹挑选资源，领取后会发到你的私聊。\n"
+    "点下面的机器人入口开始使用：\n"
+    "{bot}"
+)
+
+
+async def get_welcome_settings():
+    """Return (enabled, template) for the group welcome message.
+
+    The welcome is on by default; only an explicit "0" turns it off.
+    A blank custom template falls back to the built-in default.
+    """
+    enabled_value = await db.get_setting(WELCOME_ENABLED_KEY)
+    enabled = enabled_value != "0"
+    custom = await db.get_setting(WELCOME_MESSAGE_KEY)
+    template = (custom or "").strip() or DEFAULT_WELCOME_MESSAGE
+    return enabled, template
+
+
+def render_welcome_message(template, names, bot_url):
+    name_text = "、".join(names)
+    return template.replace("{name}", name_text).replace("{bot}", bot_url)
+
+
 async def telegram_bot_api(method: str, payload: dict, timeout=None):
     """Call Telegram Bot API directly, retrying rate-limited media transfers safely."""
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/{method}"
@@ -3561,6 +3591,46 @@ async def bind_member_group_handler(client, message):
     )
 
 
+@app.on_message(filters.group & filters.new_chat_members)
+async def welcome_new_members_handler(client, message):
+    group_id = await get_member_group_id()
+    if not group_id or message.chat.id != group_id:
+        return
+
+    enabled, template = await get_welcome_settings()
+    if not enabled:
+        return
+
+    new_members = getattr(message, "new_chat_members", None) or []
+    me_id = BOT_ID
+    if not me_id:
+        try:
+            me_id = (await client.get_me()).id
+        except Exception:
+            me_id = None
+
+    names = []
+    for member in new_members:
+        if getattr(member, "is_bot", False):
+            continue
+        if me_id and getattr(member, "id", None) == me_id:
+            continue
+        first_name = " ".join((getattr(member, "first_name", "") or "").split())[:32]
+        names.append(first_name or "新成员")
+
+    if not names:
+        return
+
+    bot_url = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
+    text = render_welcome_message(template, names, bot_url)
+    try:
+        await message.reply_text(
+            text, parse_mode=None, disable_web_page_preview=True
+        )
+    except Exception:
+        log.exception("Could not send welcome message to group %s", group_id)
+
+
 @app.on_message(filters.group & filters.command("bindgroup"))
 async def bind_member_group_in_chat_handler(client, message):
     user = message.from_user
@@ -6472,9 +6542,62 @@ async def admin_callback_handler(client, query):
             "📖 管理命令速查\n\n管理员名单：打开 /admin → 管理员管理（仅超级管理员）\n\n"
             "/bindgroup — 绑定会员群\n/membercheck [用户ID] — 检查会员群和成员权限\n/bindmain [Chat ID] — 绑定主存储频道\n/bindbackup [Chat ID] — 绑定备用频道或群组\n/storage — 查看绑定状态\n"
             "/grant 用户ID 天数|永久 — 授权会员\n/revoke 用户ID — 取消授权\n/ban 用户ID 原因 — 封禁\n/unban 用户ID — 解封\n"
-            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scancheck — 检查主存储频道访问和历史读取权限\n/catalogreset — 预览清理旧资源索引\n/catalogresetconfirm — 确认清理资源索引（保留用户会员设置）\n/scan — 只扫描主存储频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/wm 领取编号 — 按编号查领取人\n/broadcast 内容 — 广播",
+            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scancheck — 检查主存储频道访问和历史读取权限\n/catalogreset — 预览清理旧资源索引\n/catalogresetconfirm — 确认清理资源索引（保留用户会员设置）\n/scan — 只扫描主存储频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/wm 领取编号 — 按编号查领取人\n/broadcast 内容 — 广播\n/welcome — 新人进群欢迎设置",
             reply_markup=back_keyboard(),
         )
+
+
+@app.on_message(filters.private & filters.command("welcome"))
+async def welcome_admin_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+
+    enabled, template = await get_welcome_settings()
+    parts = message.command[1:] if len(message.command) > 1 else []
+    bot_url = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
+
+    if not parts:
+        status = "开启" if enabled else "关闭"
+        await message.reply_text(
+            "👋 新人进群欢迎设置\n\n"
+            f"当前状态：{status}\n"
+            f"当前文案：\n{template}\n\n"
+            "可用命令：\n"
+            "/welcome on — 开启自动欢迎\n"
+            "/welcome off — 关闭自动欢迎\n"
+            "/welcome 文案 — 自定义文案（{name} 替换为新人称呼，{bot} 替换为机器人入口）\n"
+            "/welcome reset — 恢复默认文案",
+            reply_markup=back_keyboard(),
+        )
+        return
+
+    action = parts[0].lower()
+    if action in ("on", "开", "开启", "1"):
+        await db.set_setting(WELCOME_ENABLED_KEY, "1")
+        await message.reply_text("✅ 已开启新人进群自动欢迎。", reply_markup=back_keyboard())
+        return
+    if action in ("off", "关", "关闭", "0"):
+        await db.set_setting(WELCOME_ENABLED_KEY, "0")
+        await message.reply_text("✅ 已关闭新人进群自动欢迎。", reply_markup=back_keyboard())
+        return
+    if action == "reset":
+        await db.set_setting(WELCOME_MESSAGE_KEY, "")
+        await message.reply_text("✅ 已恢复默认欢迎文案。", reply_markup=back_keyboard())
+        return
+
+    custom = " ".join(parts).strip()
+    if not custom:
+        await message.reply_text("❌ 文案不能为空。", reply_markup=back_keyboard())
+        return
+
+    await db.set_setting(WELCOME_MESSAGE_KEY, custom)
+    preview = render_welcome_message(custom, ["新成员"], bot_url)
+    await message.reply_text(
+        f"✅ 欢迎文案已保存。\n\n预览：\n{preview}",
+        reply_markup=back_keyboard(),
+    )
 
 
 @app.on_message(filters.private & filters.command("membercheck"))
