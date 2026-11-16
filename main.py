@@ -1416,8 +1416,8 @@ async def reply_admin_only(message):
 
 DEFAULT_HOME_BUTTONS = [
     {"key": "search", "text": "🔎 搜索资源", "type": "action", "enabled": True},
-    {"key": "history", "text": "🕘 最近获取", "type": "action", "enabled": True},
-    {"key": "folders", "text": "🗂️ 文件夹列表", "type": "action", "enabled": True},
+    {"key": "history", "text": "🕘 我的领取", "type": "action", "enabled": True},
+    {"key": "folders", "text": "📁 资源目录", "type": "action", "enabled": True},
     {"key": "latest", "text": "🆕 最新资源", "type": "action", "enabled": True},
     {"key": "latest_new", "text": "🆕 最近上新", "type": "action", "enabled": True},
     {"key": "top", "text": "🔥 领取最多", "type": "action", "enabled": True},
@@ -5869,7 +5869,7 @@ async def user_catalog_callback_handler(client, query):
                 f"📄 {row['file_name'][:32]}",
                 callback_data=f"uc:open:{row['file_key']}",
             )] for row in records]
-            body = "🕘 最近获取\n\n" + (
+            body = "🕘 我的领取记录\n\n" + (
                 "\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
                 if records else "你还没有获取过资源。\n"
                 "去首页「文件夹列表」里挑一个目录领取，领取记录会保存在这里。"
