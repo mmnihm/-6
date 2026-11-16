@@ -409,36 +409,30 @@ async def admin_home_text():
 
 
 def admin_keyboard():
-    # Deep-console grouping: keep every existing callback and feature unchanged.
+    """Compact two-column dashboard; existing modules and callback actions are preserved."""
     return InlineKeyboardMarkup([
-        # Storage and backup
-        [InlineKeyboardButton("🗄 双频道存储", callback_data="mc:storage"),
-         InlineKeyboardButton("📦 自动备份", callback_data="mc:backup")],
-        # Catalog and files
-        [InlineKeyboardButton("📁 目录管理", callback_data="mc:directories"),
-         InlineKeyboardButton("📂 文件管理", callback_data="mc:files")],
-        # Scanner and statistics
-        [InlineKeyboardButton("🔐 扫描账号", callback_data="mc:scannerlogin"),
+        [InlineKeyboardButton("📤 上传资源", callback_data="mc:upload"),
+         InlineKeyboardButton("📁 文件夹管理", callback_data="mc:directories")],
+        [InlineKeyboardButton("📚 资源管理", callback_data="mc:files"),
+         InlineKeyboardButton("🧾 领取记录与审计", callback_data="mc:audit")],
+        [InlineKeyboardButton("🗄 储存管理", callback_data="mc:storage"),
+         InlineKeyboardButton("📦 备份管理", callback_data="mc:backup")],
+        [InlineKeyboardButton("🔍 扫描账号", callback_data="mc:scannerlogin"),
          InlineKeyboardButton("📊 数据统计", callback_data="mc:stats")],
-        # Members
-        [InlineKeyboardButton("👥 会员群绑定", callback_data="mc:bindgroup"),
-         InlineKeyboardButton("👤 会员管理", callback_data="mc:members")],
-        # Audit and protection
-        [InlineKeyboardButton("🧾 资源发放审计", callback_data="mc:audit"),
+        [InlineKeyboardButton("🛡 内容保护", callback_data="mc:contentguard"),
          InlineKeyboardButton("🆔 领取编号查询", callback_data="mc:wm")],
-        [InlineKeyboardButton("🛡 内容保护与删除", callback_data="mc:contentguard"),
-         InlineKeyboardButton("👋 进群欢迎", callback_data="mc:welcome")],
-        # Bot presentation and communications
-        [InlineKeyboardButton("🔘 首页按钮", callback_data="mc:homebuttons"),
-         InlineKeyboardButton("📢 首页公告", callback_data="mc:announce")],
-        [InlineKeyboardButton("📢 群发广播", callback_data="mc:broadcast"),
+        [InlineKeyboardButton("👥 会员群绑定", callback_data="mc:bindgroup"),
          InlineKeyboardButton("🛡 管理员管理", callback_data="mc:admins")],
+        [InlineKeyboardButton("👋 进群欢迎", callback_data="mc:welcome"),
+         InlineKeyboardButton("🔘 首页按钮", callback_data="mc:homebuttons")],
+        [InlineKeyboardButton("📢 首页公告", callback_data="mc:announce"),
+         InlineKeyboardButton("📣 群发广播", callback_data="mc:broadcast")],
         [InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
     ])
 
 
 def back_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 返回管理首页", callback_data="mc:home")]])
 pending_binding_filter = filters.create(
     lambda _, __, message: bool(
         message.from_user and message.from_user.id in pending_channel_bindings
@@ -559,13 +553,10 @@ async def render_welcome_admin(message, notice=""):
     await message.edit_text(
         body,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                f"{'✅' if enabled else '⏸'} 自动欢迎开关",
-                callback_data="mc:welcome:toggle",
-            )],
-            [InlineKeyboardButton("✏️ 修改欢迎文案", callback_data="mc:welcome:edit")],
-            [InlineKeyboardButton("♻️ 恢复默认文案", callback_data="mc:welcome:reset")],
-            [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+            [InlineKeyboardButton(f"{'✅' if enabled else '⏸'} 自动欢迎开关", callback_data="mc:welcome:toggle"),
+             InlineKeyboardButton("✏️ 修改文案", callback_data="mc:welcome:edit")],
+            [InlineKeyboardButton("♻️ 恢复默认文案", callback_data="mc:welcome:reset"),
+             InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")],
         ]),
     )
 
@@ -588,9 +579,9 @@ async def render_announce_admin(message, notice=""):
     await message.edit_text(
         body,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ 编辑公告", callback_data="mc:announce:edit")],
-            [InlineKeyboardButton("🗑 清空公告", callback_data="mc:announce:clear")],
-            [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+            [InlineKeyboardButton("✏️ 编辑公告", callback_data="mc:announce:edit"),
+             InlineKeyboardButton("🗑 清空公告", callback_data="mc:announce:clear")],
+            [InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")],
         ]),
     )
 
@@ -6387,11 +6378,15 @@ async def admin_callback_handler(client, query):
             f"自动删除：{duration_label}\n\n"
             "内容保护用于限制会员转发/保存机器人发出的资源。自动删除只清理会员私聊里的机器人发送消息，不会删除主存储或备用存储频道原件。\n\n请选择要修改的项目：",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{'✅' if protect else '⏸'} 内容保护开关", callback_data="mc:guard:protect")],
-                [InlineKeyboardButton("1分钟", callback_data="mc:guard:delete:60"), InlineKeyboardButton("5分钟", callback_data="mc:guard:delete:300"), InlineKeyboardButton("10分钟", callback_data="mc:guard:delete:600")],
-                [InlineKeyboardButton("30分钟", callback_data="mc:guard:delete:1800"), InlineKeyboardButton("1小时", callback_data="mc:guard:delete:3600"), InlineKeyboardButton("24小时", callback_data="mc:guard:delete:86400")],
-                [InlineKeyboardButton("关闭自动删除", callback_data="mc:guard:delete:0")],
-                [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+                [InlineKeyboardButton(f"{'✅' if protect else '⏸'} 内容保护开关", callback_data="mc:guard:protect"),
+                 InlineKeyboardButton("关闭自动删除", callback_data="mc:guard:delete:0")],
+                [InlineKeyboardButton("1 分钟", callback_data="mc:guard:delete:60"),
+                 InlineKeyboardButton("5 分钟", callback_data="mc:guard:delete:300")],
+                [InlineKeyboardButton("10 分钟", callback_data="mc:guard:delete:600"),
+                 InlineKeyboardButton("30 分钟", callback_data="mc:guard:delete:1800")],
+                [InlineKeyboardButton("1 小时", callback_data="mc:guard:delete:3600"),
+                 InlineKeyboardButton("24 小时", callback_data="mc:guard:delete:86400")],
+                [InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")],
             ]),
         )
     elif action == "welcome" or action.startswith("welcome:"):
@@ -6433,14 +6428,16 @@ async def admin_callback_handler(client, query):
             return
         await render_announce_admin(message)
     elif action == "home":
-        users, files, members, banned = await db.stats()
+        users, files, _, banned = await db.stats()
         group_id = await get_member_group_id()
         primary, backup = await get_storage_channels()
         text = (
-            "🛠 管理员控制面板\n\n"
-            f"会员群：{'已绑定' if group_id else '未绑定'}\n"
-            f"主存储：{'已绑定' if primary else '未绑定'}  |  备份：{'已绑定' if backup else '未绑定'}\n\n"
-            f"用户：{users}  |  文件：{files}\n手动会员：{members}  |  封禁：{banned}\n\n请选择下方按钮管理机器人。"
+            "⚙️ 资源管理中心\n━━━━━━━━━━━━━━\n"
+            f"👥 会员群：{'已绑定' if group_id else '未绑定'}\n"
+            f"🗄 主存储：{'已绑定' if primary else '未绑定'}\n"
+            f"📦 备用存储：{'已绑定' if backup else '未绑定'}\n\n"
+            f"👤 用户：{users}    📁 资源：{files}\n"
+            f"🚫 封禁用户：{banned}\n\n请选择需要管理的功能。"
         )
         await message.edit_text(text, reply_markup=admin_keyboard())
     elif action == "audit":
@@ -6476,9 +6473,9 @@ async def admin_callback_handler(client, query):
             await message.edit_text(
                 "\n".join(lines),
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🧾 查看最近发送明细", callback_data="mc:auditdetail")],
-                    [InlineKeyboardButton("🔄 刷新审计", callback_data="mc:audit")],
-                    [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
+                    [InlineKeyboardButton("🧾 最近发送明细", callback_data="mc:auditdetail"),
+                 InlineKeyboardButton("🔄 刷新审计", callback_data="mc:audit")],
+                [InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")],
                 ]),
             )
         except Exception:
@@ -6522,10 +6519,8 @@ async def admin_callback_handler(client, query):
                                 callback_data=resend_data,
                             )])
             body = "\n".join(lines)
-            nav = [
-                [InlineKeyboardButton("⬅️ 返回发放审计", callback_data="mc:audit")],
-                [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
-            ]
+            nav = [[InlineKeyboardButton("🧾 返回领取审计", callback_data="mc:audit"),
+                    InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")]]
             await message.edit_text(
                 body[:3900],
                 reply_markup=InlineKeyboardMarkup(resend_buttons + nav),
@@ -6615,10 +6610,11 @@ async def admin_callback_handler(client, query):
             "🗄 绑定设置\n\n"
             f"会员群：{group_id or '未绑定'}\n主存储频道：{primary or '未绑定'}\n备用存储（频道/群组）：{backup or '未绑定'}\n\n选择需要绑定或刷新状态：",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("👥 绑定会员群", callback_data="mc:bindgroup")],
-                [InlineKeyboardButton("🔗 设置群邀请链接", callback_data="mc:setgroupurl")],
-                [InlineKeyboardButton("📥 绑定主频道", callback_data="mc:bindmain"), InlineKeyboardButton("📥 绑定备份频道", callback_data="mc:bindbackup")],
-                [InlineKeyboardButton("⬅️ 返回", callback_data="mc:home")],
+                [InlineKeyboardButton("👥 绑定会员群", callback_data="mc:bindgroup"),
+                 InlineKeyboardButton("🔗 邀请链接", callback_data="mc:setgroupurl")],
+                [InlineKeyboardButton("📥 绑定主频道", callback_data="mc:bindmain"),
+                 InlineKeyboardButton("📥 绑定备份频道", callback_data="mc:bindbackup")],
+                [InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")],
             ]),
         )
     elif action == "setgroupurl":
@@ -6642,26 +6638,12 @@ async def admin_callback_handler(client, query):
             reply_markup=back_keyboard(),
         )
     elif action == "members":
-        rows = await db.list_manual_members()
-        if not rows:
-            body = "暂无手动授权记录。\n\n授权：/grant 用户ID 天数|永久\n取消：/revoke 用户ID\n封禁：/ban 用户ID 原因\n解封：/unban 用户ID"
-        else:
-            now = datetime.now(timezone.utc)
-            lines = []
-            for row in rows:
-                expiry = row["expires_at"]
-                if expiry is None:
-                    label = "永久"
-                else:
-                    expiry_dt = parse_cn_datetime(expiry)
-                    if expiry_dt is None:
-                        label = "日期异常"
-                    else:
-                        # Display only: Beijing time for the admin, expiry check untouched.
-                        label = "已过期" if expiry_dt <= now else expiry_dt.strftime("%Y-%m-%d %H:%M")
-                lines.append(f"{row['user_id']} — {label}")
-            body = "👥 手动会员列表\n" + "\n".join(lines) + "\n\n授权：/grant 用户ID 天数|永久\n取消：/revoke 用户ID"
-        await message.edit_text(body, reply_markup=back_keyboard())
+        await message.edit_text(
+            "👥 会员资格由指定会员群统一管理。\n\n"
+            "本机器人只检测用户是否仍在已绑定的会员群内，不在这里手动开通、续期或取消会员。\n\n"
+            "如需更换会员群，请使用「储存管理 → 绑定会员群」。",
+            reply_markup=back_keyboard(),
+        )
     elif action == "tagfolderscan":
         global directory_import_running
         if directory_import_running:
@@ -6828,13 +6810,14 @@ async def admin_callback_handler(client, query):
         sizes = await db.get_category_storage_stats(row["category"])
         measured = int(sizes["sized_count"] or 0)
         buttons = [
-            [InlineKeyboardButton("📂 查看内容（直接发送文件）", callback_data=f"mc:dircontent:{index}")],
-            [InlineKeyboardButton("📤 上传文件到此目录", callback_data=f"mc:dirupload:{index}")],
+            [InlineKeyboardButton("📂 查看内容", callback_data=f"mc:dircontent:{index}"),
+             InlineKeyboardButton("📤 上传资源", callback_data=f"mc:dirupload:{index}")],
             [InlineKeyboardButton("✏️ 修改目录名称", callback_data=f"mc:dirrename:{index}")],
         ]
         if count == 0:
             buttons.append([InlineKeyboardButton("🗑 删除空目录", callback_data=f"mc:dirdelete:{index}")])
-        buttons.append([InlineKeyboardButton("⬅️ 返回文件夹列表", callback_data="mc:directories")])
+        buttons.append([InlineKeyboardButton("📁 文件夹列表", callback_data="mc:directories"),
+                        InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")])
         detail = (
             f"📁 目录：{row['category']}\n"
             f"📦 资源总数：{count} 个\n"
@@ -6990,20 +6973,28 @@ async def admin_callback_handler(client, query):
         ]
         if superadmin_id and int(superadmin_id) != int(config.ADMIN_ID):
             lines.append(f"👑 数据库超级管理员：{int(superadmin_id)}")
-        rows = [[InlineKeyboardButton("➕ 添加管理员", callback_data="mc:adminadd")]]
+        rows = [[InlineKeyboardButton("➕ 添加管理员", callback_data="mc:adminadd"),
+                 InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")]]
         if delegated:
             lines.append("")
             lines.append("🛡 其他管理员：")
             for item in delegated:
                 admin_id = int(item["user_id"])
                 lines.append(f"• {admin_id}")
-                rows.append([InlineKeyboardButton(
-                    f"❌ 移除管理员 {admin_id}",
-                    callback_data=f"mc:adminremove:{admin_id}",
-                )])
+                if rows and len(rows[-1]) == 1 and rows[-1][0].callback_data == "mc:adminadd":
+                    rows[-1].append(InlineKeyboardButton(
+                        f"❌ 移除 {admin_id}",
+                        callback_data=f"mc:adminremove:{admin_id}",
+                    ))
+                else:
+                    rows.append([InlineKeyboardButton(
+                        f"❌ 移除 {admin_id}",
+                        callback_data=f"mc:adminremove:{admin_id}",
+                    )])
         else:
             lines.extend(["", "目前还没有添加其他管理员。"])
-        rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
+        if not any(button.callback_data == "mc:home" for row in rows for button in row):
+            rows.append([InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")])
         await message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
     elif action == "adminadd":
         if not await is_superadmin(user.id):
@@ -7111,6 +7102,24 @@ async def admin_callback_handler(client, query):
             rows.append([InlineKeyboardButton("➕ 添加网址按钮", callback_data="mc:homebutton:add")])
             rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
             await message.edit_text("✅ 已删除网址按钮。\n\n🔘 用户首页按钮设置", reply_markup=InlineKeyboardMarkup(rows))
+    elif action == "upload":
+        categories = await db.list_categories()
+        rows = []
+        for index, row in enumerate(categories[:20]):
+            rows.append([InlineKeyboardButton(
+                f"📁 {str(row['category'])[:24]}（{int(row['file_count'] or 0)}）",
+                callback_data=f"mc:dirupload:{index}",
+            )])
+        if len(categories) > 20:
+            rows.append([InlineKeyboardButton("📂 全部文件夹", callback_data="mc:directories")])
+        if not categories:
+            rows.append([InlineKeyboardButton("➕ 新建文件夹", callback_data="mc:dirnew")])
+        rows.append([InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")])
+        await message.edit_text(
+            f"📤 上传资源\n\n当前共有 {len(categories)} 个文件夹。请选择上传位置；"
+            "选择后直接发送文件或相册，结束上传前资源不会发布到目录。",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
     elif action == "files":
         rows = await db.list_files(15)
         lines = [f"{row['file_key']} | {row['category']} | {row['file_name'][:40]}" for row in rows]
@@ -7128,8 +7137,11 @@ async def admin_callback_handler(client, query):
             reply_markup=back_keyboard(),
         )
     elif action == "stats":
-        users, files, members, banned = await db.stats()
-        await message.edit_text(f"📊 数据统计\n\n用户总数：{users}\n文件总数：{files}\n有效手动会员：{members}\n封禁用户：{banned}", reply_markup=back_keyboard())
+        users, files, _, banned = await db.stats()
+        await message.edit_text(
+            f"📊 数据统计\n\n👤 用户总数：{users}\n📦 资源总数：{files}\n🚫 封禁用户：{banned}",
+            reply_markup=back_keyboard(),
+        )
     elif action == "scannerlogin":
         await message.edit_text(
             "🔐 扫描账号设置\n\n"
@@ -7137,8 +7149,8 @@ async def admin_callback_handler(client, query):
             "点击下方按钮后，机器人会引导你输入手机号、登录验证码及（如有）两步验证密码。敏感输入会尝试立即删除。\n"
             "扫描进度保存在数据库中；登录会话保存在本地文件。若部署平台没有持久化文件存储，重新部署后可能需要重新登录扫描账号。",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔑 开始登录", callback_data="mc:scannerloginstart")],
-                [InlineKeyboardButton("⬅️ 返回", callback_data="mc:home")],
+                [InlineKeyboardButton("🔑 开始登录", callback_data="mc:scannerloginstart"),
+                 InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")],
             ]),
         )
     elif action == "scannerloginstart":
