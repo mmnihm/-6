@@ -1425,6 +1425,7 @@ DEFAULT_HOME_BUTTONS = [
     {"key": "favorites", "text": "⭐ 收藏列表", "type": "action", "enabled": True},
     {"key": "notifications", "text": "🔔 新资源订阅", "type": "action", "enabled": True},
     {"key": "member", "text": "👤 会员中心", "type": "action", "enabled": True},
+    {"key": "help", "text": "❔ 使用帮助", "type": "action", "enabled": True},
 ]
 
 
@@ -1451,14 +1452,14 @@ async def get_home_buttons():
         if current is None:
             buttons.append(dict(default))
             continue
-        if default["key"] in ("random", "latest", "latest_new", "top", "folders", "favorites", "search", "history", "notifications", "member"):
+        if default["key"] in ("random", "latest", "latest_new", "top", "folders", "favorites", "search", "history", "notifications", "member", "help"):
             current["text"] = default["text"]
             current["type"] = "action"
             current["enabled"] = True
     # "再来一批" is a result-screen action, never a home-menu button.
     buttons = [item for item in buttons if item.get("key") != "random_again"]
     # Keep built-in actions in a clear two-column order; custom URL buttons follow.
-    built_in_order = ["folders", "latest_new", "top", "random", "notifications", "favorites", "member", "search", "history", "latest"]
+    built_in_order = ["folders", "search", "latest", "random", "history", "help", "latest_new", "top", "favorites", "notifications", "member"]
     built_ins = {str(item.get("key")): item for item in buttons if item.get("key") in built_in_order}
     custom = [item for item in buttons if item.get("key") not in built_in_order]
     buttons = [built_ins[key] for key in built_in_order if key in built_ins] + custom
@@ -1481,24 +1482,25 @@ async def user_home_keyboard():
             str(item["text"])[:60], callback_data=f"uc:{item['key']}"
         )
 
-    # Premium-library layout. All existing actions remain present; only their
-    # visual grouping/order changes. Custom URL buttons are still appended below.
+    # Main member actions are shown first in a compact two-column layout.
+    # Secondary built-ins and administrator-created URL buttons remain available.
     rows = []
     for group in (
-        ("folders", "latest_new"),
-        ("search", "latest"),
-        ("random", "top"),
+        ("folders", "search"),
+        ("latest", "random"),
+        ("history", "help"),
+        ("latest_new", "top"),
         ("favorites", "notifications"),
-        ("history", "member"),
+        ("member",),
     ):
         row = [make_button(by_key[key]) for key in group if key in by_key]
         if row:
             rows.append(row)
 
-    # Preserve any custom buttons added by the administrator.
+    # Preserve every administrator-created custom button below the built-ins.
     custom = [item for item in enabled if item.get("key") not in {
         "search", "history", "folders", "latest", "random", "favorites",
-        "notifications", "member", "random_again", "latest_new", "top",
+        "notifications", "member", "random_again", "latest_new", "top", "help",
     }]
     for index in range(0, len(custom), 2):
         rows.append([make_button(item) for item in custom[index:index + 2]])
@@ -1512,23 +1514,23 @@ async def user_home_text(user_id):
     tier = await get_membership_tier(user_id)
     stats = await db.catalog_stats()
     announcement = await get_home_announcement()
-    head = "✦ MEMBER LIBRARY · 会员资源空间\n"
+    head = "📚 会员资源中心\n"
     head += "━━━━━━━━━━━━━━━━━━\n"
     if announcement:
         head += f"📢 {announcement}\n\n"
     else:
-        head += "探索专属资源，快速找到想要的内容。\n\n"
+        head += "欢迎回来，选择功能开始浏览资源。\n\n"
     return (
         head
-        + f"🏅 会员等级：{tier or '未开通'}\n\n"
-        + "✦ 资源概览\n"
-        + f"📁 文件夹　{stats['folders']} 个\n"
-        + f"▣ 资源消息　{stats['messages']} 条\n"
-        + f"▧ 图片资源　{stats['images']} 张\n"
-        + f"▶ 视频资源　{stats['videos']} 个\n"
+        + f"🏅 当前身份：{tier or '未开通'}\n\n"
+        + "📊 资源库统计\n"
+        + f"📁 文件夹：{stats['folders']} 个\n"
+        + f"📦 资源总数：{stats['messages']} 条\n"
+        + f"🖼 图片：{stats['images']} 张\n"
+        + f"🎬 视频：{stats['videos']} 个\n"
         + "━━━━━━━━━━━━━━━━━━\n"
-        + "💡 可以直接搜索文件名、文件夹名称或中文标签。\n"
-        + "选择下方入口开始浏览："
+        + "🔎 支持搜索文件名、文件夹名称和中文标签。\n"
+        + "请点击下方两列功能入口："
     )
 
 
@@ -5446,6 +5448,24 @@ async def user_catalog_callback_handler(client, query):
     if action[1] == "random_again":
         action[1] = "random"
 
+    if action[1] == "help":
+        await query.answer()
+        await message.edit_text(
+            "❔ 使用帮助\n\n"
+            "📁 资源目录：打开文件夹列表，选择文件夹查看内容。\n"
+            "🔎 搜索资源：输入文件名、文件夹名称或关键词；搜索结果可直接进入文件夹或领取单个资源。\n"
+            "🆕 最新资源：查看最近入库的资源。\n"
+            "🎲 随机探索：每次随机发送一项；如果该资源属于相册，会整组发送。\n"
+            "🕘 我的领取：查看最近领取记录并可再次打开资源。\n\n"
+            "🔒 领取资格：需要加入管理员绑定的会员群。离开会员群后，系统会按群成员状态限制领取。\n"
+            "📩 如遇到资源无法发送，请稍后重试或联系管理员。",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📁 打开资源目录", callback_data="uc:folders")],
+                [InlineKeyboardButton("🏠 返回首页", callback_data="uc:home")],
+            ]),
+        )
+        return
+
     if action[1] == "latest":
         await query.answer("正在整理最新资源…")
         records, _, total = await db.public_catalog(limit=12, offset=0)
@@ -5508,17 +5528,11 @@ async def user_catalog_callback_handler(client, query):
                 await message.reply_text("📭 资源库暂时没有可随机发送的文件。")
                 return
 
-            batch_size = min(20, int(total))
+            # Pick exactly one catalog item. If it belongs to a Telegram album,
+            # complete_album_groups expands it to the entire original album.
+            # Thus one tap sends one single file OR one complete media group.
             start = secrets.randbelow(int(total))
-            rows, _, _ = await db.public_catalog(
-                limit=min(batch_size, int(total) - start), offset=start
-            )
-            if len(rows) < batch_size:
-                extra, _, _ = await db.public_catalog(
-                    limit=batch_size - len(rows), offset=0
-                )
-                rows.extend(extra)
-
+            rows, _, _ = await db.public_catalog(limit=1, offset=start)
             rows = await db.complete_album_groups(rows)
             if not rows:
                 await message.reply_text("📭 暂时没有找到可发送的资源，请稍后重试。")
