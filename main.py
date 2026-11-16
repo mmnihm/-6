@@ -6172,13 +6172,12 @@ async def admin_callback_handler(client, query):
     if action == "broadcast:confirm":
         pending = pending_broadcasts.get(int(user.id))
         if not pending:
-            await query.answer("没有待发送的内容", show_alert=True)
+            await message.reply_text("⚠️ 没有待发送的内容，请重新进入广播管理。")
             return
         if int(user.id) in broadcast_running:
-            await query.answer("广播已经在进行中", show_alert=True)
+            await message.reply_text("⚠️ 这次广播已经在进行中，请勿重复点击。")
             return
         broadcast_running.add(int(user.id))
-        await query.answer("已开始发送")
         try:
             await message.edit_reply_markup(None)
         except Exception:
@@ -6198,7 +6197,6 @@ async def admin_callback_handler(client, query):
                     task.cancel()
                 broadcast_album_tasks.pop(key, None)
                 broadcast_album_buffers.pop(key, None)
-        await query.answer("已取消")
         await message.edit_text("❌ 已取消本次广播，没有向用户发送任何内容。", reply_markup=back_keyboard())
         return
     if action == "categorycancel":
@@ -7122,10 +7120,10 @@ async def admin_callback_handler(client, query):
         broadcast_input_mode.add(int(user.id))
         pending_broadcasts.pop(int(user.id), None)
         await message.edit_text(
-            "📢 广播管理\\n\\n"
-            "请直接发送一条要广播的消息：文字、图片、视频、文件、音频、GIF 或相册均可。\\n"
-            "文字格式和媒体说明会尽量按原消息保留。\\n\\n"
-            "收到后先显示预览，只有点击“确认群发”才会发送；发送失败不会删除用户记录。\\n"
+            "📢 广播管理\n\n"
+            "请直接发送一条要广播的消息：文字、图片、视频、文件、音频、GIF 或相册均可。\n"
+            "文字格式和媒体说明会尽量按原消息保留。\n\n"
+            "收到后先显示预览，只有点击“确认群发”才会发送；发送失败不会删除用户记录。\n"
             "发送 /cancel 可退出。",
             reply_markup=back_keyboard(),
         )
