@@ -1482,17 +1482,15 @@ async def user_home_keyboard():
             str(item["text"])[:60], callback_data=f"uc:{item['key']}"
         )
 
-    # One primary entry, then paired rows: find-content (search / new folders /
-    # top / random), mine (history / favorites / notifications / member), and a
-    # low-traffic tail. Pairs keep every row full instead of ending on one key.
+    # The user requested hiding "我的领取" and "最新入库" from the
+    # member home only. Their callbacks and stored data remain untouched.
     rows = []
     for group in (
-        ("folders",),
-        ("search", "latest_new"),
-        ("top", "random"),
-        ("history", "favorites"),
+        ("folders", "search"),
+        ("latest_new", "top"),
+        ("random", "favorites"),
         ("notifications", "member"),
-        ("latest", "help"),
+        ("help",),
     ):
         row = [make_button(by_key[key]) for key in group if key in by_key]
         if row:
