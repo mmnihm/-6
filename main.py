@@ -386,25 +386,21 @@ async def update_admin_upload_progress(message, user_id, category, increment=1, 
 
 
 async def admin_home_text():
-    users, files, members, banned = await db.stats()
+    users, files, _, _ = await db.stats()
     categories = await db.list_categories()
     catalog = await db.catalog_stats()
     album_groups = sum(int(row["album_count"] or 0) for row in categories)
     return (
-        "◆ ADMIN CONSOLE · 管理控制台\n"
+        "⚙️ 资源管理中心\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "资源运营与机器人管理中心\n\n"
-        "▣ 数据概览\n"
+        "管理上传、目录、存储、扫描与备份\n\n"
+        "📊 数据概览\n"
         f"👥 用户总数：{users}\n"
         f"📁 文件夹数量：{len(categories)}\n"
-        f"📦 已发布文件：{files}\n"
-        f"🖼 图片资源：{catalog['images']} 张\n"
-        f"🎬 视频资源：{catalog['videos']} 个\n"
+        f"📦 已发布资源：{files}\n"
+        f"🖼 图片：{catalog['images']} 张  ·  🎬 视频：{catalog['videos']} 个\n"
         f"🗂 相册分组：{album_groups} 组\n\n"
-        "▣ 快捷操作\n"
-        "上传资源、整理目录、查看存储与备份状态。\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "请选择下方管理模块。" 
+        "请选择下方两列功能按钮。"
     )
 
 
@@ -7106,10 +7102,14 @@ async def admin_callback_handler(client, query):
         categories = await db.list_categories()
         rows = []
         for index, row in enumerate(categories[:20]):
-            rows.append([InlineKeyboardButton(
-                f"📁 {str(row['category'])[:24]}（{int(row['file_count'] or 0)}）",
+            button = InlineKeyboardButton(
+                f"📁 {str(row['category'])[:20]}（{int(row['file_count'] or 0)}）",
                 callback_data=f"mc:dirupload:{index}",
-            )])
+            )
+            if rows and len(rows[-1]) == 1 and rows[-1][0].callback_data.startswith("mc:dirupload:"):
+                rows[-1].append(button)
+            else:
+                rows.append([button])
         if len(categories) > 20:
             rows.append([InlineKeyboardButton("📂 全部文件夹", callback_data="mc:directories")])
         if not categories:
@@ -7186,8 +7186,8 @@ async def admin_callback_handler(client, query):
         await message.edit_text(
             "📖 管理命令速查\n\n管理员名单：打开 /admin → 管理员管理（仅超级管理员）\n\n"
             "/bindgroup — 绑定会员群\n/membercheck [用户ID] — 检查会员群和成员权限\n/bindmain [Chat ID] — 绑定主存储频道\n/bindbackup [Chat ID] — 绑定备用频道或群组\n/storage — 查看绑定状态\n"
-            "/grant 用户ID 天数|永久 — 授权会员\n/revoke 用户ID — 取消授权\n/ban 用户ID 原因 — 封禁\n/unban 用户ID — 解封\n"
-            "/members — 会员列表\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scancheck — 检查主存储频道访问和历史读取权限\n/catalogreset — 预览清理旧资源索引\n/catalogresetconfirm — 确认清理资源索引（保留用户会员设置）\n/scan — 只扫描主存储频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/wm 领取编号 — 按编号查领取人\n/broadcast 内容 — 广播\n/welcome — 新人进群欢迎设置",
+            "/ban 用户ID 原因 — 封禁用户\n/unban 用户ID — 解封用户\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scancheck — 检查频道访问和历史读取权限\n/catalogreset — 预览清理旧资源索引\n/catalogresetconfirm — 确认清理资源索引\n/scan — 扫描频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/wm 领取编号 — 按编号查领取人\n/welcome — 新人进群欢迎设置\n"
+            "广播请打开 /admin → 群发广播，直接发送内容并确认。",
             reply_markup=back_keyboard(),
         )
 
