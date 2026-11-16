@@ -386,40 +386,49 @@ async def admin_home_text():
     catalog = await db.catalog_stats()
     album_groups = sum(int(row["album_count"] or 0) for row in categories)
     return (
-        "☁️ 网盘管理中心\n\n"
-        "📁 目录管理：创建、整理、查看内容统计\n"
-        "📤 资源上传：支持单文件和相册成组上传\n"
-        "✅ 批量发布：点击结束上传后统一对会员开放\n\n"
+        "◆ ADMIN CONSOLE · 管理控制台\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "资源运营与机器人管理中心\n\n"
+        "▣ 数据概览\n"
         f"👥 用户总数：{users}\n"
         f"📁 文件夹数量：{len(categories)}\n"
         f"📦 已发布文件：{files}\n"
-        f"🖼 图片：{catalog['images']} 张\n"
-        f"🎬 视频：{catalog['videos']} 个\n"
-        f"🗂 相册组：{album_groups} 组\n\n"
-        "请选择要进行的操作。"
+        f"🖼 图片资源：{catalog['images']} 张\n"
+        f"🎬 视频资源：{catalog['videos']} 个\n"
+        f"🗂 相册分组：{album_groups} 组\n\n"
+        "▣ 快捷操作\n"
+        "上传资源、整理目录、查看存储与备份状态。\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "请选择下方管理模块。" 
     )
 
 
 def admin_keyboard():
-    # Compact two-column layout to keep the admin panel short on mobile.
+    # Deep-console grouping: keep every existing callback and feature unchanged.
     return InlineKeyboardMarkup([
+        # Storage and backup
         [InlineKeyboardButton("🗄 双频道存储", callback_data="mc:storage"),
          InlineKeyboardButton("📦 自动备份", callback_data="mc:backup")],
+        # Catalog and files
+        [InlineKeyboardButton("📁 目录管理", callback_data="mc:directories"),
+         InlineKeyboardButton("📂 文件管理", callback_data="mc:files")],
+        # Scanner and statistics
+        [InlineKeyboardButton("🔐 扫描账号", callback_data="mc:scannerlogin"),
+         InlineKeyboardButton("📊 数据统计", callback_data="mc:stats")],
+        # Members
         [InlineKeyboardButton("👥 会员群绑定", callback_data="mc:bindgroup"),
          InlineKeyboardButton("👤 会员管理", callback_data="mc:members")],
-        [InlineKeyboardButton("📂 文件管理", callback_data="mc:files"),
-         InlineKeyboardButton("📁 目录管理", callback_data="mc:directories")],
-        [InlineKeyboardButton("🔘 首页按钮", callback_data="mc:homebuttons"),
-         InlineKeyboardButton("📢 群发广播", callback_data="mc:broadcast")],
-        [InlineKeyboardButton("📊 数据统计", callback_data="mc:stats"),
-         InlineKeyboardButton("🔐 扫描账号", callback_data="mc:scannerlogin")],
-        [InlineKeyboardButton("🧾 资源发放审计", callback_data="mc:audit")],
-        [InlineKeyboardButton("🆔 领取编号查询", callback_data="mc:wm")],
+        # Audit and protection
+        [InlineKeyboardButton("🧾 资源发放审计", callback_data="mc:audit"),
+         InlineKeyboardButton("🆔 领取编号查询", callback_data="mc:wm")],
         [InlineKeyboardButton("🛡 内容保护与删除", callback_data="mc:contentguard"),
          InlineKeyboardButton("👋 进群欢迎", callback_data="mc:welcome")],
-        [InlineKeyboardButton("📢 首页公告", callback_data="mc:announce")],
-        [InlineKeyboardButton("🛡 管理员管理", callback_data="mc:admins"),
-         InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
+        # Bot presentation and communications
+        [InlineKeyboardButton("🔘 首页按钮", callback_data="mc:homebuttons"),
+         InlineKeyboardButton("📢 首页公告", callback_data="mc:announce")],
+        [InlineKeyboardButton("📢 群发广播", callback_data="mc:broadcast"),
+         InlineKeyboardButton("🛡 管理员管理", callback_data="mc:admins")],
+        [InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
     ])
 
 
@@ -1480,16 +1489,15 @@ async def user_home_keyboard():
             str(item["text"])[:60], callback_data=f"uc:{item['key']}"
         )
 
-    # Primary member actions follow the selected three-row layout.
-    # Existing search/history/latest features remain available below them.
+    # Premium-library layout. All existing actions remain present; only their
+    # visual grouping/order changes. Custom URL buttons are still appended below.
     rows = []
     for group in (
         ("folders", "latest_new"),
-        ("top", "random"),
-        ("notifications", "favorites"),
-        ("member",),
-        ("search", "history"),
-        ("latest",),
+        ("search", "latest"),
+        ("random", "top"),
+        ("favorites", "notifications"),
+        ("history", "member"),
     ):
         row = [make_button(by_key[key]) for key in group if key in by_key]
         if row:
@@ -1512,20 +1520,23 @@ async def user_home_text(user_id):
     tier = await get_membership_tier(user_id)
     stats = await db.catalog_stats()
     announcement = await get_home_announcement()
-    head = "📂 会员资源中心\n\n"
+    head = "✦ MEMBER LIBRARY · 会员资源空间\n"
+    head += "━━━━━━━━━━━━━━━━━━\n"
     if announcement:
         head += f"📢 {announcement}\n\n"
-    head += "欢迎使用会员专属资源库。\n\n"
+    else:
+        head += "探索专属资源，快速找到想要的内容。\n\n"
     return (
         head
-        + f"🏅 会员级别：{tier or '未开通'}\n\n"
-        + "📊 资源统计\n"
-        + f"• 文件夹：{stats['folders']} 个\n"
-        + f"• 消息：{stats['messages']} 条\n"
-        + f"• 图片：{stats['images']} 张\n"
-        + f"• 视频：{stats['videos']} 个\n\n"
-        + "💡 使用提示：先加入会员群完成验证，再逛「文件夹列表」挑目录；找不到资源时直接发送关键词搜索。\n\n"
-        + "请选择下方功能："
+        + f"🏅 会员等级：{tier or '未开通'}\n\n"
+        + "✦ 资源概览\n"
+        + f"📁 文件夹　{stats['folders']} 个\n"
+        + f"▣ 资源消息　{stats['messages']} 条\n"
+        + f"▧ 图片资源　{stats['images']} 张\n"
+        + f"▶ 视频资源　{stats['videos']} 个\n"
+        + "━━━━━━━━━━━━━━━━━━\n"
+        + "💡 可以直接搜索文件名、文件夹名称或中文标签。\n"
+        + "选择下方入口开始浏览："
     )
 
 
