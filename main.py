@@ -60,6 +60,7 @@ broadcast_input_mode = set()
 pending_broadcasts = {}
 broadcast_album_buffers = {}
 broadcast_album_tasks = {}
+broadcast_running = set()
 directory_import_running = False
 
 # A light global pacing guard for outgoing Bot API sends. Telegram still owns the
@@ -2622,6 +2623,13 @@ async def capture_broadcast_message(client, message):
     return True
 
 
+async def run_broadcast_guarded(client, admin_id, status):
+    try:
+        await run_broadcast(client, admin_id, status)
+    finally:
+        broadcast_running.discard(int(admin_id))
+
+
 async def run_broadcast(client, admin_id, status):
     pending = pending_broadcasts.get(int(admin_id))
     if not pending:
@@ -2732,6 +2740,9 @@ async def directory_export_upload_handler(client, message):
     """Receive an admin's Cangku JSON export and prepare a safe preview."""
     user = message.from_user
     if not user:
+        return
+    if int(user.id) in broadcast_input_mode:
+        await capture_broadcast_message(client, message)
         return
     if not await is_admin(user.id):
         # Preserve the existing normal-upload flow for non-admin users.
@@ -6163,9 +6174,20 @@ async def admin_callback_handler(client, query):
         if not pending:
             await query.answer("没有待发送的内容", show_alert=True)
             return
+        if int(user.id) in broadcast_running:
+            await query.answer("广播已经在进行中", show_alert=True)
+            return
+        broadcast_running.add(int(user.id))
         await query.answer("已开始发送")
+        try:
+            await message.edit_reply_markup(None)
+        except Exception:
+            pass
         status = await message.reply_text("⏳ 正在启动广播…")
-        spawn_background(f"broadcast-{int(user.id)}", run_broadcast(client, int(user.id), status))
+        spawn_background(
+            f"broadcast-{int(user.id)}",
+            run_broadcast_guarded(client, int(user.id), status),
+        )
         return
     if action == "broadcast:cancel":
         pending_broadcasts.pop(int(user.id), None)
