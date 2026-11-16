@@ -1133,7 +1133,7 @@ def folder_detail_keyboard(category_row, page, has_next, is_favorite):
         ))
     if jump:
         rows.append(jump)
-    rows.append([InlineKeyboardButton("⬅️ 文件夹列表", callback_data="uc:folders")])
+    rows.append([InlineKeyboardButton("⬅️ 资源目录", callback_data="uc:folders")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1418,7 +1418,7 @@ DEFAULT_HOME_BUTTONS = [
     {"key": "search", "text": "🔎 搜索资源", "type": "action", "enabled": True},
     {"key": "history", "text": "🕘 我的领取", "type": "action", "enabled": True},
     {"key": "folders", "text": "📁 资源目录", "type": "action", "enabled": True},
-    {"key": "latest", "text": "🆕 最新资源", "type": "action", "enabled": True},
+    {"key": "latest", "text": "🆕 最新入库", "type": "action", "enabled": True},
     {"key": "latest_new", "text": "🆕 最近上新", "type": "action", "enabled": True},
     {"key": "top", "text": "🔥 领取最多", "type": "action", "enabled": True},
     {"key": "random", "text": "🎲 随机探索", "type": "action", "enabled": True},
@@ -1482,16 +1482,17 @@ async def user_home_keyboard():
             str(item["text"])[:60], callback_data=f"uc:{item['key']}"
         )
 
-    # Main member actions are shown first in a compact two-column layout.
-    # Secondary built-ins and administrator-created URL buttons remain available.
+    # One primary entry, then paired rows: find-content (search / new folders /
+    # top / random), mine (history / favorites / notifications / member), and a
+    # low-traffic tail. Pairs keep every row full instead of ending on one key.
     rows = []
     for group in (
-        ("folders", "search"),
-        ("latest", "random"),
-        ("history", "help"),
-        ("latest_new", "top"),
-        ("favorites", "notifications"),
-        ("member",),
+        ("folders",),
+        ("search", "latest_new"),
+        ("top", "random"),
+        ("history", "favorites"),
+        ("notifications", "member"),
+        ("latest", "help"),
     ):
         row = [make_button(by_key[key]) for key in group if key in by_key]
         if row:
@@ -5160,7 +5161,7 @@ async def build_favorites_view(user_id):
         sections.extend([
             "",
             "你还没有收藏文件或文件夹。",
-            "去「文件夹列表」打开目录并点「⭐ 收藏目录」，或在资源消息里点「⭐ 收藏」。",
+            "去「资源目录」打开目录并点「⭐ 收藏目录」，或在资源消息里点「⭐ 收藏」。",
         ])
     rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
     return "\n".join(sections), InlineKeyboardMarkup(rows)
@@ -5454,7 +5455,7 @@ async def user_catalog_callback_handler(client, query):
             "❔ 使用帮助\n\n"
             "📁 资源目录：打开文件夹列表，选择文件夹查看内容。\n"
             "🔎 搜索资源：输入文件名、文件夹名称或关键词；搜索结果可直接进入文件夹或领取单个资源。\n"
-            "🆕 最新资源：查看最近入库的资源。\n"
+            "🆕 最新入库：查看最近入库的资源。\n"
             "🎲 随机探索：每次随机发送一项；如果该资源属于相册，会整组发送。\n"
             "🕘 我的领取：查看最近领取记录并可再次打开资源。\n\n"
             "🔒 领取资格：需要加入管理员绑定的会员群。离开会员群后，系统会按群成员状态限制领取。\n"
@@ -5467,7 +5468,7 @@ async def user_catalog_callback_handler(client, query):
         return
 
     if action[1] == "latest":
-        await query.answer("正在整理最新资源…")
+        await query.answer("正在整理最新入库…")
         records, _, total = await db.public_catalog(limit=12, offset=0)
         rows = [[InlineKeyboardButton(
             f"📄 {str(item['file_name'])[:38]}",
@@ -5475,7 +5476,7 @@ async def user_catalog_callback_handler(client, query):
         )] for item in records]
         rows.append([InlineKeyboardButton("🎲 随机探索", callback_data="uc:random")])
         rows.append([InlineKeyboardButton("🏠 返回主页", callback_data="uc:home")])
-        body = "🆕 最新资源（按入库时间排序）\n"
+        body = "🆕 最新入库（按入库时间排序）\n"
         body += f"共 {total} 个资源，以下显示最新 12 个。\n\n"
         body += ("\n".join(
             f"• {item['file_name'][:48]}（{item['category']}）" for item in records
@@ -5872,7 +5873,7 @@ async def user_catalog_callback_handler(client, query):
             body = "🕘 我的领取记录\n\n" + (
                 "\n".join(f"• {row['file_name'][:48]}（{row['category']}）" for row in records)
                 if records else "你还没有获取过资源。\n"
-                "去首页「文件夹列表」里挑一个目录领取，领取记录会保存在这里。"
+                "去首页「资源目录」里挑一个目录领取，领取记录会保存在这里。"
             )
             rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="uc:home")])
             await message.edit_text(body, reply_markup=InlineKeyboardMarkup(rows))
