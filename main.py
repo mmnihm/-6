@@ -56,6 +56,10 @@ pending_admin_actions = {}
 pending_welcome_edit = set()
 pending_announce_edit = set()
 pending_member_group_url = set()
+broadcast_input_mode = set()
+pending_broadcasts = {}
+broadcast_album_buffers = {}
+broadcast_album_tasks = {}
 directory_import_running = False
 
 # A light global pacing guard for outgoing Bot API sends. Telegram still owns the
@@ -2553,9 +2557,127 @@ async def _flush_album_upload(client, key):
             except Exception:
                 log.exception("Could not report album upload failure")
 
+
+
+BROADCAST_CONFIRM_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("✅ 确认群发", callback_data="mc:broadcast:confirm"),
+     InlineKeyboardButton("❌ 取消", callback_data="mc:broadcast:cancel")]
+])
+
+
+async def _finish_broadcast_album(client, user_id, key):
+    try:
+        await asyncio.sleep(1.5)
+        messages = sorted(broadcast_album_buffers.pop(key, []), key=lambda item: int(item.id))
+        if not messages:
+            return
+        uid = int(user_id)
+        pending_broadcasts[uid] = {
+            "chat_id": int(messages[0].chat.id),
+            "message_ids": [int(item.id) for item in messages],
+            "is_album": True,
+        }
+        broadcast_input_mode.discard(uid)
+        await client.send_message(
+            uid,
+            f"📢 已收到相册（{len(messages)} 项）。上方内容就是发送预览。\n"
+            "确认后将整组发送给所有已记录用户。",
+            reply_markup=BROADCAST_CONFIRM_KEYBOARD,
+        )
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.exception("Could not prepare broadcast album preview for user %s", user_id)
+        broadcast_input_mode.discard(int(user_id))
+
+
+async def capture_broadcast_message(client, message):
+    user = message.from_user
+    if not user or int(user.id) not in broadcast_input_mode:
+        return False
+    uid = int(user.id)
+    group_id = getattr(message, "media_group_id", None)
+    if group_id:
+        key = (uid, int(message.chat.id), str(group_id))
+        broadcast_album_buffers.setdefault(key, []).append(message)
+        previous = broadcast_album_tasks.get(key)
+        if previous and not previous.done():
+            previous.cancel()
+        broadcast_album_tasks[key] = asyncio.create_task(
+            _finish_broadcast_album(client, uid, key)
+        )
+        return True
+
+    broadcast_input_mode.discard(uid)
+    pending_broadcasts[uid] = {
+        "chat_id": int(message.chat.id),
+        "message_ids": [int(message.id)],
+        "is_album": False,
+    }
+    await message.reply_text(
+        "📢 已收到广播内容。上方消息就是发送预览。\n"
+        "确认后将发送给所有已记录用户。",
+        reply_markup=BROADCAST_CONFIRM_KEYBOARD,
+    )
+    return True
+
+
+async def run_broadcast(client, admin_id, status):
+    pending = pending_broadcasts.get(int(admin_id))
+    if not pending:
+        await status.edit_text("⚠️ 没有待发送的广播内容，请重新进入广播管理。")
+        return
+    target_ids = await db.list_user_ids()
+    sent = 0
+    failed = 0
+    total = len(target_ids)
+    await status.edit_text(f"⏳ 正在广播：0/{total}")
+    for index, target_id in enumerate(target_ids, 1):
+        try:
+            while True:
+                try:
+                    if pending["is_album"]:
+                        await client.copy_media_group(
+                            chat_id=int(target_id),
+                            from_chat_id=int(pending["chat_id"]),
+                            message_id=int(pending["message_ids"][0]),
+                        )
+                    else:
+                        await client.copy_message(
+                            chat_id=int(target_id),
+                            from_chat_id=int(pending["chat_id"]),
+                            message_id=int(pending["message_ids"][0]),
+                        )
+                    sent += 1
+                    break
+                except FloodWait as exc:
+                    await asyncio.sleep(max(1, int(exc.value)))
+        except Exception:
+            failed += 1
+            log.warning("Broadcast delivery failed: admin=%s user=%s", admin_id, target_id, exc_info=True)
+        if index % 25 == 0 or index == total:
+            try:
+                await status.edit_text(
+                    f"⏳ 广播进行中：{index}/{total}\n"
+                    f"✅ 成功：{sent}  ❌ 失败：{failed}"
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(0.08)
+    pending_broadcasts.pop(int(admin_id), None)
+    await status.edit_text(
+        f"✅ 广播完成\n\n👥 目标用户：{total}\n"
+        f"📨 发送成功：{sent}\n⚠️ 发送失败：{failed}\n\n"
+        "失败用户记录已保留，没有自动删除任何用户。"
+    )
+
+
 async def upload_handler(client, message):
     user = message.from_user
     if not user:
+        return
+    if int(user.id) in broadcast_input_mode:
+        await capture_broadcast_message(client, message)
         return
     if not await is_admin(user.id):
         # Members browse and retrieve only. Ignore their uploads completely:
@@ -3942,6 +4064,16 @@ async def cancel_pending_admin_handler(client, message):
         return
     if pending_admin_actions.pop(user.id, None):
         await message.reply_text("已取消添加管理员。")
+    if int(user.id) in broadcast_input_mode or int(user.id) in pending_broadcasts:
+        broadcast_input_mode.discard(int(user.id))
+        pending_broadcasts.pop(int(user.id), None)
+        for key, task in list(broadcast_album_tasks.items()):
+            if key[0] == int(user.id):
+                if task and not task.done():
+                    task.cancel()
+                broadcast_album_tasks.pop(key, None)
+                broadcast_album_buffers.pop(key, None)
+        await message.reply_text("已取消广播流程。")
     if int(user.id) in pending_welcome_edit:
         pending_welcome_edit.discard(int(user.id))
         await message.reply_text("已取消编辑欢迎文案。")
@@ -3976,6 +4108,9 @@ async def scanner_login_input_handler(client, message):
     global scanner
     user = message.from_user
     if not user or not await is_admin(user.id):
+        return
+    if int(user.id) in broadcast_input_mode:
+        await capture_broadcast_message(client, message)
         return
     state = scanner_login_states.get(user.id)
     login_client = scanner_login_clients.get(user.id)
@@ -6023,6 +6158,27 @@ async def admin_callback_handler(client, query):
     await query.answer()
     action = query.data.split(":", 1)[1]
     message = query.message
+    if action == "broadcast:confirm":
+        pending = pending_broadcasts.get(int(user.id))
+        if not pending:
+            await query.answer("没有待发送的内容", show_alert=True)
+            return
+        await query.answer("已开始发送")
+        status = await message.reply_text("⏳ 正在启动广播…")
+        spawn_background(f"broadcast-{int(user.id)}", run_broadcast(client, int(user.id), status))
+        return
+    if action == "broadcast:cancel":
+        pending_broadcasts.pop(int(user.id), None)
+        broadcast_input_mode.discard(int(user.id))
+        for key, task in list(broadcast_album_tasks.items()):
+            if key[0] == int(user.id):
+                if task and not task.done():
+                    task.cancel()
+                broadcast_album_tasks.pop(key, None)
+                broadcast_album_buffers.pop(key, None)
+        await query.answer("已取消")
+        await message.edit_text("❌ 已取消本次广播，没有向用户发送任何内容。", reply_markup=back_keyboard())
+        return
     if action == "categorycancel":
         pending_category_actions.pop(user.id, None)
         active_batch = await db.get_upload_batch(user.id)
@@ -6941,7 +7097,16 @@ async def admin_callback_handler(client, query):
         body = "📂 最近文件（最多 15 个）\n" + ("\n".join(lines) if lines else "暂无文件记录") + "\n\n修改分类：/category 文件码 分类\n批量分享：/share 文件码1 文件码2"
         await message.edit_text(body, reply_markup=back_keyboard())
     elif action == "broadcast":
-        await message.edit_text("📢 广播操作\n\n发送：/broadcast 广播内容\n机器人会向已记录用户逐一发送，并返回成功/失败数量。", reply_markup=back_keyboard())
+        broadcast_input_mode.add(int(user.id))
+        pending_broadcasts.pop(int(user.id), None)
+        await message.edit_text(
+            "📢 广播管理\\n\\n"
+            "请直接发送一条要广播的消息：文字、图片、视频、文件、音频、GIF 或相册均可。\\n"
+            "文字格式和媒体说明会尽量按原消息保留。\\n\\n"
+            "收到后先显示预览，只有点击“确认群发”才会发送；发送失败不会删除用户记录。\\n"
+            "发送 /cancel 可退出。",
+            reply_markup=back_keyboard(),
+        )
     elif action == "stats":
         users, files, members, banned = await db.stats()
         await message.edit_text(f"📊 数据统计\n\n用户总数：{users}\n文件总数：{files}\n有效手动会员：{members}\n封禁用户：{banned}", reply_markup=back_keyboard())
@@ -7296,36 +7461,9 @@ async def broadcast_handler(client, message):
     if len(content) < 2 or not content[1].strip():
         await message.reply_text("用法：/broadcast 要广播的文字内容")
         return
-    target_ids = await db.list_user_ids()
-    sent = 0
-    failed_ids = []
-    status = await message.reply_text(f"⏳ 开始广播，共 {len(target_ids)} 位用户…")
-    for target_id in target_ids:
-        try:
-            await client.send_message(target_id, content[1])
-            sent += 1
-        except FloodWait as exc:
-            await asyncio.sleep(exc.value)
-            try:
-                await client.send_message(target_id, content[1])
-                sent += 1
-            except Exception:
-                failed_ids.append(int(target_id))
-                log.warning("Broadcast delivery failed after FloodWait: user=%s", target_id, exc_info=True)
-        except Exception:
-            failed_ids.append(int(target_id))
-            log.warning("Broadcast delivery failed: user=%s", target_id, exc_info=True)
-        await asyncio.sleep(0.05)
-
-    # Remove failed recipients from the broadcast user list only.
-    # Membership, files, and other user-related records remain untouched.
-    cleaned = await db.remove_users_from_broadcast_list(failed_ids)
-    failed = len(failed_ids)
-    await status.edit_text(
-        f"✅ 广播完成\n"
-        f"📨 发送成功：{sent}\n"
-        f"🧹 清理失败用户：{cleaned}\n"
-        f"👥 用户总数：{sent}"
+    await message.reply_text(
+        "📢 旧版命令仅支持文字。请打开 /admin → 群发广播，"
+        "直接发送文字或媒体，预览后确认发送。"
     )
 
 
