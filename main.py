@@ -939,9 +939,9 @@ async def send_captcha_challenge(client, user_id, attempts=0, notice=""):
         raise
 
     caption = (
-        "🧩 安全验证\\n\\n"
+        "🧩 安全验证\n\n"
         f"{notice + chr(10) + chr(10) if notice else ''}"
-        "请识别图片中的 6 位字母/数字，并直接发送给机器人。\\n"
+        "请识别图片中的 6 位字母/数字，并直接发送给机器人。\n"
         "验证码 3 分钟有效；验证通过后 1 小时内无需重复验证。"
     )
     try:
