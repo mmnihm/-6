@@ -17,7 +17,7 @@ def generate_captcha_image():
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", 43)
     except OSError:
-        font = ImageFont.load_default()
+        font = ImageFont.load_default(size=43)
 
     for _ in range(24):
         x1 = secrets.randbelow(width)
