@@ -1,6 +1,4 @@
 import asyncio
-import hashlib
-import hmac
 import json
 import aiohttp
 import logging
@@ -38,6 +36,11 @@ BOT_ID = None
 telegram_http_session = None
 pending_channel_bindings = {}
 membership_cache = {}
+# Browsing re-verifies membership at most once per hour; every claim path still
+# asks Telegram directly. A denial expires fast so someone who just joined is
+# not locked out for the rest of the hour.
+MEMBERSHIP_TTL_SECONDS = 3600
+MEMBERSHIP_DENIED_TTL_SECONDS = 60
 category_catalog_cache = {"expires_at": 0.0, "rows": []}
 scanner_login_states = {}
 scanner_login_clients = {}
@@ -548,6 +551,7 @@ async def render_captcha_admin(message, notice=""):
         "━━━━━━━━━━━━━━\n"
         f"当前状态：{'🟢 已开启' if enabled else '⏸ 已关闭'}\n\n"
         "开启后，普通会员进入机器人前需要完成图片验证码。\n"
+        "• 图片显示 4 位数字，下方 6 个按钮选一组\n"
         "• 验证码本身有效 3 分钟\n"
         "• 验证成功后 1 小时内有效\n"
         "• 连续错误 5 次，临时限制 15 分钟\n"
@@ -797,11 +801,13 @@ async def get_membership_tier(user_id: int, force_refresh: bool = False):
         return "手动会员"
 
     now = asyncio.get_running_loop().time()
-    # A still-fresh result is reused even when the caller asks to refresh: the
-    # window is only 15 seconds, so consecutive clicks cost zero API calls
-    # while a member who just left is still blocked within that window.
+    # Claim paths pass force_refresh=True so each delivery re-validates with
+    # Telegram even inside the hourly window; browsing reuses the cache below
+    # so a member who was removed is re-checked once an hour at most. A fresh
+    # denial is reused regardless, otherwise blocked users would retry
+    # getChatMember on every click.
     cached = membership_cache.get(int(user_id))
-    if cached and cached[0] > now:
+    if cached and cached[0] > now and (cached[1] is None or not force_refresh):
         return cached[1]
 
     group_id = await get_member_group_id()
@@ -849,11 +855,13 @@ async def get_membership_tier(user_id: int, force_refresh: bool = False):
             tier = "黄金会员"
         else:
             tier = None
-        # Cache group membership for 15 seconds to avoid repeated serial
-        # Telegram getChatMember calls on rapid folder navigation.
+        # Cache group membership: an hour once verified, a minute when denied,
+        # so a fresh joiner can retry immediately while members cost at most
+        # one getChatMember call per hour on browsing paths.
+        ttl = MEMBERSHIP_TTL_SECONDS if tier else MEMBERSHIP_DENIED_TTL_SECONDS
         if len(membership_cache) >= 2000:
             membership_cache.pop(next(iter(membership_cache)))
-        membership_cache[int(user_id)] = (now + 15, tier)
+        membership_cache[int(user_id)] = (now + ttl, tier)
         return tier
     except Exception as exc:
         # A Telegram hiccup must not tell a paying member to go join the group.
@@ -913,18 +921,16 @@ async def captcha_notice_allowed(user_id, cooldown=12):
 
 
 def captcha_choice_keyboard(user_id, challenge):
-    choices = challenge.get("choices") or []
-    selected = set(challenge.get("selected") or [])
+    options = challenge.get("options") or []
     buttons = []
-    for start in range(0, len(choices), 3):
-        row = []
-        for index in range(start, min(start + 3, len(choices))):
-            label = str(choices[index])
-            if index in selected:
-                label = f"✓ {label}"
-            row.append(InlineKeyboardButton(
-                label, callback_data=f"captcha_pick:{int(user_id)}:{index}"
-            ))
+    for start in range(0, len(options), 3):
+        row = [
+            InlineKeyboardButton(
+                str(options[index]),
+                callback_data=f"captcha_pick:{int(user_id)}:{index}",
+            )
+            for index in range(start, min(start + 3, len(options)))
+        ]
         buttons.append(row)
     return InlineKeyboardMarkup(buttons)
 
@@ -972,17 +978,13 @@ async def handle_captcha_choice(client, query):
         await query.answer("验证码已过期，已发送新验证码。", show_alert=True)
         return
 
-    choices = challenge.get("choices") or []
-    answer_order = challenge.get("answer_order") or []
-    selected = list(challenge.get("selected") or [])
-    if index < 0 or index >= len(choices) or len(selected) >= len(answer_order):
+    options = challenge.get("options") or []
+    answer_index = int(challenge.get("answer_index", -1) or -1)
+    if index < 0 or index >= len(options) or answer_index < 0:
         await query.answer("按钮无效，请重新验证。", show_alert=True)
         return
-    if index in selected:
-        await query.answer("这个字符已经选择过了。")
-        return
 
-    if index != answer_order[len(selected)]:
+    if index != answer_index:
         attempts = int(challenge.get("attempts", 0) or 0) + 1
         try:
             await message.edit_reply_markup(reply_markup=None)
@@ -999,62 +1001,40 @@ async def handle_captcha_choice(client, query):
             return
         await send_captcha_challenge(
             client, user.id, attempts=attempts,
-            notice=f"❌ 顺序不正确，还可尝试 {CAPTCHA_MAX_ATTEMPTS - attempts} 次。",
+            notice=f"❌ 没有选中图片上的数字，还可尝试 {CAPTCHA_MAX_ATTEMPTS - attempts} 次。",
         )
-        await query.answer("顺序不正确，已更换验证码。", show_alert=True)
+        await query.answer("选择不正确，已更换验证码。", show_alert=True)
         return
 
-    selected.append(index)
-    if len(selected) == len(answer_order):
-        await db.set_setting(
-            _captcha_setting_key("session", user.id),
-            json.dumps({"verified_at": now, "expires_at": now + CAPTCHA_SESSION_TTL}),
-        )
-        await db.set_setting(_captcha_setting_key("challenge", user.id), "")
-        await db.set_setting(_captcha_setting_key("block", user.id), "")
-        await db.set_setting(_captcha_setting_key("notice", user.id), "")
-        try:
-            await message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        await query.answer("✅ 验证成功！")
-        await message.reply_text("✅ 验证成功！本次验证有效 1 小时。请发送 /start 进入机器人。")
-        return
-
-    challenge["selected"] = selected
     await db.set_setting(
-        _captcha_setting_key("challenge", user.id),
-        json.dumps(challenge, separators=(",", ":")),
+        _captcha_setting_key("session", user.id),
+        json.dumps({"verified_at": now, "expires_at": now + CAPTCHA_SESSION_TTL}),
     )
-    await message.edit_reply_markup(
-        reply_markup=captcha_choice_keyboard(user.id, challenge)
-    )
-    await query.answer(f"已选择 {len(selected)}/6")
+    await db.set_setting(_captcha_setting_key("challenge", user.id), "")
+    await db.set_setting(_captcha_setting_key("block", user.id), "")
+    await db.set_setting(_captcha_setting_key("notice", user.id), "")
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await query.answer("✅ 验证成功！")
+    await message.reply_text("✅ 验证成功！本次验证有效 1 小时。请发送 /start 进入机器人。")
 
 
 async def send_captcha_challenge(client, user_id, attempts=0, notice=""):
-    from captcha_image import generate_captcha_image
+    from captcha_image import build_captcha
 
     try:
-        image, answer = generate_captcha_image()
+        image, options, answer_index = build_captcha()
     except Exception:
         log.exception("CAPTCHA image generation failed for user %s", user_id)
         raise
 
-    salt = secrets.token_hex(16)
-    indexed_choices = list(enumerate(answer))
-    secrets.SystemRandom().shuffle(indexed_choices)
-    choices = [char for _, char in indexed_choices]
-    answer_order = [next(i for i, (original, _) in enumerate(indexed_choices) if original == pos)
-                    for pos in range(len(answer))]
     challenge = {
-        "salt": salt,
-        "answer_hash": hashlib.sha256((salt + answer).encode("utf-8")).hexdigest(),
         "expires_at": time.time() + CAPTCHA_CHALLENGE_TTL,
         "attempts": int(attempts),
-        "choices": choices,
-        "answer_order": answer_order,
-        "selected": [],
+        "options": options,
+        "answer_index": int(answer_index),
     }
     try:
         await db.set_setting(
@@ -1074,7 +1054,7 @@ async def send_captcha_challenge(client, user_id, attempts=0, notice=""):
     caption = (
         "🧩 安全验证\n\n"
         f"{notice + chr(10) + chr(10) if notice else ''}"
-        "请按图片中字符的顺序，依次点击下方 6 个按钮。\n"
+        "请在下方按钮中，点击与图片里 4 位数字完全相同的一组。\n"
         "验证码 3 分钟有效；验证通过后 1 小时内无需重复验证。"
     )
     try:
@@ -1121,7 +1101,7 @@ async def captcha_message_gate(client, message):
 
     if (
         not challenge
-        or not challenge.get("choices")
+        or not challenge.get("options")
         or float(challenge.get("expires_at", 0) or 0) <= now
     ):
         if await captcha_notice_allowed(user_id):
@@ -1187,7 +1167,7 @@ async def captcha_private_callback_middleware(client, query):
             challenge = {}
 
         if (
-            challenge and challenge.get("choices")
+            challenge and challenge.get("options")
             and float(challenge.get("expires_at", 0) or 0) > now
         ):
             # The CAPTCHA image is already in the chat. Do not send another
