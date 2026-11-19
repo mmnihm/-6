@@ -912,6 +912,126 @@ async def captcha_notice_allowed(user_id, cooldown=12):
     return True
 
 
+def captcha_choice_keyboard(user_id, challenge):
+    choices = challenge.get("choices") or []
+    selected = set(challenge.get("selected") or [])
+    buttons = []
+    for start in range(0, len(choices), 3):
+        row = []
+        for index in range(start, min(start + 3, len(choices))):
+            label = str(choices[index])
+            if index in selected:
+                label = f"✓ {label}"
+            row.append(InlineKeyboardButton(
+                label, callback_data=f"captcha_pick:{int(user_id)}:{index}"
+            ))
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+async def handle_captcha_choice(client, query):
+    user = query.from_user
+    message = query.message
+    if not user or user.is_bot or not message or message.chat.type != ChatType.PRIVATE:
+        return
+    try:
+        _, owner_text, index_text = str(query.data or "").split(":", 2)
+        owner_id, index = int(owner_text), int(index_text)
+    except (TypeError, ValueError):
+        await query.answer("验证按钮无效，请重新获取验证码。", show_alert=True)
+        return
+    if owner_id != int(user.id):
+        await query.answer("这不是你的验证码。", show_alert=True)
+        return
+    if await is_admin(user.id) or not await captcha_is_enabled():
+        await query.answer("无需验证。")
+        return
+
+    now = time.time()
+    block_raw = await db.get_setting(_captcha_setting_key("block", user.id))
+    try:
+        blocked_until = float(block_raw or 0)
+    except (TypeError, ValueError):
+        blocked_until = 0
+    if blocked_until > now:
+        remaining = max(1, int((blocked_until - now + 59) // 60))
+        await query.answer(f"验证失败次数过多，请 {remaining} 分钟后再试。", show_alert=True)
+        return
+
+    challenge_raw = await db.get_setting(_captcha_setting_key("challenge", user.id))
+    try:
+        challenge = json.loads(challenge_raw or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        challenge = {}
+    if not challenge or float(challenge.get("expires_at", 0) or 0) <= now:
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await send_captcha_challenge(client, user.id)
+        await query.answer("验证码已过期，已发送新验证码。", show_alert=True)
+        return
+
+    choices = challenge.get("choices") or []
+    answer_order = challenge.get("answer_order") or []
+    selected = list(challenge.get("selected") or [])
+    if index < 0 or index >= len(choices) or len(selected) >= len(answer_order):
+        await query.answer("按钮无效，请重新验证。", show_alert=True)
+        return
+    if index in selected:
+        await query.answer("这个字符已经选择过了。")
+        return
+
+    if index != answer_order[len(selected)]:
+        attempts = int(challenge.get("attempts", 0) or 0) + 1
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        if attempts >= CAPTCHA_MAX_ATTEMPTS:
+            await db.set_setting(_captcha_setting_key("challenge", user.id), "")
+            await db.set_setting(
+                _captcha_setting_key("block", user.id),
+                str(now + CAPTCHA_BLOCK_SECONDS),
+            )
+            await query.answer("连续错误 5 次，已限制 15 分钟。", show_alert=True)
+            await message.reply_text("⛔ 验证失败次数过多，请 15 分钟后再试。")
+            return
+        await send_captcha_challenge(
+            client, user.id, attempts=attempts,
+            notice=f"❌ 顺序不正确，还可尝试 {CAPTCHA_MAX_ATTEMPTS - attempts} 次。",
+        )
+        await query.answer("顺序不正确，已更换验证码。", show_alert=True)
+        return
+
+    selected.append(index)
+    if len(selected) == len(answer_order):
+        await db.set_setting(
+            _captcha_setting_key("session", user.id),
+            json.dumps({"verified_at": now, "expires_at": now + CAPTCHA_SESSION_TTL}),
+        )
+        await db.set_setting(_captcha_setting_key("challenge", user.id), "")
+        await db.set_setting(_captcha_setting_key("block", user.id), "")
+        await db.set_setting(_captcha_setting_key("notice", user.id), "")
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.answer("✅ 验证成功！")
+        await message.reply_text("✅ 验证成功！本次验证有效 1 小时。请发送 /start 进入机器人。")
+        return
+
+    challenge["selected"] = selected
+    await db.set_setting(
+        _captcha_setting_key("challenge", user.id),
+        json.dumps(challenge, separators=(",", ":")),
+    )
+    await message.edit_reply_markup(
+        reply_markup=captcha_choice_keyboard(user.id, challenge)
+    )
+    await query.answer(f"已选择 {len(selected)}/6")
+
+
 async def send_captcha_challenge(client, user_id, attempts=0, notice=""):
     from captcha_image import generate_captcha_image
 
@@ -922,11 +1042,19 @@ async def send_captcha_challenge(client, user_id, attempts=0, notice=""):
         raise
 
     salt = secrets.token_hex(16)
+    indexed_choices = list(enumerate(answer))
+    secrets.SystemRandom().shuffle(indexed_choices)
+    choices = [char for _, char in indexed_choices]
+    answer_order = [next(i for i, (original, _) in enumerate(indexed_choices) if original == pos)
+                    for pos in range(len(answer))]
     challenge = {
         "salt": salt,
         "answer_hash": hashlib.sha256((salt + answer).encode("utf-8")).hexdigest(),
         "expires_at": time.time() + CAPTCHA_CHALLENGE_TTL,
         "attempts": int(attempts),
+        "choices": choices,
+        "answer_order": answer_order,
+        "selected": [],
     }
     try:
         await db.set_setting(
@@ -946,11 +1074,14 @@ async def send_captcha_challenge(client, user_id, attempts=0, notice=""):
     caption = (
         "🧩 安全验证\n\n"
         f"{notice + chr(10) + chr(10) if notice else ''}"
-        "请识别图片中的 6 位字母/数字，并直接发送给机器人。\n"
+        "请按图片中字符的顺序，依次点击下方 6 个按钮。\n"
         "验证码 3 分钟有效；验证通过后 1 小时内无需重复验证。"
     )
     try:
-        await client.send_photo(int(user_id), photo=image, caption=caption)
+        await client.send_photo(
+            int(user_id), photo=image, caption=caption,
+            reply_markup=captcha_choice_keyboard(user_id, challenge)
+        )
     except Exception:
         log.exception("CAPTCHA Telegram photo send failed for user %s", user_id)
         # Remove an unsent challenge so the next request can retry delivery.
@@ -964,7 +1095,7 @@ async def send_captcha_challenge(client, user_id, attempts=0, notice=""):
 
 async def captcha_message_gate(client, message):
     user = message.from_user
-    if not user or await is_admin(user.id) or not await captcha_is_enabled():
+    if not user or user.is_bot or await is_admin(user.id) or not await captcha_is_enabled():
         return
     user_id = int(user.id)
     now = time.time()
@@ -997,45 +1128,8 @@ async def captcha_message_gate(client, message):
                 await message.reply_text("⚠️ 验证码暂时无法生成，请稍后重试。")
         raise StopPropagation
 
-    answer = str(getattr(message, "text", "") or "").strip().upper()
-    # Ignore commands, media, and ordinary text while CAPTCHA is pending.
-    # Only a six-character alphanumeric reply is treated as an attempted code;
-    # this avoids repeating reminder messages or consuming attempts on /start.
-    if not answer or answer.startswith("/") or not re.fullmatch(r"[A-Z0-9]{6}", answer):
-        raise StopPropagation
-
-    salt = str(challenge.get("salt") or "")
-    expected = str(challenge.get("answer_hash") or "")
-    actual = hashlib.sha256((salt + answer).encode("utf-8")).hexdigest()
-    if salt and expected and hmac.compare_digest(actual, expected):
-        await db.set_setting(
-            _captcha_setting_key("session", user_id),
-            json.dumps({"verified_at": now, "expires_at": now + CAPTCHA_SESSION_TTL}),
-        )
-        await db.set_setting(_captcha_setting_key("challenge", user_id), "")
-        await db.set_setting(_captcha_setting_key("block", user_id), "")
-        await db.set_setting(_captcha_setting_key("notice", user_id), "")
-        await message.reply_text("✅ 验证成功！本次验证有效 1 小时。请发送 /start 进入机器人。")
-        raise StopPropagation
-
-    attempts = int(challenge.get("attempts", 0) or 0) + 1
-    if attempts >= CAPTCHA_MAX_ATTEMPTS:
-        await db.set_setting(_captcha_setting_key("challenge", user_id), "")
-        await db.set_setting(
-            _captcha_setting_key("block", user_id),
-            str(now + CAPTCHA_BLOCK_SECONDS),
-        )
-        await message.reply_text("⛔ 验证码连续错误 5 次，已临时限制 15 分钟，请稍后再试。")
-        raise StopPropagation
-
-    try:
-        await send_captcha_challenge(
-            client, user_id, attempts=attempts,
-            notice=f"❌ 验证码不正确，还可尝试 {CAPTCHA_MAX_ATTEMPTS - attempts} 次。",
-        )
-    except Exception:
-        log.exception("Could not refresh image CAPTCHA for user %s", user_id)
-        await message.reply_text("❌ 验证码不正确，请稍后重试。")
+    # CAPTCHA is completed only through the six inline buttons.
+    # Ignore typed text, commands and media while a challenge is pending.
     raise StopPropagation
 
 
@@ -1048,8 +1142,11 @@ async def captcha_private_message_middleware(client, message):
 async def captcha_private_callback_middleware(client, query):
     user = query.from_user
     message = query.message
+    if query.data and str(query.data).startswith("captcha_pick:"):
+        await handle_captcha_choice(client, query)
+        raise StopPropagation
     if (
-        not user or not message or message.chat.type != ChatType.PRIVATE
+        not user or user.is_bot or not message or message.chat.type != ChatType.PRIVATE
         or await is_admin(user.id) or not await captcha_is_enabled()
         or await captcha_session_valid(user.id)
     ):
