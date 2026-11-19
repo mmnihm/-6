@@ -1370,6 +1370,18 @@ class Database:
             """, (user_id, share_key, max(0, int(next_offset)), iso_now()))
             await db.commit()
 
+    async def reset_category_delivery_progress(self, user_id: int, share_key: str):
+        """Start a new delivery cycle for one member and one folder only."""
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT INTO category_delivery_progress(user_id, share_key, next_offset, updated_at)
+                VALUES(?, ?, 0, ?)
+                ON CONFLICT(user_id, share_key) DO UPDATE SET
+                    next_offset=0,
+                    updated_at=excluded.updated_at
+            """, (int(user_id), str(share_key), iso_now()))
+            await db.commit()
+
     async def record_delivery_failure(self, user_id, file_keys, share_key, error=""):
         """Count failed retrieval attempts for one delivery unit and return the new peak.
 
