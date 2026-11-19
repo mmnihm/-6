@@ -915,7 +915,12 @@ async def captcha_notice_allowed(user_id, cooldown=12):
 async def send_captcha_challenge(client, user_id, attempts=0, notice=""):
     from captcha_image import generate_captcha_image
 
-    image, answer = generate_captcha_image()
+    try:
+        image, answer = generate_captcha_image()
+    except Exception:
+        log.exception("CAPTCHA image generation failed for user %s", user_id)
+        raise
+
     salt = secrets.token_hex(16)
     challenge = {
         "salt": salt,
@@ -923,18 +928,33 @@ async def send_captcha_challenge(client, user_id, attempts=0, notice=""):
         "expires_at": time.time() + CAPTCHA_CHALLENGE_TTL,
         "attempts": int(attempts),
     }
-    await db.set_setting(
-        _captcha_setting_key("challenge", user_id),
-        json.dumps(challenge, separators=(",", ":")),
-    )
-    await db.set_setting(_captcha_setting_key("notice", user_id), str(time.time()))
+    try:
+        await db.set_setting(
+            _captcha_setting_key("challenge", user_id),
+            json.dumps(challenge, separators=(",", ":")),
+        )
+        await db.set_setting(_captcha_setting_key("notice", user_id), str(time.time()))
+    except Exception:
+        log.exception("CAPTCHA challenge database write failed for user %s", user_id)
+        raise
+
     caption = (
-        "🧩 安全验证\n\n"
+        "🧩 安全验证\\n\\n"
         f"{notice + chr(10) + chr(10) if notice else ''}"
-        "请识别图片中的 6 位字母/数字，并直接发送给机器人。\n"
+        "请识别图片中的 6 位字母/数字，并直接发送给机器人。\\n"
         "验证码 3 分钟有效；验证通过后 1 小时内无需重复验证。"
     )
-    await client.send_photo(int(user_id), photo=image, caption=caption)
+    try:
+        await client.send_photo(int(user_id), photo=image, caption=caption)
+    except Exception:
+        log.exception("CAPTCHA Telegram photo send failed for user %s", user_id)
+        # Remove an unsent challenge so the next request can retry delivery.
+        try:
+            await db.set_setting(_captcha_setting_key("challenge", user_id), "")
+            await db.set_setting(_captcha_setting_key("notice", user_id), "")
+        except Exception:
+            log.exception("Could not clear failed CAPTCHA challenge for user %s", user_id)
+        raise
 
 
 async def captcha_message_gate(client, message):
