@@ -936,6 +936,11 @@ async def send_captcha_challenge(client, user_id, attempts=0, notice=""):
         await db.set_setting(_captcha_setting_key("notice", user_id), str(time.time()))
     except Exception:
         log.exception("CAPTCHA challenge database write failed for user %s", user_id)
+        try:
+            await db.set_setting(_captcha_setting_key("challenge", user_id), "")
+            await db.set_setting(_captcha_setting_key("notice", user_id), "")
+        except Exception:
+            log.exception("Could not roll back partial CAPTCHA state for user %s", user_id)
         raise
 
     caption = (
