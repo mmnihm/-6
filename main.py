@@ -875,6 +875,8 @@ CAPTCHA_SESSION_TTL = 3600
 CAPTCHA_CHALLENGE_TTL = 180
 CAPTCHA_MAX_ATTEMPTS = 5
 CAPTCHA_BLOCK_SECONDS = 900
+# Prevent rapid/repeated button taps from creating duplicate CAPTCHA messages.
+captcha_callback_locks = {}
 
 
 def _captcha_setting_key(kind, user_id):
@@ -1005,31 +1007,50 @@ async def captcha_private_callback_middleware(client, query):
         or await captcha_session_valid(user.id)
     ):
         return
-    await query.answer("请先完成图片验证码。", show_alert=True)
-    now = time.time()
-    block_raw = await db.get_setting(_captcha_setting_key("block", user.id))
-    try:
-        blocked_until = float(block_raw or 0)
-    except (TypeError, ValueError):
-        blocked_until = 0
-    if blocked_until > now:
-        remaining = max(1, int((blocked_until - now + 59) // 60))
-        await client.send_message(user.id, f"⛔ 验证失败次数过多，请 {remaining} 分钟后再试。")
-    else:
-        challenge_raw = await db.get_setting(_captcha_setting_key("challenge", user.id))
+
+    user_id = int(user.id)
+    lock = captcha_callback_locks.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        # Re-check after acquiring the lock in case verification just completed.
+        if await is_admin(user_id) or not await captcha_is_enabled():
+            return
+        if await captcha_session_valid(user_id):
+            return
+
+        now = time.time()
+        block_raw = await db.get_setting(_captcha_setting_key("block", user_id))
+        try:
+            blocked_until = float(block_raw or 0)
+        except (TypeError, ValueError):
+            blocked_until = 0
+
+        if blocked_until > now:
+            remaining = max(1, int((blocked_until - now + 59) // 60))
+            await query.answer(
+                f"验证失败次数过多，请 {remaining} 分钟后再试。",
+                show_alert=True,
+            )
+            raise StopPropagation
+
+        challenge_raw = await db.get_setting(_captcha_setting_key("challenge", user_id))
         try:
             challenge = json.loads(challenge_raw or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
             challenge = {}
-        if not challenge or float(challenge.get("expires_at", 0) or 0) <= now:
-            try:
-                await send_captcha_challenge(client, user.id)
-            except Exception:
-                log.exception("Could not create CAPTCHA after callback for user %s", user.id)
-                await client.send_message(user.id, "⚠️ 验证码暂时无法生成，请稍后重试。")
-        else:
-            await client.send_message(user.id, "请先查看验证码图片，并发送图片中的 6 位字母/数字。")
-    raise StopPropagation
+
+        if challenge and float(challenge.get("expires_at", 0) or 0) > now:
+            # The CAPTCHA image is already in the chat. Do not send another
+            # message for every catalogue or claim button tap.
+            await query.answer("请先完成图片验证码。")
+            raise StopPropagation
+
+        try:
+            await send_captcha_challenge(client, user_id)
+            await query.answer("验证码已发送，请查看上方图片。")
+        except Exception:
+            log.exception("Could not create CAPTCHA after callback for user %s", user_id)
+            await query.answer("验证码暂时无法生成，请稍后重试。", show_alert=True)
+        raise StopPropagation
 
 
 def media_details(message):
