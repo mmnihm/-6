@@ -1119,7 +1119,11 @@ async def captcha_message_gate(client, message):
     except (TypeError, ValueError, json.JSONDecodeError):
         challenge = {}
 
-    if not challenge or float(challenge.get("expires_at", 0) or 0) <= now:
+    if (
+        not challenge
+        or not challenge.get("choices")
+        or float(challenge.get("expires_at", 0) or 0) <= now
+    ):
         if await captcha_notice_allowed(user_id):
             try:
                 await send_captcha_challenge(client, user_id)
@@ -1182,7 +1186,10 @@ async def captcha_private_callback_middleware(client, query):
         except (TypeError, ValueError, json.JSONDecodeError):
             challenge = {}
 
-        if challenge and float(challenge.get("expires_at", 0) or 0) > now:
+        if (
+            challenge and challenge.get("choices")
+            and float(challenge.get("expires_at", 0) or 0) > now
+        ):
             # The CAPTCHA image is already in the chat. Do not send another
             # message for every catalogue or claim button tap.
             await query.answer("请先完成图片验证码。")
