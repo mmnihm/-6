@@ -411,7 +411,7 @@ async def admin_home_text():
 
 
 def admin_keyboard():
-    """Compact two-column dashboard; existing modules and callback actions are preserved."""
+    """Compact two-column dashboard; seldom-used modules live in mc:more."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 上传资源", callback_data="mc:upload"),
          InlineKeyboardButton("📁 文件夹管理", callback_data="mc:directories")],
@@ -419,18 +419,26 @@ def admin_keyboard():
          InlineKeyboardButton("🧾 领取记录与审计", callback_data="mc:audit")],
         [InlineKeyboardButton("🗄 储存管理", callback_data="mc:storage"),
          InlineKeyboardButton("📦 备份管理", callback_data="mc:backup")],
-        [InlineKeyboardButton("🔍 扫描账号", callback_data="mc:scannerlogin"),
-         InlineKeyboardButton("📊 数据统计", callback_data="mc:stats")],
-        [InlineKeyboardButton("🛡 内容保护", callback_data="mc:contentguard"),
-         InlineKeyboardButton("🆔 领取编号查询", callback_data="mc:wm")],
-        [InlineKeyboardButton("🧩 验证码设置", callback_data="mc:captcha")],
         [InlineKeyboardButton("👥 会员群绑定", callback_data="mc:bindgroup"),
+         InlineKeyboardButton("📊 数据统计", callback_data="mc:stats")],
+        [InlineKeyboardButton("🧩 验证码设置", callback_data="mc:captcha"),
+         InlineKeyboardButton("⚙️ 更多设置", callback_data="mc:more")],
+    ])
+
+
+def admin_more_keyboard():
+    """Secondary dashboard for modules that are used rarely."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 扫描账号", callback_data="mc:scannerlogin"),
+         InlineKeyboardButton("🛡 内容保护", callback_data="mc:contentguard")],
+        [InlineKeyboardButton("🆔 领取编号查询", callback_data="mc:wm"),
          InlineKeyboardButton("🛡 管理员管理", callback_data="mc:admins")],
         [InlineKeyboardButton("👋 进群欢迎", callback_data="mc:welcome"),
          InlineKeyboardButton("🔘 首页按钮", callback_data="mc:homebuttons")],
         [InlineKeyboardButton("📢 首页公告", callback_data="mc:announce"),
          InlineKeyboardButton("📣 群发广播", callback_data="mc:broadcast")],
-        [InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands")],
+        [InlineKeyboardButton("📖 命令帮助", callback_data="mc:commands"),
+         InlineKeyboardButton("🏠 返回管理首页", callback_data="mc:home")],
     ])
 
 
@@ -1826,15 +1834,14 @@ async def user_home_keyboard():
             str(item["text"])[:60], callback_data=f"uc:{item['key']}"
         )
 
-    # The user requested hiding "我的领取" and "最新入库" from the
-    # member home only. Their callbacks and stored data remain untouched.
+    # Four clean rows. 「我的领取」 and 「使用帮助」 moved into 会员中心 so the
+    # grid never ends on a single lonely key.
     rows = []
     for group in (
         ("folders", "search"),
         ("latest_new", "top"),
         ("random", "favorites"),
         ("notifications", "member"),
-        ("help",),
     ):
         row = [make_button(by_key[key]) for key in group if key in by_key]
         if row:
@@ -5770,6 +5777,8 @@ async def user_catalog_callback_handler(client, query):
             f"🎬 视频：{stats['videos']} 个\n\n"
             "感谢使用会员资源中心。",
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🕘 我的领取", callback_data="uc:history"),
+                 InlineKeyboardButton("❔ 使用帮助", callback_data="uc:help")],
                 [InlineKeyboardButton("🏠 返回主页", callback_data="uc:home")]
             ]),
         )
@@ -6283,13 +6292,19 @@ async def user_catalog_callback_handler(client, query):
         )
         return
 
-    if action[1] == "getfolder" and len(action) == 4:
+    if (action[1] == "getfolder" and len(action) == 4) or (
+        action[1] == "reget" and len(action) == 3
+    ):
         share_key = action[2]
-        try:
-            offset = max(0, int(action[3]))
-        except ValueError:
-            await message.reply_text("⚠️ 批次参数无效，请重新打开目录。")
-            return
+        restart_folder = action[1] == "reget"
+        if restart_folder:
+            offset = 0
+        else:
+            try:
+                offset = max(0, int(action[3]))
+            except ValueError:
+                await message.reply_text("⚠️ 批次参数无效，请重新打开目录。")
+                return
         category = await db.get_category_by_share_key(share_key)
         if not category:
             await message.reply_text("⚠️ 文件夹不存在或已被移除。")
@@ -6314,13 +6329,30 @@ async def user_catalog_callback_handler(client, query):
                     user.id, member_progress_key, category["name"]
                 )
 
-            # A completed member/folder cursor starts a fresh delivery cycle when
-            # the member explicitly asks for this folder again. Reset only this
-            # user's cursor; preserve delivery history and every other member.
+            # A completed member/folder cursor restarts only after the member
+            # taps 「✅ 重新领取」, so one stray tap cannot resend the whole
+            # folder. The confirmation itself carries no state change.
             repeat_delivery = bool(total > 0 and saved_offset >= total)
-            if repeat_delivery:
+            if restart_folder:
                 await db.reset_category_delivery_progress(user.id, member_progress_key)
                 saved_offset = 0
+            elif repeat_delivery:
+                await query.answer("这个目录已经领完了")
+                await message.edit_text(
+                    "🔄 这个目录已经领完了\n\n"
+                    f"📁 目录：{category['name']}\n"
+                    f"📦 资源：{total} 个\n\n"
+                    "重新领取会从第一个资源开始，整本再发一遍（每批 20 个）。",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            "✅ 重新领取", callback_data=f"uc:reget:{share_key}"
+                        )],
+                        [InlineKeyboardButton(
+                            "↩️ 返回目录", callback_data=f"uc:folderlink:{share_key}"
+                        )],
+                    ]),
+                )
+                return
 
             # The database cursor is authoritative; stale Telegram buttons must
             # not jump over resources that were never delivered.
@@ -6799,6 +6831,13 @@ async def admin_callback_handler(client, query):
             await render_announce_admin(message, "🗑 公告已清空。")
             return
         await render_announce_admin(message)
+    elif action == "more":
+        await message.edit_text(
+            "⚙️ 更多设置\n━━━━━━━━━━━━━━\n"
+            "扫描、内容保护、编号查询、管理员与首页配置都在这里。\n"
+            "返回「⚙️ 资源管理中心」可回到常用功能。",
+            reply_markup=admin_more_keyboard(),
+        )
     elif action == "home":
         users, files, _, banned = await db.stats()
         group_id = await get_member_group_id()
