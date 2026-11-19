@@ -972,9 +972,10 @@ async def captcha_message_gate(client, message):
         raise StopPropagation
 
     answer = str(getattr(message, "text", "") or "").strip().upper()
-    if not answer or answer.startswith("/"):
-        if await captcha_notice_allowed(user_id):
-            await message.reply_text("请先查看上方验证码图片，再发送图片中的 6 位字母/数字。")
+    # Ignore commands, media, and ordinary text while CAPTCHA is pending.
+    # Only a six-character alphanumeric reply is treated as an attempted code;
+    # this avoids repeating reminder messages or consuming attempts on /start.
+    if not answer or answer.startswith("/") or not re.fullmatch(r"[A-Z0-9]{6}", answer):
         raise StopPropagation
 
     salt = str(challenge.get("salt") or "")
