@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import aiohttp
 import logging
@@ -9,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 
 from aiohttp import web
 
-from pyrogram import Client, filters, raw, utils
+from pyrogram import Client, filters, raw, utils, StopPropagation
 from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio,
@@ -417,6 +419,7 @@ def admin_keyboard():
          InlineKeyboardButton("📊 数据统计", callback_data="mc:stats")],
         [InlineKeyboardButton("🛡 内容保护", callback_data="mc:contentguard"),
          InlineKeyboardButton("🆔 领取编号查询", callback_data="mc:wm")],
+        [InlineKeyboardButton("🧩 验证码设置", callback_data="mc:captcha")],
         [InlineKeyboardButton("👥 会员群绑定", callback_data="mc:bindgroup"),
          InlineKeyboardButton("🛡 管理员管理", callback_data="mc:admins")],
         [InlineKeyboardButton("👋 进群欢迎", callback_data="mc:welcome"),
@@ -535,6 +538,31 @@ async def get_welcome_settings():
 def render_welcome_message(template, names, bot_url):
     name_text = "、".join(names)
     return template.replace("{name}", name_text).replace("{bot}", bot_url)
+
+
+async def render_captcha_admin(message, notice=""):
+    enabled = await captcha_is_enabled()
+    body = (
+        "🧩 图片验证码设置\n"
+        "━━━━━━━━━━━━━━\n"
+        f"当前状态：{'🟢 已开启' if enabled else '⏸ 已关闭'}\n\n"
+        "开启后，普通会员进入机器人前需要完成图片验证码。\n"
+        "• 验证码本身有效 3 分钟\n"
+        "• 验证成功后 1 小时内有效\n"
+        "• 连续错误 5 次，临时限制 15 分钟\n"
+        "• 管理员不受验证码拦截\n"
+        "• 设置和验证状态保存在 PostgreSQL，重启后保留"
+    )
+    if notice:
+        body = notice + "\n\n" + body
+    toggle_label = "⏸ 关闭验证码" if enabled else "✅ 开启验证码"
+    await message.edit_text(
+        body,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle_label, callback_data="mc:captcha:toggle")],
+            [InlineKeyboardButton("🏠 返回管理首页", callback_data="mc:home")],
+        ]),
+    )
 
 
 async def render_welcome_admin(message, notice=""):
@@ -838,6 +866,170 @@ async def get_membership_tier(user_id: int, force_refresh: bool = False):
 
 async def has_access(user_id: int, force_refresh: bool = False) -> bool:
     return await get_membership_tier(user_id, force_refresh=force_refresh) is not None
+
+
+# Private-chat image CAPTCHA. All state is stored in the existing PostgreSQL
+# settings table so sessions survive process restarts and redeployments.
+CAPTCHA_ENABLED_KEY = "captcha_enabled"
+CAPTCHA_SESSION_TTL = 3600
+CAPTCHA_CHALLENGE_TTL = 180
+CAPTCHA_MAX_ATTEMPTS = 5
+CAPTCHA_BLOCK_SECONDS = 900
+
+
+def _captcha_setting_key(kind, user_id):
+    return f"captcha_{kind}:{int(user_id)}"
+
+
+async def captcha_is_enabled():
+    return await db.get_setting(CAPTCHA_ENABLED_KEY) != "0"
+
+
+async def captcha_session_valid(user_id):
+    raw_value = await db.get_setting(_captcha_setting_key("session", user_id))
+    try:
+        session = json.loads(raw_value or "{}")
+        return float(session.get("expires_at", 0)) > time.time()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+async def send_captcha_challenge(client, user_id, attempts=0, notice=""):
+    from captcha_image import generate_captcha_image
+
+    image, answer = generate_captcha_image()
+    salt = secrets.token_hex(16)
+    challenge = {
+        "salt": salt,
+        "answer_hash": hashlib.sha256((salt + answer).encode("utf-8")).hexdigest(),
+        "expires_at": time.time() + CAPTCHA_CHALLENGE_TTL,
+        "attempts": int(attempts),
+    }
+    await db.set_setting(
+        _captcha_setting_key("challenge", user_id),
+        json.dumps(challenge, separators=(",", ":")),
+    )
+    caption = (
+        "🧩 安全验证\n\n"
+        f"{notice + chr(10) + chr(10) if notice else ''}"
+        "请识别图片中的 6 位字母/数字，并直接发送给机器人。\n"
+        "验证码 3 分钟有效；验证通过后 1 小时内无需重复验证。"
+    )
+    await client.send_photo(int(user_id), photo=image, caption=caption)
+
+
+async def captcha_message_gate(client, message):
+    user = message.from_user
+    if not user or await is_admin(user.id) or not await captcha_is_enabled():
+        return
+    user_id = int(user.id)
+    now = time.time()
+
+    block_raw = await db.get_setting(_captcha_setting_key("block", user_id))
+    try:
+        blocked_until = float(block_raw or 0)
+    except (TypeError, ValueError):
+        blocked_until = 0
+    if blocked_until > now:
+        remaining = max(1, int((blocked_until - now + 59) // 60))
+        await message.reply_text(f"⛔ 验证失败次数过多，请 {remaining} 分钟后再试。")
+        raise StopPropagation
+    if await captcha_session_valid(user_id):
+        return
+
+    challenge_raw = await db.get_setting(_captcha_setting_key("challenge", user_id))
+    try:
+        challenge = json.loads(challenge_raw or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        challenge = {}
+
+    if not challenge or float(challenge.get("expires_at", 0) or 0) <= now:
+        try:
+            await send_captcha_challenge(client, user_id)
+        except Exception:
+            log.exception("Could not create image CAPTCHA for user %s", user_id)
+            await message.reply_text("⚠️ 验证码暂时无法生成，请稍后重试。")
+        raise StopPropagation
+
+    answer = str(getattr(message, "text", "") or "").strip().upper()
+    if not answer or answer.startswith("/"):
+        await message.reply_text("请先查看上方验证码图片，再发送图片中的 6 位字母/数字。")
+        raise StopPropagation
+
+    salt = str(challenge.get("salt") or "")
+    expected = str(challenge.get("answer_hash") or "")
+    actual = hashlib.sha256((salt + answer).encode("utf-8")).hexdigest()
+    if salt and expected and hmac.compare_digest(actual, expected):
+        await db.set_setting(
+            _captcha_setting_key("session", user_id),
+            json.dumps({"verified_at": now, "expires_at": now + CAPTCHA_SESSION_TTL}),
+        )
+        await db.set_setting(_captcha_setting_key("challenge", user_id), "")
+        await db.set_setting(_captcha_setting_key("block", user_id), "")
+        await message.reply_text("✅ 验证成功！本次验证有效 1 小时。请发送 /start 进入机器人。")
+        raise StopPropagation
+
+    attempts = int(challenge.get("attempts", 0) or 0) + 1
+    if attempts >= CAPTCHA_MAX_ATTEMPTS:
+        await db.set_setting(_captcha_setting_key("challenge", user_id), "")
+        await db.set_setting(
+            _captcha_setting_key("block", user_id),
+            str(now + CAPTCHA_BLOCK_SECONDS),
+        )
+        await message.reply_text("⛔ 验证码连续错误 5 次，已临时限制 15 分钟，请稍后再试。")
+        raise StopPropagation
+
+    try:
+        await send_captcha_challenge(
+            client, user_id, attempts=attempts,
+            notice=f"❌ 验证码不正确，还可尝试 {CAPTCHA_MAX_ATTEMPTS - attempts} 次。",
+        )
+    except Exception:
+        log.exception("Could not refresh image CAPTCHA for user %s", user_id)
+        await message.reply_text("❌ 验证码不正确，请稍后重试。")
+    raise StopPropagation
+
+
+@app.on_message(filters.private, group=-99)
+async def captcha_private_message_middleware(client, message):
+    await captcha_message_gate(client, message)
+
+
+@app.on_callback_query(group=-99)
+async def captcha_private_callback_middleware(client, query):
+    user = query.from_user
+    message = query.message
+    if (
+        not user or not message or message.chat.type != ChatType.PRIVATE
+        or await is_admin(user.id) or not await captcha_is_enabled()
+        or await captcha_session_valid(user.id)
+    ):
+        return
+    await query.answer("请先完成图片验证码。", show_alert=True)
+    now = time.time()
+    block_raw = await db.get_setting(_captcha_setting_key("block", user.id))
+    try:
+        blocked_until = float(block_raw or 0)
+    except (TypeError, ValueError):
+        blocked_until = 0
+    if blocked_until > now:
+        remaining = max(1, int((blocked_until - now + 59) // 60))
+        await client.send_message(user.id, f"⛔ 验证失败次数过多，请 {remaining} 分钟后再试。")
+    else:
+        challenge_raw = await db.get_setting(_captcha_setting_key("challenge", user.id))
+        try:
+            challenge = json.loads(challenge_raw or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            challenge = {}
+        if not challenge or float(challenge.get("expires_at", 0) or 0) <= now:
+            try:
+                await send_captcha_challenge(client, user.id)
+            except Exception:
+                log.exception("Could not create CAPTCHA after callback for user %s", user.id)
+                await client.send_message(user.id, "⚠️ 验证码暂时无法生成，请稍后重试。")
+        else:
+            await client.send_message(user.id, "请先查看验证码图片，并发送图片中的 6 位字母/数字。")
+    raise StopPropagation
 
 
 def media_details(message):
@@ -6359,6 +6551,13 @@ async def admin_callback_handler(client, query):
         else:
             notice = ""
         await render_backup_admin(message, notice)
+    elif action == "captcha" or action.startswith("captcha:"):
+        notice = ""
+        if action == "captcha:toggle":
+            enabled = await captcha_is_enabled()
+            await db.set_setting(CAPTCHA_ENABLED_KEY, "0" if enabled else "1")
+            notice = "⏸ 已关闭图片验证码。" if enabled else "✅ 已开启图片验证码。"
+        await render_captcha_admin(message, notice)
     elif action == "contentguard" or action.startswith("guard:"):
         if action == "contentguard":
             pass
@@ -6904,783 +7103,3 @@ async def admin_callback_handler(client, query):
                     await progress.delete()
                 except Exception:
                     log.warning("Could not delete admin delivery progress message")
-                await client.send_message(
-                    user.id,
-                    result_text,
-                    reply_markup=InlineKeyboardMarkup(buttons),
-                )
-            except Exception as exc:
-                log.exception(
-                    "Admin directory delivery failed: user=%s category=%s offset=%s",
-                    user.id, row["category"], offset,
-                )
-                error_text = (
-                    f"⚠️「{row['category']}」发送过程中出现异常。\n"
-                    f"已处理进度：{offset}/{total}\n"
-                    f"原因：{str(exc)[:180]}"
-                )
-                # A failed batch still gets its own final notification.
-                # Remove the temporary status message instead of editing it.
-                try:
-                    await progress.delete()
-                except Exception:
-                    log.warning("Could not delete failed admin delivery progress message")
-                try:
-                    await client.send_message(
-                        user.id,
-                        error_text,
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("📁 返回目录", callback_data="mc:directories")],
-                            [InlineKeyboardButton("🏠 返回主页", callback_data="mc:home")],
-                        ]),
-                    )
-                except Exception:
-                    log.exception(
-                        "Could not send standalone admin delivery error summary: user=%s category=%s",
-                        user.id, row["category"],
-                    )
-                    try:
-                        await message.reply_text(error_text)
-                    except Exception:
-                        log.exception("All admin delivery error notification methods failed")
-        finally:
-            category_delivery_in_progress.discard(delivery_key)
-    elif action.startswith("dirrename:"):
-        try:
-            index = int(action.split(":", 1)[1])
-            row = (await db.list_categories())[index]
-        except (ValueError, IndexError):
-            await message.edit_text("⚠️ 目录列表已更新，请重新打开目录管理。", reply_markup=back_keyboard())
-            return
-        pending_category_actions[user.id] = {"action": "rename", "name": row["category"]}
-        await message.edit_text(
-            f"✏️ 修改目录名称\n\n当前名称：{row['category']}\n请发送新的目录名称。\n"
-            "目录内的资源会同步更名，不会删除或移动文件。",
-            reply_markup=back_keyboard(),
-        )
-    elif action.startswith("dirdelete:"):
-        try:
-            index = int(action.split(":", 1)[1])
-            row = (await db.list_categories())[index]
-        except (ValueError, IndexError):
-            await message.edit_text("⚠️ 目录列表已更新，请重新打开目录管理。", reply_markup=back_keyboard())
-            return
-        if await db.delete_empty_category(row["category"]):
-            await message.edit_text(f"✅ 已删除空目录：{row['category']}", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ 返回目录管理", callback_data="mc:directories")]
-            ]))
-        else:
-            await message.edit_text("❌ 删除失败：目录可能已有文件，系统不会删除或影响其中资源。", reply_markup=back_keyboard())
-    elif action == "admins":
-        if not await is_superadmin(user.id):
-            await message.edit_text("⛔ 只有超级管理员可以管理管理员名单。", reply_markup=back_keyboard())
-            return
-        delegated = await db.list_admins()
-        superadmin_id = await db.get_admin_id()
-        lines = [
-            f"👑 超级管理员：{int(config.ADMIN_ID)}"
-        ]
-        if superadmin_id and int(superadmin_id) != int(config.ADMIN_ID):
-            lines.append(f"👑 数据库超级管理员：{int(superadmin_id)}")
-        rows = [[InlineKeyboardButton("➕ 添加管理员", callback_data="mc:adminadd"),
-                 InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")]]
-        if delegated:
-            lines.append("")
-            lines.append("🛡 其他管理员：")
-            for item in delegated:
-                admin_id = int(item["user_id"])
-                lines.append(f"• {admin_id}")
-                if rows and len(rows[-1]) == 1 and rows[-1][0].callback_data == "mc:adminadd":
-                    rows[-1].append(InlineKeyboardButton(
-                        f"❌ 移除 {admin_id}",
-                        callback_data=f"mc:adminremove:{admin_id}",
-                    ))
-                else:
-                    rows.append([InlineKeyboardButton(
-                        f"❌ 移除 {admin_id}",
-                        callback_data=f"mc:adminremove:{admin_id}",
-                    )])
-        else:
-            lines.extend(["", "目前还没有添加其他管理员。"])
-        if not any(button.callback_data == "mc:home" for row in rows for button in row):
-            rows.append([InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")])
-        await message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
-    elif action == "adminadd":
-        if not await is_superadmin(user.id):
-            await message.edit_text("⛔ 只有超级管理员可以添加管理员。", reply_markup=back_keyboard())
-            return
-        pending_admin_actions[user.id] = {"action": "add"}
-        await message.edit_text(
-            "➕ 添加管理员\n\n请发送对方的 Telegram 数字用户 ID。\n"
-            "只接受数字 ID，不要发送用户名。\n\n发送 /cancel 可取消。",
-            reply_markup=back_keyboard(),
-        )
-    elif action.startswith("adminremove:"):
-        if not await is_superadmin(user.id):
-            await message.edit_text("⛔ 只有超级管理员可以移除管理员。", reply_markup=back_keyboard())
-            return
-        try:
-            target_id = int(action.split(":", 1)[1])
-        except ValueError:
-            await message.edit_text("❌ 管理员 ID 无效。", reply_markup=back_keyboard())
-            return
-        superadmin_id = await db.get_admin_id()
-        if target_id in (int(config.ADMIN_ID), int(superadmin_id or 0)):
-            await message.edit_text("❌ 不能移除超级管理员。", reply_markup=back_keyboard())
-            return
-        removed = await db.remove_admin(target_id)
-        await message.edit_text(
-            ("✅ 已移除管理员：" if removed else "ℹ️ 这个用户不在管理员名单中：")
-            + str(target_id),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ 返回管理员列表", callback_data="mc:admins")],
-                [InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
-            ]),
-        )
-    elif action == "homebuttons":
-        buttons = await get_home_buttons()
-        rows = []
-        for item in buttons:
-            enabled = item.get("enabled", True)
-            status = "✅" if enabled else "⏸"
-            rows.append([
-                InlineKeyboardButton(
-                    f"{status} {str(item['text'])[:32]}",
-                    callback_data=f"mc:homebutton:toggle:{item['key']}",
-                ),
-                InlineKeyboardButton(
-                    "✏️ 改名" if item.get("type") == "action" else "🗑 删除",
-                    callback_data=(
-                        f"mc:homebutton:rename:{item['key']}"
-                        if item.get("type") == "action"
-                        else f"mc:homebutton:delete:{item['key']}"
-                    ),
-                ),
-            ])
-        rows.append([InlineKeyboardButton("➕ 添加网址按钮", callback_data="mc:homebutton:add")])
-        rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
-        await message.edit_text(
-            "🔘 用户首页按钮设置\n\n"
-            "这里控制用户发送 /start 后看到的内联按钮。\n"
-            "点击左侧可启用/停用；右侧可修改内置按钮名称或删除自定义网址按钮。\n"
-            "随机探索等原有功能保留，停用只会隐藏按钮，不会删除功能。",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-    elif action.startswith("homebutton:"):
-        parts = action.split(":")
-        if len(parts) < 3:
-            return
-        operation, key = parts[1], parts[2]
-        buttons = await get_home_buttons()
-        target = next((item for item in buttons if str(item.get("key")) == key), None)
-        if operation == "toggle" and target:
-            target["enabled"] = not target.get("enabled", True)
-            await save_home_buttons(buttons)
-            rows = []
-            for item in buttons:
-                status = "✅" if item.get("enabled", True) else "⏸"
-                rows.append([
-                    InlineKeyboardButton(f"{status} {str(item['text'])[:32]}", callback_data=f"mc:homebutton:toggle:{item['key']}"),
-                    InlineKeyboardButton(
-                        "✏️ 改名" if item.get("type") == "action" else "🗑 删除",
-                        callback_data=f"mc:homebutton:{'rename' if item.get('type') == 'action' else 'delete'}:{item['key']}",
-                    ),
-                ])
-            rows.append([InlineKeyboardButton("➕ 添加网址按钮", callback_data="mc:homebutton:add")])
-            rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
-            await message.edit_text("🔘 用户首页按钮设置\n\n点击左侧切换显示状态，右侧修改名称或删除网址按钮。", reply_markup=InlineKeyboardMarkup(rows))
-        elif operation == "rename" and target:
-            pending_home_button_actions[user.id] = {"action": "rename", "key": key}
-            await message.edit_text(f"✏️ 修改按钮名称\n\n当前名称：{target['text']}\n请直接发送新的按钮名称。", reply_markup=back_keyboard())
-        elif operation == "add":
-            pending_home_button_actions[user.id] = {"action": "add"}
-            await message.edit_text("➕ 添加首页网址按钮\n\n请按以下格式发送：\n按钮名称|https://网址\n\n例如：联系客服|https://t.me/example", reply_markup=back_keyboard())
-        elif operation == "delete" and target and target.get("type") == "url":
-            buttons = [item for item in buttons if item.get("key") != key]
-            await save_home_buttons(buttons)
-            rows = []
-            for item in buttons:
-                status = "✅" if item.get("enabled", True) else "⏸"
-                rows.append([
-                    InlineKeyboardButton(f"{status} {str(item['text'])[:32]}", callback_data=f"mc:homebutton:toggle:{item['key']}"),
-                    InlineKeyboardButton(
-                        "✏️ 改名" if item.get("type") == "action" else "🗑 删除",
-                        callback_data=f"mc:homebutton:{'rename' if item.get('type') == 'action' else 'delete'}:{item['key']}",
-                    ),
-                ])
-            rows.append([InlineKeyboardButton("➕ 添加网址按钮", callback_data="mc:homebutton:add")])
-            rows.append([InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")])
-            await message.edit_text("✅ 已删除网址按钮。\n\n🔘 用户首页按钮设置", reply_markup=InlineKeyboardMarkup(rows))
-    elif action == "upload":
-        categories = await db.list_categories()
-        rows = []
-        for index, row in enumerate(categories[:20]):
-            button = InlineKeyboardButton(
-                f"📁 {str(row['category'])[:20]}（{int(row['file_count'] or 0)}）",
-                callback_data=f"mc:dirupload:{index}",
-            )
-            if rows and len(rows[-1]) == 1 and rows[-1][0].callback_data.startswith("mc:dirupload:"):
-                rows[-1].append(button)
-            else:
-                rows.append([button])
-        if len(categories) > 20:
-            rows.append([InlineKeyboardButton("📂 全部文件夹", callback_data="mc:directories")])
-        if not categories:
-            rows.append([InlineKeyboardButton("➕ 新建文件夹", callback_data="mc:dirnew")])
-        rows.append([InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")])
-        await message.edit_text(
-            f"📤 上传资源\n\n当前共有 {len(categories)} 个文件夹。请选择上传位置；"
-            "选择后直接发送文件或相册，结束上传前资源不会发布到目录。",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-    elif action == "files":
-        rows = await db.list_files(15)
-        lines = [f"{row['file_key']} | {row['category']} | {row['file_name'][:40]}" for row in rows]
-        body = "📂 最近文件（最多 15 个）\n" + ("\n".join(lines) if lines else "暂无文件记录") + "\n\n修改分类：/category 文件码 分类\n批量分享：/share 文件码1 文件码2"
-        await message.edit_text(body, reply_markup=back_keyboard())
-    elif action == "broadcast":
-        broadcast_input_mode.add(int(user.id))
-        pending_broadcasts.pop(int(user.id), None)
-        await message.edit_text(
-            "📢 广播管理\n\n"
-            "请直接发送一条要广播的消息：文字、图片、视频、文件、音频、GIF 或相册均可。\n"
-            "文字格式和媒体说明会尽量按原消息保留。\n\n"
-            "收到后先显示预览，只有点击“确认群发”才会发送；发送失败不会删除用户记录。\n"
-            "发送 /cancel 可退出。",
-            reply_markup=back_keyboard(),
-        )
-    elif action == "stats":
-        users, files, _, banned = await db.stats()
-        await message.edit_text(
-            f"📊 数据统计\n\n👤 用户总数：{users}\n📦 资源总数：{files}\n🚫 封禁用户：{banned}",
-            reply_markup=back_keyboard(),
-        )
-    elif action == "scannerlogin":
-        await message.edit_text(
-            "🔐 扫描账号设置\n\n"
-            "使用普通 Telegram 用户账号读取主、备份频道历史。建议使用专用账号，并先将它加入两个私有频道。\n\n"
-            "点击下方按钮后，机器人会引导你输入手机号、登录验证码及（如有）两步验证密码。敏感输入会尝试立即删除。\n"
-            "扫描进度保存在数据库中；登录会话保存在本地文件。若部署平台没有持久化文件存储，重新部署后可能需要重新登录扫描账号。",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔑 开始登录", callback_data="mc:scannerloginstart"),
-                 InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")],
-            ]),
-        )
-    elif action == "scannerloginstart":
-        if scanner is not None and scanner.is_connected:
-            await message.edit_text("✅ 扫描账号已经登录，可以直接发送 /scan 开始扫描。", reply_markup=back_keyboard())
-        else:
-            old_client = scanner_login_clients.pop(user.id, None)
-            if old_client:
-                try:
-                    await old_client.disconnect()
-                except Exception:
-                    pass
-            login_client = Client(
-                "member_cloud_scanner",
-                api_id=config.API_ID,
-                api_hash=config.API_HASH,
-                workdir=SCANNER_WORKDIR,
-            )
-            try:
-                await login_client.connect()
-                scanner_login_clients[user.id] = login_client
-                scanner_login_states[user.id] = {"step": "phone"}
-                await message.edit_text(
-                    "🔐 请发送扫描账号的手机号（含国家区号，例如 +1）。\n\n"
-                    "随后按提示输入 Telegram 登录验证码；如开启两步验证，还需要输入密码。\n"
-                    "建议使用专用扫描账号。验证码/密码会短暂经过本机器人私聊，处理后会尝试立即删除。\n\n"
-                    "发送 /scancancel 可取消。"
-                )
-            except Exception:
-                log.exception("Could not start scanner login from admin panel")
-                await message.edit_text("❌ 无法启动登录流程，请稍后重试。", reply_markup=back_keyboard())
-    elif action == "commands":
-        await message.edit_text(
-            "📖 管理命令速查\n\n管理员名单：打开 /admin → 管理员管理（仅超级管理员）\n\n"
-            "/bindgroup — 绑定会员群\n/membercheck [用户ID] — 检查会员群和成员权限\n/bindmain [Chat ID] — 绑定主存储频道\n/bindbackup [Chat ID] — 绑定备用频道或群组\n/storage — 查看绑定状态\n"
-            "/ban 用户ID 原因 — 封禁用户\n/unban 用户ID — 解封用户\n/users — 用户列表\n/files — 文件列表\n/import — 批量转发导入旧文件\n/scanlogin — 在机器人内登录扫描账号\n/scancancel — 取消扫描账号登录\n/scanlogout — 退出/更换扫描账号\n/scancheck — 检查频道访问和历史读取权限\n/catalogreset — 预览清理旧资源索引\n/catalogresetconfirm — 确认清理资源索引\n/scan — 扫描频道历史\n/scanstatus — 查看扫描进度\n/scanstop — 暂停扫描\n/category 文件码 分类 — 修改分类\n/share 文件码1 文件码2 — 批量分享\n/wm 领取编号 — 按编号查领取人\n/welcome — 新人进群欢迎设置\n"
-            "广播请打开 /admin → 群发广播，直接发送内容并确认。",
-            reply_markup=back_keyboard(),
-        )
-
-
-@app.on_message(filters.private & filters.command("welcome"))
-async def welcome_admin_handler(client, message):
-    user = message.from_user
-    if not user or not await is_admin(user.id):
-        await reply_admin_only(message)
-        return
-
-    pending_welcome_edit.discard(int(user.id))
-    enabled, template = await get_welcome_settings()
-    parts = message.command[1:] if len(message.command) > 1 else []
-    bot_url = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
-
-    if not parts:
-        status = "开启" if enabled else "关闭"
-        await message.reply_text(
-            "👋 新人进群欢迎设置\n\n"
-            f"当前状态：{status}\n"
-            f"当前文案：\n{template}\n\n"
-            "可用命令：\n"
-            "/welcome on — 开启自动欢迎\n"
-            "/welcome off — 关闭自动欢迎\n"
-            "/welcome 文案 — 自定义文案（{name} 替换为新人称呼，{bot} 替换为机器人入口）\n"
-            "/welcome reset — 恢复默认文案",
-            reply_markup=back_keyboard(),
-        )
-        return
-
-    action = parts[0].lower()
-    if action in ("on", "开", "开启", "1"):
-        await db.set_setting(WELCOME_ENABLED_KEY, "1")
-        await message.reply_text("✅ 已开启新人进群自动欢迎。", reply_markup=back_keyboard())
-        return
-    if action in ("off", "关", "关闭", "0"):
-        await db.set_setting(WELCOME_ENABLED_KEY, "0")
-        await message.reply_text("✅ 已关闭新人进群自动欢迎。", reply_markup=back_keyboard())
-        return
-    if action == "reset":
-        await db.set_setting(WELCOME_MESSAGE_KEY, "")
-        await message.reply_text("✅ 已恢复默认欢迎文案。", reply_markup=back_keyboard())
-        return
-
-    custom = " ".join(parts).strip()
-    if not custom:
-        await message.reply_text("❌ 文案不能为空。", reply_markup=back_keyboard())
-        return
-
-    await db.set_setting(WELCOME_MESSAGE_KEY, custom)
-    preview = render_welcome_message(custom, ["新成员"], bot_url)
-    await message.reply_text(
-        f"✅ 欢迎文案已保存。\n\n预览：\n{preview}",
-        reply_markup=back_keyboard(),
-    )
-
-
-@app.on_message(filters.private & filters.command("membercheck"))
-async def membercheck_handler(client, message):
-    user = message.from_user
-    if not user or not await is_admin(user.id):
-        await reply_admin_only(message)
-        return
-
-    group_id = await get_member_group_id()
-    if not group_id:
-        await message.reply_text(
-            "❌ 尚未绑定会员群。\n"
-            "请把机器人添加到会员群并设为管理员，然后在群内发送 /bindgroup。"
-        )
-        return
-
-    try:
-        group = await telegram_bot_api("getChat", {"chat_id": group_id})
-        me = await client.get_me()
-        bot_member = await telegram_bot_api(
-            "getChatMember",
-            {"chat_id": group_id, "user_id": me.id},
-        )
-        bot_status = str(bot_member.get("status", "unknown"))
-        lines = [
-            "🔎 会员群权限诊断（Telegram Bot API）",
-            f"群名称：{group.get('title') or '未命名'}",
-            f"群 ID：{group_id}",
-            f"机器人状态：{bot_status}",
-        ]
-        if bot_status not in ("administrator", "creator"):
-            lines.append("❌ 机器人不是群管理员，无法可靠查询普通成员。")
-            await message.reply_text("\n".join(lines))
-            return
-
-        if len(message.command) > 1:
-            target_id = int(message.command[1])
-            target = await telegram_bot_api(
-                "getChatMember",
-                {"chat_id": group_id, "user_id": target_id},
-            )
-            target_status = str(target.get("status", "unknown"))
-            lines.append(f"用户 {target_id} 状态：{target_status}")
-            if target_status in ("member", "administrator", "creator") or (
-                target_status == "restricted" and target.get("is_member") is True
-            ):
-                lines.append("✅ Bot API 确认该用户是有效群成员，应获得黄金会员权限。")
-            else:
-                lines.append("❌ Bot API 返回该用户不是有效群成员。")
-        else:
-            lines.append("✅ 机器人管理员权限正常。")
-            lines.append("可追加用户数字 ID 检查：/membercheck 用户ID")
-        await message.reply_text("\n".join(lines))
-    except ValueError:
-        await message.reply_text("用法：/membercheck 用户数字ID")
-    except Exception as exc:
-        log.error(
-            "Member group diagnostic failed for group %s: %s",
-            group_id, str(exc)[:400],
-        )
-        await message.reply_text(
-            "❌ 会员群诊断失败："
-            f"{type(exc).__name__}: {str(exc)[:300]}"
-        )
-
-
-@app.on_message(filters.private & filters.command("grant"))
-async def grant_handler(client, message):
-    user = message.from_user
-    if not user or not await is_admin(user.id):
-        await reply_admin_only(message)
-        return
-    args = message.command[1:]
-    if len(args) != 2:
-        await message.reply_text("用法：/grant 用户ID 天数|永久")
-        return
-    try:
-        target = int(args[0])
-        days = None if args[1] in ("永久", "永久授权", "forever") else int(args[1])
-        if days is not None and not 1 <= days <= 36500:
-            raise ValueError()
-        await db.grant_member(target, days, user.id)
-        expiry = "永久" if days is None else f"{days} 天"
-        await message.reply_text(f"✅ 已为用户 {target} 开通 {expiry} 手动会员权限。")
-    except ValueError:
-        await message.reply_text("❌ 参数错误。天数请填写 1–36500，或填写“永久”。")
-
-
-@app.on_message(filters.private & filters.command("revoke"))
-async def revoke_handler(client, message):
-    user = message.from_user
-    if not user or not await is_admin(user.id):
-        await reply_admin_only(message)
-        return
-    try:
-        target = int(message.command[1])
-        await db.revoke_member(target)
-        await message.reply_text(f"✅ 已取消用户 {target} 的手动授权。")
-    except (IndexError, ValueError):
-        await message.reply_text("用法：/revoke 用户ID")
-
-
-@app.on_message(filters.private & filters.command("ban"))
-async def ban_handler(client, message):
-    user = message.from_user
-    if not user or not await is_admin(user.id):
-        await reply_admin_only(message)
-        return
-    args = message.command[1:]
-    if not args:
-        await message.reply_text("用法：/ban 用户ID 原因")
-        return
-    try:
-        target = int(args[0])
-        if target == user.id:
-            await message.reply_text("不能封禁超级管理员本人。")
-            return
-        reason = " ".join(args[1:])[:200]
-        await db.ban_user(target, reason, user.id)
-        await message.reply_text(f"🚫 已封禁用户 {target}。")
-    except ValueError:
-        await message.reply_text("❌ 用户 ID 必须是数字。")
-
-
-@app.on_message(filters.private & filters.command("unban"))
-async def unban_handler(client, message):
-    user = message.from_user
-    if not user or not await is_admin(user.id):
-        await reply_admin_only(message)
-        return
-    try:
-        target = int(message.command[1])
-        await db.unban_user(target)
-        await message.reply_text(f"✅ 已解除用户 {target} 的封禁。")
-    except (IndexError, ValueError):
-        await message.reply_text("用法：/unban 用户ID")
-
-
-@app.on_message(filters.private & filters.command("users"))
-async def users_handler(client, message):
-    user = message.from_user
-    if not user or not await is_admin(user.id):
-        await reply_admin_only(message)
-        return
-    ids = await db.list_user_ids()
-    if not ids:
-        await message.reply_text("暂时没有用户记录。")
-        return
-    lines = [str(uid) for uid in ids[-50:]]
-    await message.reply_text("最近用户 ID（最多 50 个）：\n" + "\n".join(lines))
-
-
-@app.on_message(filters.private & filters.command("members"))
-async def members_handler(client, message):
-    user = message.from_user
-    if not user or not await is_admin(user.id):
-        await reply_admin_only(message)
-        return
-    rows = await db.list_manual_members()
-    if not rows:
-        await message.reply_text("暂无手动授权记录。")
-        return
-    now = datetime.now(timezone.utc)
-    lines = []
-    for row in rows:
-        expiry = row["expires_at"]
-        if expiry is None:
-            label = "永久"
-        else:
-            dt = parse_cn_datetime(expiry)
-            if dt is None:
-                label = "日期异常"
-            else:
-                # Display only: Beijing time for the admin, expiry check untouched.
-                label = "已过期" if dt <= now else dt.strftime("%Y-%m-%d %H:%M")
-        lines.append(f'{row["user_id"]} — {label}')
-    await message.reply_text("手动授权列表：\n" + "\n".join(lines))
-
-
-@app.on_message(filters.private & filters.command("files"))
-async def files_handler(client, message):
-    user = message.from_user
-    if not user or not await is_admin(user.id):
-        await reply_admin_only(message)
-        return
-    rows = await db.list_files(20)
-    if not rows:
-        await message.reply_text("暂时没有文件记录。")
-        return
-    lines = []
-    for row in rows:
-        lines.append(
-            f'{row["file_key"]} | {row["category"]} | {row["file_name"][:50]}'
-        )
-    await message.reply_text("最近 20 个文件：\n" + "\n".join(lines))
-
-
-@app.on_message(filters.private & filters.command("category"))
-async def category_handler(client, message):
-    user = message.from_user
-    if not user or not await is_admin(user.id):
-        await reply_admin_only(message)
-        return
-    args = message.command[1:]
-    if len(args) < 2:
-        await message.reply_text("用法：/category 文件码 分类名称")
-        return
-    key, category = args[0], " ".join(args[1:])[:40]
-    if await db.set_file_category(key, category):
-        category_catalog_cache["expires_at"] = 0
-        await message.reply_text(f"✅ 文件 {key} 已归类为：{category}")
-    else:
-        await message.reply_text("❌ 没找到这个文件码。")
-
-
-@app.on_message(filters.private & filters.command("share"))
-async def share_handler(client, message):
-    user = message.from_user
-    if not user or not await is_admin(user.id):
-        await reply_admin_only(message)
-        return
-    keys = message.command[1:]
-    if not keys or len(keys) > 20:
-        await message.reply_text("用法：/share 文件码1 文件码2（最多 20 个）")
-        return
-    links = []
-    missing = []
-    for key in keys:
-        if await db.get_file(key):
-            links.append(f"{key}: {share_url(key)}")
-        else:
-            missing.append(key)
-    response = "批量分享链接：\n" + ("\n".join(links) if links else "没有找到有效文件。")
-    if missing:
-        response += "\n\n未找到：" + ", ".join(missing)
-    await message.reply_text(response, disable_web_page_preview=True)
-
-
-@app.on_message(filters.private & filters.command("broadcast"))
-async def broadcast_handler(client, message):
-    user = message.from_user
-    if not user or not await is_admin(user.id):
-        await reply_admin_only(message)
-        return
-    content = message.text.split(maxsplit=1)
-    if len(content) < 2 or not content[1].strip():
-        await message.reply_text("用法：/broadcast 要广播的文字内容")
-        return
-    await message.reply_text(
-        "📢 旧版命令仅支持文字。请打开 /admin → 群发广播，"
-        "直接发送文字或媒体，预览后确认发送。"
-    )
-
-
-async def main():
-    global BOT_USERNAME, BOT_ID, telegram_http_session, scanner, last_user_activity, backup_worker_running
-    scanner_started = False
-    app_started = False
-    runner = None
-    backup_retry_task = None
-    scanner_caption_task = None
-    try:
-        # Keep database initialization inside the cleanup scope. A migration
-        # error must not leave AsyncConnectionPool worker tasks behind.
-        await db.initialize()
-        log.info(
-            "Database backend: %s",
-            "PostgreSQL" if db.uses_postgres else "SQLite (local fallback)",
-        )
-
-        # Restore the scanner from the database-backed session string. This is
-        # durable across container replacement and does not rely on /app/data.
-        stored_scanner_session = await db.get_setting(SCANNER_SESSION_SETTING_KEY)
-        if stored_scanner_session:
-            scanner = Client(
-                "member_cloud_scanner",
-                api_id=config.API_ID,
-                api_hash=config.API_HASH,
-                session_string=stored_scanner_session,
-            )
-            log.info("Persistent scanner session loaded from database")
-        elif os.path.exists(SCANNER_SESSION_PATH):
-            # One-time migration for deployments that still have the old
-            # file-based Pyrogram session available.
-            legacy_scanner = Client(
-                "member_cloud_scanner",
-                api_id=config.API_ID,
-                api_hash=config.API_HASH,
-                workdir=SCANNER_WORKDIR,
-            )
-            try:
-                await legacy_scanner.start()
-                legacy_me = await legacy_scanner.get_me()
-                if legacy_me.is_bot:
-                    raise RuntimeError("History scanner must be a normal Telegram user account")
-                migrated_session = await legacy_scanner.export_session_string()
-                await db.set_setting(SCANNER_SESSION_SETTING_KEY, migrated_session)
-                await legacy_scanner.stop()
-                scanner = Client(
-                    "member_cloud_scanner",
-                    api_id=config.API_ID,
-                    api_hash=config.API_HASH,
-                    session_string=migrated_session,
-                )
-                log.info("Legacy file-based scanner session migrated to database")
-            except Exception:
-                log.exception("Could not migrate legacy scanner session")
-                try:
-                    if legacy_scanner.is_connected:
-                        await legacy_scanner.stop()
-                except Exception:
-                    log.exception("Could not stop legacy scanner during migration")
-                scanner = None
-        else:
-            scanner = None
-            log.warning("No persistent scanner session found; admin must use /scanlogin")
-
-        await app.start()
-        app_started = True
-        # Publish the Telegram chat command menu for all users.
-        # /admin remains protected by the existing is_admin() check.
-        await app.set_bot_commands([
-            BotCommand("start", "开始使用机器人"),
-            BotCommand("admin", "打开管理后台"),
-        ])
-        telegram_http_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=12, connect=5, sock_read=10)
-        )
-        await resume_pending_deletions(app)
-        await startup_self_check(app)
-
-        if scanner is not None:
-            try:
-                await scanner.start()
-                scanner_started = True
-                scanner_me = await scanner.get_me()
-                if scanner_me.is_bot:
-                    raise RuntimeError("History scanner must be a normal Telegram user account")
-                log.info("History scanner ready: user %s", scanner_me.id)
-            except Exception:
-                log.exception(
-                    "History scanner is unavailable; bot will continue without history scanning"
-                )
-                if scanner_started:
-                    try:
-                        await scanner.stop()
-                    except Exception:
-                        log.exception("Could not stop failed history scanner session")
-                    scanner_started = False
-                scanner = None
-
-        last_user_activity = asyncio.get_running_loop().time()
-        me = await app.get_me()
-        BOT_USERNAME = me.username
-        BOT_ID = me.id
-        log.info("Bot started: @%s", me.username)
-
-        backup_retry_task = spawn_background("backup-worker", backup_retry_worker(app))
-        backup_worker_running = True
-        log.info("Durable backup retry worker started")
-        scanner_caption_task = spawn_background("caption-worker", scanner_caption_worker())
-        log.info("Durable scanner caption worker started")
-
-        runner = web.AppRunner(create_catalog_app(db, lambda: BOT_USERNAME))
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", config.WEB_PORT)
-        await site.start()
-        log.info("Public catalog listening on port %s", config.WEB_PORT)
-
-        await asyncio.Event().wait()
-    finally:
-        # Each resource is closed independently so one cleanup failure cannot
-        # prevent the PostgreSQL pool from being closed.
-        backup_worker_running = False
-        if scanner_caption_task is not None:
-            scanner_caption_task.cancel()
-            try:
-                await scanner_caption_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                log.exception("Scanner caption worker stopped with an error")
-        if backup_retry_task is not None:
-            backup_retry_task.cancel()
-            try:
-                await backup_retry_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                log.exception("Backup retry worker stopped with an error")
-
-        if runner is not None:
-            try:
-                await runner.cleanup()
-            except Exception:
-                log.exception("Could not clean up catalog web server")
-
-        if scanner_started and scanner is not None:
-            try:
-                if scanner.is_connected:
-                    await scanner.stop()
-            except Exception:
-                log.exception("Could not stop history scanner")
-
-        if app_started:
-            try:
-                await app.stop()
-            except Exception:
-                log.exception("Could not stop Telegram bot client")
-
-        if telegram_http_session is not None and not telegram_http_session.closed:
-            try:
-                await telegram_http_session.close()
-            except Exception:
-                log.exception("Could not close Telegram HTTP session")
-            finally:
-                telegram_http_session = None
-
-        try:
-            await db.close()
-        except Exception:
-            log.exception("Could not close database connection pool")
-
-
-if __name__ == "__main__":
-    app.run(main())
