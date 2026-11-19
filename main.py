@@ -2170,7 +2170,9 @@ async def try_send_catalog_album(client, user_id, group, settings=None, schedule
     return False
 
 
-async def send_catalog_batch(client, user_id, share_key, offset, batch, track_progress=True):
+async def send_catalog_batch(
+    client, user_id, share_key, offset, batch, track_progress=True, ignore_history=False
+):
     """Send complete media units and advance folder progress only over successful items."""
     sent = failed = skipped = 0
     next_offset = offset
@@ -2184,7 +2186,7 @@ async def send_catalog_batch(client, user_id, share_key, offset, batch, track_pr
         await db.get_user_history_keys(
             user_id, [item["file_key"] for item in batch]
         )
-        if track_progress else set()
+        if track_progress and not ignore_history else set()
     )
 
     prepared = []
@@ -6227,6 +6229,15 @@ async def user_catalog_callback_handler(client, query):
                 saved_offset = await db.repair_category_delivery_progress_from_history(
                     user.id, member_progress_key, category["name"]
                 )
+
+            # A completed member/folder cursor starts a fresh delivery cycle when
+            # the member explicitly asks for this folder again. Reset only this
+            # user's cursor; preserve delivery history and every other member.
+            repeat_delivery = bool(total > 0 and saved_offset >= total)
+            if repeat_delivery:
+                await db.reset_category_delivery_progress(user.id, member_progress_key)
+                saved_offset = 0
+
             # The database cursor is authoritative; stale Telegram buttons must
             # not jump over resources that were never delivered.
             offset = saved_offset
@@ -6249,7 +6260,8 @@ async def user_catalog_callback_handler(client, query):
                     await message.reply_text(pace)
                     return
                 sent, failed, skipped, next_offset, last_sent_message_id = await send_catalog_batch(
-                    client, user.id, member_progress_key, offset, batch
+                    client, user.id, member_progress_key, offset, batch,
+                    ignore_history=repeat_delivery,
                 )
                 # The stored folder count is refreshed lazily, so it can lag a
                 # fresh upload. Probe past the cursor before declaring "done".
