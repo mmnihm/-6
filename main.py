@@ -896,6 +896,21 @@ async def captcha_session_valid(user_id):
         return False
 
 
+async def captcha_notice_allowed(user_id, cooldown=12):
+    """Limit repeated CAPTCHA chat notices caused by rapid user messages."""
+    key = _captcha_setting_key("notice", user_id)
+    now = time.time()
+    raw_value = await db.get_setting(key)
+    try:
+        last_notice = float(raw_value or 0)
+    except (TypeError, ValueError):
+        last_notice = 0
+    if now - last_notice < cooldown:
+        return False
+    await db.set_setting(key, str(now))
+    return True
+
+
 async def send_captcha_challenge(client, user_id, attempts=0, notice=""):
     from captcha_image import generate_captcha_image
 
@@ -911,6 +926,7 @@ async def send_captcha_challenge(client, user_id, attempts=0, notice=""):
         _captcha_setting_key("challenge", user_id),
         json.dumps(challenge, separators=(",", ":")),
     )
+    await db.set_setting(_captcha_setting_key("notice", user_id), str(time.time()))
     caption = (
         "🧩 安全验证\n\n"
         f"{notice + chr(10) + chr(10) if notice else ''}"
@@ -934,7 +950,8 @@ async def captcha_message_gate(client, message):
         blocked_until = 0
     if blocked_until > now:
         remaining = max(1, int((blocked_until - now + 59) // 60))
-        await message.reply_text(f"⛔ 验证失败次数过多，请 {remaining} 分钟后再试。")
+        if await captcha_notice_allowed(user_id):
+            await message.reply_text(f"⛔ 验证失败次数过多，请 {remaining} 分钟后再试。")
         raise StopPropagation
     if await captcha_session_valid(user_id):
         return
@@ -946,16 +963,18 @@ async def captcha_message_gate(client, message):
         challenge = {}
 
     if not challenge or float(challenge.get("expires_at", 0) or 0) <= now:
-        try:
-            await send_captcha_challenge(client, user_id)
-        except Exception:
-            log.exception("Could not create image CAPTCHA for user %s", user_id)
-            await message.reply_text("⚠️ 验证码暂时无法生成，请稍后重试。")
+        if await captcha_notice_allowed(user_id):
+            try:
+                await send_captcha_challenge(client, user_id)
+            except Exception:
+                log.exception("Could not create image CAPTCHA for user %s", user_id)
+                await message.reply_text("⚠️ 验证码暂时无法生成，请稍后重试。")
         raise StopPropagation
 
     answer = str(getattr(message, "text", "") or "").strip().upper()
     if not answer or answer.startswith("/"):
-        await message.reply_text("请先查看上方验证码图片，再发送图片中的 6 位字母/数字。")
+        if await captcha_notice_allowed(user_id):
+            await message.reply_text("请先查看上方验证码图片，再发送图片中的 6 位字母/数字。")
         raise StopPropagation
 
     salt = str(challenge.get("salt") or "")
@@ -968,6 +987,7 @@ async def captcha_message_gate(client, message):
         )
         await db.set_setting(_captcha_setting_key("challenge", user_id), "")
         await db.set_setting(_captcha_setting_key("block", user_id), "")
+        await db.set_setting(_captcha_setting_key("notice", user_id), "")
         await message.reply_text("✅ 验证成功！本次验证有效 1 小时。请发送 /start 进入机器人。")
         raise StopPropagation
 
