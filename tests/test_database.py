@@ -702,5 +702,36 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(Database.split_search_query("   "), [])
         self.assertEqual(Database.split_search_query("single"), ["single"])
 
+    async def test_purge_stale_settings_only_touches_temp_prefixes(self):
+        from datetime import timedelta
+        from database import utc_now
+
+        await self.db.set_setting("folder_view:7:abc", "20")
+        await self.db.set_setting("captcha_session:7", "{}")
+        await self.db.set_setting("member_group_id", "-100")
+        # Backdate the throwaway rows beyond the retention window.
+        old = (utc_now() - timedelta(seconds=4 * 24 * 3600)).isoformat()
+        async with self.db.connect() as conn:
+            await conn.execute(
+                "UPDATE settings SET updated_at=? WHERE key LIKE 'folder_view:%' "
+                "OR key LIKE 'captcha_session:%'",
+                (old,),
+            )
+            await conn.commit()
+
+        removed = await self.db.purge_stale_settings(
+            ("folder_view:", "captcha_session:"), 3 * 24 * 3600
+        )
+        self.assertEqual(removed, 2)
+        self.assertIsNone(await self.db.get_setting("folder_view:7:abc"))
+        self.assertIsNone(await self.db.get_setting("captcha_session:7"))
+        self.assertEqual(await self.db.get_setting("member_group_id"), "-100")
+
+    async def test_purge_stale_settings_keeps_fresh_rows(self):
+        await self.db.set_setting("folder_view:8:def", "0")
+        removed = await self.db.purge_stale_settings(("folder_view:",), 3 * 24 * 3600)
+        self.assertEqual(removed, 0)
+        self.assertEqual(await self.db.get_setting("folder_view:8:def"), "0")
+
 if __name__ == "__main__":
     unittest.main()

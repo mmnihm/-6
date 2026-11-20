@@ -518,6 +518,16 @@ class Database:
                 await db.execute(
                     "ALTER TABLE files ADD COLUMN media_kind TEXT NOT NULL DEFAULT ''"
                 )
+            setting_columns = await (await db.execute(
+                "SELECT column_name AS name FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='settings'"
+            )).fetchall() if self.uses_postgres else await (await db.execute(
+                "PRAGMA table_info(settings)"
+            )).fetchall()
+            setting_column_names = {row["name"] for row in setting_columns}
+            if "updated_at" not in setting_column_names:
+                await db.execute("ALTER TABLE settings ADD COLUMN updated_at TEXT")
+
             batch_columns = await (await db.execute(
                 "SELECT column_name AS name FROM information_schema.columns "
                 "WHERE table_schema=current_schema() AND table_name='upload_batch_items'"
@@ -733,12 +743,39 @@ class Database:
     async def set_setting(self, key: str, value: str):
         async with self.connect() as db:
             await db.execute("""
-                INSERT INTO settings(key, value) VALUES(?, ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value
-            """, (key, str(value)))
+                INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value,
+                    updated_at=excluded.updated_at
+            """, (key, str(value), iso_now()))
             await db.commit()
         # Write-through keeps the panel showing the value that was just saved.
         self._setting_cache[key] = (str(value), time.monotonic())
+
+    async def purge_stale_settings(self, key_prefixes, older_than_seconds):
+        """Delete throwaway per-user setting rows untouched for a while.
+
+        Only regenerable state is meant to be listed here; rows that carry
+        delivery history or audit data must never be passed in.
+        """
+        prefixes = [str(prefix) for prefix in key_prefixes if prefix]
+        if not prefixes:
+            return 0
+        cutoff = (utc_now() - timedelta(seconds=int(older_than_seconds))).isoformat()
+        conditions = " OR ".join("key LIKE ?" for _ in prefixes)
+        params = [prefix + "%" for prefix in prefixes]
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "DELETE FROM settings WHERE (updated_at IS NULL OR updated_at < ?) "
+                f"AND ({conditions})",
+                [cutoff] + params,
+            )
+            removed = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+            await db.commit()
+        for key in list(self._setting_cache):
+            if any(key.startswith(prefix) for prefix in prefixes):
+                self._setting_cache.pop(key, None)
+        return removed
 
     async def enqueue_scanner_caption_job(self, channel_id: int, message_id: int, caption: str):
         now = iso_now()

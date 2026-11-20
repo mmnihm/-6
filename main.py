@@ -41,6 +41,14 @@ membership_cache = {}
 # not locked out for the rest of the hour.
 MEMBERSHIP_TTL_SECONDS = 3600
 MEMBERSHIP_DENIED_TTL_SECONDS = 60
+# Throwaway per-user settings (page cursors, CAPTCHA state) are purged after
+# three days; audit and delivery history are never touched by this sweep.
+SETTING_RETENTION_SECONDS = 3 * 24 * 3600
+SETTING_CLEANUP_INTERVAL = 6 * 3600
+TEMP_SETTING_PREFIXES = (
+    "captcha_session:", "captcha_challenge:", "captcha_block:", "captcha_notice:",
+    "folder_view:", "folder_list_page:", "folder_list_sort:",
+)
 category_catalog_cache = {"expires_at": 0.0, "rows": []}
 scanner_login_states = {}
 scanner_login_clients = {}
@@ -3462,6 +3470,20 @@ async def find_deleted_source_messages(chat_id, message_ids):
         if message_id is not None:
             found_ids.add(int(message_id))
     return [message_id for message_id in requested if message_id not in found_ids]
+
+
+async def settings_retention_worker():
+    """Drop stale page cursors and CAPTCHA state so the settings table stays bounded."""
+    while True:
+        try:
+            removed = await db.purge_stale_settings(
+                TEMP_SETTING_PREFIXES, SETTING_RETENTION_SECONDS
+            )
+            if removed:
+                log.info("Purged %s stale per-user setting rows", removed)
+        except Exception:
+            log.exception("Setting retention pass failed")
+        await asyncio.sleep(SETTING_CLEANUP_INTERVAL)
 
 
 async def backup_retry_worker(client):
@@ -7921,6 +7943,7 @@ async def main():
     runner = None
     backup_retry_task = None
     scanner_caption_task = None
+    retention_task = None
     try:
         # Keep database initialization inside the cleanup scope. A migration
         # error must not leave AsyncConnectionPool worker tasks behind.
@@ -8022,6 +8045,8 @@ async def main():
         log.info("Durable backup retry worker started")
         scanner_caption_task = spawn_background("caption-worker", scanner_caption_worker())
         log.info("Durable scanner caption worker started")
+        retention_task = spawn_background("settings-retention", settings_retention_worker())
+        log.info("Settings retention worker started")
 
         runner = web.AppRunner(create_catalog_app(db, lambda: BOT_USERNAME))
         await runner.setup()
@@ -8050,6 +8075,15 @@ async def main():
                 pass
             except Exception:
                 log.exception("Backup retry worker stopped with an error")
+
+        if retention_task is not None:
+            retention_task.cancel()
+            try:
+                await retention_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("Settings retention worker stopped with an error")
 
         if runner is not None:
             try:
