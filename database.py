@@ -20,6 +20,9 @@ log = logging.getLogger(__name__)
 # catch-up recount scheduled once the interval ends. Folder counts can lag the
 # truth by at most this many seconds.
 SETTING_CACHE_TTL = 60.0
+# Per-user keys (page cursors, CAPTCHA state) also land in this cache, so it
+# needs a ceiling; oldest entries are dropped first.
+SETTING_CACHE_MAX = 5000
 CATEGORY_STATS_MIN_INTERVAL = 30.0
 
 
@@ -737,8 +740,22 @@ class Database:
                 "SELECT value FROM settings WHERE key=?", (key,)
             )).fetchone()
         value = row["value"] if row else None
-        self._setting_cache[key] = (value, time.monotonic())
+        self._cache_setting(key, value)
         return value
+
+    def _cache_setting(self, key: str, value):
+        if len(self._setting_cache) >= SETTING_CACHE_MAX and key not in self._setting_cache:
+            self._setting_cache.pop(next(iter(self._setting_cache)), None)
+        self._setting_cache[key] = (value, time.monotonic())
+
+    async def ping(self) -> bool:
+        """Cheap liveness probe; used by the container health check."""
+        try:
+            async with self.connect() as db:
+                await (await db.execute("SELECT 1")).fetchone()
+            return True
+        except Exception:
+            return False
 
     async def set_setting(self, key: str, value: str):
         async with self.connect() as db:
@@ -750,7 +767,7 @@ class Database:
             """, (key, str(value), iso_now()))
             await db.commit()
         # Write-through keeps the panel showing the value that was just saved.
-        self._setting_cache[key] = (str(value), time.monotonic())
+        self._cache_setting(key, str(value))
 
     async def purge_stale_settings(self, key_prefixes, older_than_seconds):
         """Delete throwaway per-user setting rows untouched for a while.

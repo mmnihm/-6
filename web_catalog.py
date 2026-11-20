@@ -14,6 +14,13 @@ CN_TZ = timezone(timedelta(hours=8))
 CACHE_SECONDS = 45
 CACHE_MAX_ENTRIES = 300
 _page_cache = {}
+# The public page lists every file name, so blunt request floods are throttled
+# per client address rather than left wide open.
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX = 120
+RATE_LIMIT_BUCKETS_MAX = 2000
+_rate_buckets = {}
+_health = {"checked_at": 0.0, "ok": True}
 
 
 def format_catalog_date(value):
@@ -50,7 +57,29 @@ def create_catalog_app(database, username_provider):
         _page_cache[key] = (etag, body, time.monotonic() + CACHE_SECONDS)
         return etag
 
+    def rate_limited(client_ip, now):
+        bucket = _rate_buckets.get(client_ip)
+        if not bucket or now - bucket[0] >= RATE_LIMIT_WINDOW:
+            if len(_rate_buckets) >= RATE_LIMIT_BUCKETS_MAX:
+                for address, entry in list(_rate_buckets.items()):
+                    if now - entry[0] >= RATE_LIMIT_WINDOW:
+                        _rate_buckets.pop(address, None)
+            _rate_buckets[client_ip] = (now, 1)
+            return None
+        if bucket[1] >= RATE_LIMIT_MAX:
+            return max(1, int(RATE_LIMIT_WINDOW - (now - bucket[0])))
+        _rate_buckets[client_ip] = (bucket[0], bucket[1] + 1)
+        return None
+
     async def catalog_handler(request):
+        retry_after = rate_limited(request.remote or "unknown", time.monotonic())
+        if retry_after:
+            return web.Response(
+                text="请求过于频繁，请稍后再试。",
+                status=429,
+                headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+            )
+
         query = (request.query.get("q") or "").strip()[:100]
         category = (request.query.get("category") or "").strip()[:40]
         try:
@@ -189,7 +218,15 @@ footer{{margin-top:25px;text-align:center;color:var(--muted);font-size:12px}}
         raise web.HTTPFound("/catalog")
 
     async def health_handler(request):
-        return web.json_response({"ok": True})
+        now = time.monotonic()
+        if now - _health["checked_at"] > 20:
+            _health["ok"] = await database.ping()
+            _health["checked_at"] = now
+        return web.json_response(
+            {"ok": _health["ok"]},
+            status=200 if _health["ok"] else 503,
+            headers={"Cache-Control": "no-store"},
+        )
 
     app = web.Application(client_max_size=1024 * 1024)
     app.router.add_get("/", root_handler)

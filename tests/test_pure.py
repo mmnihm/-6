@@ -51,6 +51,10 @@ class CatalogDateTests(unittest.TestCase):
 class FakeCatalogDatabase:
     def __init__(self):
         self.calls = 0
+        self.healthy = True
+
+    async def ping(self):
+        return self.healthy
 
     async def public_catalog(self, query="", category="", limit=30, offset=0):
         self.calls += 1
@@ -67,6 +71,9 @@ class FakeCatalogDatabase:
 class CatalogCacheTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         web_catalog._page_cache.clear()
+        web_catalog._rate_buckets.clear()
+        web_catalog._health.update({"checked_at": 0.0, "ok": True})
+        self._saved_max = web_catalog.RATE_LIMIT_MAX
         self.database = FakeCatalogDatabase()
         app = web_catalog.create_catalog_app(self.database, lambda: "testbot")
         self.server = TestServer(app)
@@ -74,8 +81,10 @@ class CatalogCacheTests(unittest.IsolatedAsyncioTestCase):
         await self.client.start_server()
 
     async def asyncTearDown(self):
+        web_catalog.RATE_LIMIT_MAX = self._saved_max
         await self.client.close()
         web_catalog._page_cache.clear()
+        web_catalog._rate_buckets.clear()
 
     async def test_repeat_request_is_served_from_cache(self):
         first = await self.client.get("/catalog")
@@ -99,6 +108,23 @@ class CatalogCacheTests(unittest.IsolatedAsyncioTestCase):
         await self.client.get("/catalog")
         await self.client.get("/catalog?q=猫")
         self.assertEqual(self.database.calls, 2)
+
+    async def test_flood_gets_429_with_retry_after(self):
+        web_catalog.RATE_LIMIT_MAX = 2
+        for _ in range(2):
+            self.assertEqual((await self.client.get("/catalog")).status, 200)
+        blocked = await self.client.get("/catalog")
+        self.assertEqual(blocked.status, 429)
+        self.assertTrue(blocked.headers.get("Retry-After"))
+
+    async def test_health_reports_failure_when_database_is_down(self):
+        healthy = await self.client.get("/healthz")
+        self.assertEqual(healthy.status, 200)
+
+        self.database.healthy = False
+        web_catalog._health.update({"checked_at": 0.0, "ok": True})
+        degraded = await self.client.get("/healthz")
+        self.assertEqual(degraded.status, 503)
 
 
 if __name__ == "__main__":
