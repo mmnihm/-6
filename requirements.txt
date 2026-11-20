@@ -1,7 +1,7 @@
 Pyrogram==2.0.106
-TgCrypto>=1.2.5
-aiosqlite>=0.20.0
-python-dotenv>=1.0.1
-aiohttp>=3.9,<4
-psycopg[pool,binary]>=3.2,<4
-Pillow>=10.1,<13
+TgCrypto==1.2.5
+aiosqlite==0.22.1
+python-dotenv==1.2.4
+aiohttp==3.11.13
+psycopg[pool,binary]==3.3.9
+Pillow==10.4.0

@@ -1,4 +1,6 @@
+import hashlib
 import html
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
@@ -7,6 +9,11 @@ from aiohttp import web
 
 PAGE_SIZE = 30
 CN_TZ = timezone(timedelta(hours=8))
+# The public page runs a LIKE scan over the whole files table, so identical
+# requests are served from memory for a short window instead of re-querying.
+CACHE_SECONDS = 45
+CACHE_MAX_ENTRIES = 300
+_page_cache = {}
 
 
 def format_catalog_date(value):
@@ -24,6 +31,25 @@ def format_catalog_date(value):
 
 
 def create_catalog_app(database, username_provider):
+    def cache_key(query, category, page):
+        return (query, category, int(page))
+
+    def cache_lookup(key):
+        entry = _page_cache.get(key)
+        if not entry:
+            return None
+        if entry[2] < time.monotonic():
+            _page_cache.pop(key, None)
+            return None
+        return entry[0], entry[1]
+
+    def cache_store(key, body):
+        if len(_page_cache) >= CACHE_MAX_ENTRIES:
+            _page_cache.pop(next(iter(_page_cache)))
+        etag = '"' + hashlib.sha256(body.encode("utf-8")).hexdigest()[:16] + '"'
+        _page_cache[key] = (etag, body, time.monotonic() + CACHE_SECONDS)
+        return etag
+
     async def catalog_handler(request):
         query = (request.query.get("q") or "").strip()[:100]
         category = (request.query.get("category") or "").strip()[:40]
@@ -31,6 +57,20 @@ def create_catalog_app(database, username_provider):
             page = max(1, int(request.query.get("page", "1")))
         except (TypeError, ValueError):
             page = 1
+
+        key = cache_key(query, category, page)
+        cached = cache_lookup(key)
+        if cached:
+            etag, body = cached
+            if request.headers.get("If-None-Match") == etag:
+                return web.Response(status=304, headers={"ETag": etag})
+            return web.Response(
+                text=body, content_type="text/html", charset="utf-8",
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": f"public, max-age={CACHE_SECONDS}",
+                },
+            )
 
         rows, categories, total = await database.public_catalog(
             query=query, category=category,
@@ -134,7 +174,16 @@ footer{{margin-top:25px;text-align:center;color:var(--muted);font-size:12px}}
 <nav class="pager">{"".join(pager)}</nav>
 <footer>文件实际存储于 Telegram 私有频道，网页不会公开存储频道地址。</footer>
 </main></body></html>"""
-        return web.Response(text=document, content_type="text/html", charset="utf-8")
+        etag = cache_store(key, document)
+        if request.headers.get("If-None-Match") == etag:
+            return web.Response(status=304, headers={"ETag": etag})
+        return web.Response(
+            text=document, content_type="text/html", charset="utf-8",
+            headers={
+                "ETag": etag,
+                "Cache-Control": f"public, max-age={CACHE_SECONDS}",
+            },
+        )
 
     async def root_handler(request):
         raise web.HTTPFound("/catalog")
