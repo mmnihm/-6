@@ -463,6 +463,7 @@ async def update_admin_upload_progress(message, user_id, category, increment=1, 
 
 async def admin_home_text():
     users, files, _, _ = await db.stats()
+    activity = await db.activity_stats()
     categories = await db.list_categories()
     catalog = await db.catalog_stats()
     album_groups = sum(int(row["album_count"] or 0) for row in categories)
@@ -471,7 +472,8 @@ async def admin_home_text():
         "━━━━━━━━━━━━━━━━━━\n"
         "管理上传、目录、存储、扫描与备份\n\n"
         "📊 数据概览\n"
-        f"👥 用户总数：{users}\n"
+        f"🟢 今日活跃：{activity['day']} 人（近 7 天 {activity['week']} 人）\n"
+        f"👥 注册总数：{users}\n"
         f"📁 文件夹数量：{len(categories)}\n"
         f"📦 已发布资源：{files}\n"
         f"🖼 图片：{catalog['images']} 张  ·  🎬 视频：{catalog['videos']} 个\n"
@@ -809,6 +811,41 @@ app = Client(
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
 )
+
+# "Active users" has to come from real traffic, not from the upload path only.
+# Every update refreshes users.last_seen, but at most once per window per user
+# so a chatty session cannot turn into a write every message.
+ACTIVITY_TOUCH_INTERVAL = 300
+ACTIVITY_TOUCH_CACHE_MAX = 20000
+activity_touch_cache = {}
+
+
+async def remember_activity(user_id):
+    uid = int(user_id)
+    now = time.monotonic()
+    last = activity_touch_cache.get(uid)
+    if last is not None and now - last < ACTIVITY_TOUCH_INTERVAL:
+        return
+    if len(activity_touch_cache) >= ACTIVITY_TOUCH_CACHE_MAX:
+        activity_touch_cache.clear()
+    activity_touch_cache[uid] = now
+    try:
+        await db.touch_user(uid)
+    except Exception as exc:
+        log.debug("Could not record activity for %s: %s", uid, exc)
+
+
+@app.on_message(filters.private, group=-1)
+async def track_private_activity(client, message):
+    if message.from_user:
+        await remember_activity(message.from_user.id)
+
+
+@app.on_callback_query(group=-1)
+async def track_callback_activity(client, query):
+    if query.from_user:
+        await remember_activity(query.from_user.id)
+
 
 SCANNER_WORKDIR = os.path.dirname(config.DATABASE_PATH) or "."
 os.makedirs(SCANNER_WORKDIR, exist_ok=True)
@@ -6934,6 +6971,7 @@ async def admin_callback_handler(client, query):
         )
     elif action == "home":
         users, files, _, banned = await db.stats()
+        activity = await db.activity_stats()
         group_id = await get_member_group_id()
         primary, backup = await get_storage_channels()
         text = (
@@ -6941,7 +6979,8 @@ async def admin_callback_handler(client, query):
             f"👥 会员群：{'已绑定' if group_id else '未绑定'}\n"
             f"🗄 主存储：{'已绑定' if primary else '未绑定'}\n"
             f"📦 备用存储：{'已绑定' if backup else '未绑定'}\n\n"
-            f"👤 用户：{users}    📁 资源：{files}\n"
+            f"🟢 今日活跃：{activity['day']} 人（7 天 {activity['week']} 人）\n"
+            f"👤 注册总数：{users}    📁 资源：{files}\n"
             f"🚫 封禁用户：{banned}\n\n请选择需要管理的功能。"
         )
         await message.edit_text(text, reply_markup=admin_keyboard())
@@ -7647,8 +7686,18 @@ async def admin_callback_handler(client, query):
         )
     elif action == "stats":
         users, files, _, banned = await db.stats()
+        activity = await db.activity_stats()
         await message.edit_text(
-            f"📊 数据统计\n\n👤 用户总数：{users}\n📦 资源总数：{files}\n🚫 封禁用户：{banned}",
+            "📊 数据统计\n"
+            "━━━━━━━━━━━━━━\n"
+            "🟢 当前活跃（不是累计注册数）\n"
+            f"今日 24 小时：{activity['day']} 人\n"
+            f"最近 7 天：{activity['week']} 人\n"
+            f"最近 30 天：{activity['month']} 人\n"
+            f"今日新注册：{activity['new_today']} 人\n\n"
+            f"👤 注册总数（累计）：{users}\n"
+            f"📦 资源总数：{files}\n"
+            f"🚫 封禁用户：{banned}",
             reply_markup=back_keyboard(),
         )
     elif action == "scannerlogin":

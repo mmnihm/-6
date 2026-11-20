@@ -733,5 +733,40 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(removed, 0)
         self.assertEqual(await self.db.get_setting("folder_view:8:def"), "0")
 
+    async def test_activity_stats_counts_recent_users_not_the_total(self):
+        from datetime import timedelta
+        from database import utc_now
+        now = utc_now()
+        rows = {
+            1001: now - timedelta(minutes=5),        # active today
+            1002: now - timedelta(hours=20),        # still inside 24h
+            1003: now - timedelta(days=3),          # inside 7d only
+            1004: now - timedelta(days=20),         # inside 30d only
+            1005: now - timedelta(days=90),         # inactive
+        }
+        async with self.db.connect() as conn:
+            for user_id, seen in rows.items():
+                await conn.execute(
+                    "INSERT INTO users(user_id, first_seen, last_seen) VALUES(?, ?, ?)",
+                    (user_id, seen.isoformat(), seen.isoformat()),
+                )
+            # One user registered today but has not been seen since yesterday.
+            await conn.execute(
+                "INSERT INTO users(user_id, first_seen, last_seen) VALUES(?, ?, ?)",
+                (1006, now.isoformat(), (now - timedelta(days=2)).isoformat()),
+            )
+            await conn.commit()
+
+        stats = await self.db.activity_stats()
+        self.assertEqual(stats["day"], 2)
+        self.assertEqual(stats["week"], 4)
+        self.assertEqual(stats["month"], 5)
+        # 1001 also registered today, so both count as new signups.
+        self.assertEqual(stats["new_today"], 2)
+
+    async def test_activity_stats_on_empty_database_is_zero(self):
+        stats = await self.db.activity_stats()
+        self.assertEqual(stats, {"day": 0, "week": 0, "month": 0, "new_today": 0})
+
 if __name__ == "__main__":
     unittest.main()

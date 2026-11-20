@@ -2317,6 +2317,28 @@ class Database:
                 self._invalidate_catalog_stats()
                 await db.commit()
 
+    async def activity_stats(self):
+        """How many people actually used the bot recently (not the cumulative total)."""
+        now = utc_now()
+        day = (now - timedelta(days=1)).isoformat()
+        week = (now - timedelta(days=7)).isoformat()
+        month = (now - timedelta(days=30)).isoformat()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        async with self.connect() as db:
+            row = await (await db.execute("""
+                SELECT SUM(CASE WHEN last_seen >= ? THEN 1 ELSE 0 END) AS day_active,
+                       SUM(CASE WHEN last_seen >= ? THEN 1 ELSE 0 END) AS week_active,
+                       SUM(CASE WHEN last_seen >= ? THEN 1 ELSE 0 END) AS month_active,
+                       SUM(CASE WHEN first_seen >= ? THEN 1 ELSE 0 END) AS new_today
+                FROM users
+            """, (day, week, month, today_start))).fetchone()
+        return {
+            "day": int(row["day_active"] or 0),
+            "week": int(row["week_active"] or 0),
+            "month": int(row["month_active"] or 0),
+            "new_today": int(row["new_today"] or 0),
+        }
+
     async def stats(self):
         # One round trip instead of four: the four counts are independent, and
         # the admin panel asks for them together every time it renders.
