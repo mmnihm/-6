@@ -531,6 +531,20 @@ class Database:
             if "updated_at" not in setting_column_names:
                 await db.execute("ALTER TABLE settings ADD COLUMN updated_at TEXT")
 
+            user_columns = await (await db.execute(
+                "SELECT column_name AS name FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='users'"
+            )).fetchall() if self.uses_postgres else await (await db.execute(
+                "PRAGMA table_info(users)"
+            )).fetchall()
+            user_column_names = {row["name"] for row in user_columns}
+            if "reach_status" not in user_column_names:
+                await db.execute(
+                    "ALTER TABLE users ADD COLUMN reach_status TEXT NOT NULL DEFAULT ''"
+                )
+            if "reach_checked_at" not in user_column_names:
+                await db.execute("ALTER TABLE users ADD COLUMN reach_checked_at TEXT")
+
             batch_columns = await (await db.execute(
                 "SELECT column_name AS name FROM information_schema.columns "
                 "WHERE table_schema=current_schema() AND table_name='upload_batch_items'"
@@ -900,6 +914,57 @@ class Database:
                 ON CONFLICT(user_id) DO UPDATE SET last_seen=excluded.last_seen
             """, (user_id, now, now))
             await db.commit()
+
+    async def list_users_for_reach_check(self, limit: int = 200, offset: int = 0):
+        async with self.connect() as db:
+            rows = await (await db.execute(
+                "SELECT user_id FROM users ORDER BY user_id LIMIT ? OFFSET ?",
+                (limit, offset),
+            )).fetchall()
+        return [int(row["user_id"]) for row in rows]
+
+    async def set_user_reach_bulk(self, rows):
+        """One transaction per batch keeps SQLite from paying a commit per user."""
+        if not rows:
+            return
+        now = iso_now()
+        async with self.connect() as db:
+            for user_id, status in rows:
+                await db.execute(
+                    "UPDATE users SET reach_status=?, reach_checked_at=? WHERE user_id=?",
+                    (status, now, int(user_id)),
+                )
+            await db.commit()
+
+    async def set_user_reach_status(self, user_id: int, status: str):
+        async with self.connect() as db:
+            await db.execute(
+                "UPDATE users SET reach_status=?, reach_checked_at=? WHERE user_id=?",
+                (status, iso_now(), int(user_id)),
+            )
+            await db.commit()
+
+    async def reach_stats(self):
+        """Reachability means "this account can still receive a message from the bot."""
+        counts = {
+            "total": 0, "ok": 0, "blocked": 0,
+            "deactivated": 0, "gone": 0, "unknown": 0, "unchecked": 0,
+        }
+        async with self.connect() as db:
+            rows = await (await db.execute(
+                "SELECT reach_status AS status, COUNT(*) AS total FROM users GROUP BY reach_status"
+            )).fetchall()
+        for row in rows:
+            total = int(row["total"] or 0)
+            key = str(row["status"] or "").strip()
+            counts["total"] += total
+            if not key:
+                counts["unchecked"] += total
+            elif key in counts:
+                counts[key] += total
+            else:
+                counts["unknown"] += total
+        return counts
 
     async def is_banned(self, user_id: int) -> bool:
         async with self.connect() as db:

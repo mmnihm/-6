@@ -768,5 +768,34 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         stats = await self.db.activity_stats()
         self.assertEqual(stats, {"day": 0, "week": 0, "month": 0, "new_today": 0})
 
+    async def test_reach_stats_and_bulk_update(self):
+        from datetime import timedelta
+        from database import utc_now
+        now = utc_now() - timedelta(minutes=1)
+        rows = ((2001, "ok"), (2002, "blocked"), (2003, ""), (2004, "deactivated"))
+        async with self.db.connect() as conn:
+            for user_id, status in rows:
+                await conn.execute(
+                    "INSERT INTO users(user_id, first_seen, last_seen, reach_status) "
+                    "VALUES(?, ?, ?, ?)",
+                    (user_id, now.isoformat(), now.isoformat(), status),
+                )
+            await conn.commit()
+
+        stats = await self.db.reach_stats()
+        self.assertEqual(stats["total"], 4)
+        self.assertEqual(stats["ok"], 1)
+        self.assertEqual(stats["blocked"], 1)
+        self.assertEqual(stats["deactivated"], 1)
+        self.assertEqual(stats["unchecked"], 1)
+
+        # One batch of probe results flips the unknown one to reachable.
+        await self.db.set_user_reach_bulk([(2003, "ok"), (2002, "gone")])
+        after = await self.db.reach_stats()
+        self.assertEqual(after["ok"], 2)
+        self.assertEqual(after["unchecked"], 0)
+        self.assertEqual(after["blocked"], 0)
+        self.assertEqual(after["gone"], 1)
+
 if __name__ == "__main__":
     unittest.main()

@@ -847,6 +847,120 @@ async def track_callback_activity(client, query):
         await remember_activity(query.from_user.id)
 
 
+# Telegram has no "is this user still reachable" endpoint: the send attempt is
+# the check. A typing action fails exactly when a message would (403 blocked /
+# deactivated) without delivering anything the user can see or keep.
+REACH_CHECK_BATCH = 200
+REACH_CHECK_PAUSE = 0.05
+reach_check_state = {"task": None}
+
+
+def classify_reach_error(exc):
+    text = str(exc).lower()
+    if "blocked" in text:
+        return "blocked"
+    if "deactivated" in text:
+        return "deactivated"
+    if "chat not found" in text or "user not found" in text or "peer id invalid" in text:
+        return "gone"
+    return "unknown"
+
+
+async def probe_user_reach(user_id):
+    try:
+        await app.send_chat_action(user_id, "typing")
+        return "ok"
+    except FloodWait as exc:
+        await asyncio.sleep(int(getattr(exc, "value", 5) or 5) + 1)
+        try:
+            await app.send_chat_action(user_id, "typing")
+            return "ok"
+        except Exception as exc2:
+            return classify_reach_error(exc2)
+    except Exception as exc:
+        return classify_reach_error(exc)
+
+
+def reach_summary_text(counts, note=""):
+    checked = counts["total"] - counts["unchecked"]
+    return (
+        "📡 用户可达性统计\n"
+        "━━━━━━━━━━━━━━\n"
+        "（可达 = 现在还能收到机器人消息）\n\n"
+        f"✅ 可达：{counts['ok']} 人\n"
+        f"🚫 已屏蔽机器人：{counts['blocked']} 人\n"
+        f"💀 账号已注销：{counts['deactivated']} 人\n"
+        f"❓ 无法触达：{counts['gone']} 人\n"
+        f"⚠️ 未确定：{counts['unknown']} 人\n"
+        f"⏳ 尚未检测：{counts['unchecked']} 人\n\n"
+        f"👥 注册总数：{counts['total']} 人｜已检测 {checked} 人"
+        + (f"\n\n{note}" if note else "")
+    )
+
+
+async def run_reach_check(status_message):
+    """Walk the whole user table once and record who can still receive messages."""
+    try:
+        counts = await db.reach_stats()
+        total = counts["total"]
+        if not total:
+            await status_message.edit_text(
+                "📡 用户可达性统计\n\n还没有任何注册用户，无需检测。",
+                reply_markup=back_keyboard(),
+            )
+            return
+
+        done = 0
+        offset = 0
+        unchecked = counts["unchecked"]
+        while True:
+            user_ids = await db.list_users_for_reach_check(REACH_CHECK_BATCH, offset)
+            if not user_ids:
+                break
+            results = []
+            for user_id in user_ids:
+                results.append((user_id, await probe_user_reach(user_id)))
+                await asyncio.sleep(REACH_CHECK_PAUSE)
+            await db.set_user_reach_bulk(results)
+            done += len(user_ids)
+            offset += len(user_ids)
+            try:
+                await status_message.edit_text(
+                    "📡 正在检测（不会给对方发任何消息）\n"
+                    "━━━━━━━━━━━━━━\n"
+                    f"进度：{done} / {total} 人\n"
+                    f"预计剩余约 {max(0, int((total - done) * REACH_CHECK_PAUSE))} 秒\n\n"
+                    "期间机器人可以正常领取资源，检测完成后会自动出结果。"
+                )
+            except Exception:
+                log.debug("Reach check progress edit failed", exc_info=True)
+
+        final = await db.reach_stats()
+        await status_message.edit_text(
+            reach_summary_text(
+                final,
+                f"本轮检测了 {done} 人（其中此前未检测 {unchecked} 人）。",
+            ),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 重新检测", callback_data="mc:reachcheck")],
+                [InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")],
+            ]),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("User reachability check failed")
+        try:
+            await status_message.edit_text(
+                "⚠️ 检测中断，已保存的进度不会丢失，可以稍后点「重新检测」继续。",
+                reply_markup=back_keyboard(),
+            )
+        except Exception:
+            log.debug("Could not report reach check failure", exc_info=True)
+    finally:
+        reach_check_state["task"] = None
+
+
 SCANNER_WORKDIR = os.path.dirname(config.DATABASE_PATH) or "."
 os.makedirs(SCANNER_WORKDIR, exist_ok=True)
 SCANNER_SESSION_PATH = os.path.join(SCANNER_WORKDIR, "member_cloud_scanner.session")
@@ -7687,6 +7801,7 @@ async def admin_callback_handler(client, query):
     elif action == "stats":
         users, files, _, banned = await db.stats()
         activity = await db.activity_stats()
+        reach = await db.reach_stats()
         await message.edit_text(
             "📊 数据统计\n"
             "━━━━━━━━━━━━━━\n"
@@ -7695,10 +7810,36 @@ async def admin_callback_handler(client, query):
             f"最近 7 天：{activity['week']} 人\n"
             f"最近 30 天：{activity['month']} 人\n"
             f"今日新注册：{activity['new_today']} 人\n\n"
+            "📡 可达性（能不能收到机器人消息）\n"
+            f"✅ 可达 {reach['ok']} ｜🚫 已屏蔽 {reach['blocked']}"
+            f" ｜💀 注销 {reach['deactivated']}\n"
+            f"⏳ 尚未检测 {reach['unchecked']} 人\n\n"
             f"👤 注册总数（累计）：{users}\n"
             f"📦 资源总数：{files}\n"
             f"🚫 封禁用户：{banned}",
-            reply_markup=back_keyboard(),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📡 检测用户能否接收", callback_data="mc:reachcheck")],
+                [InlineKeyboardButton("🏠 返回管理首页", callback_data="mc:home")],
+            ]),
+        )
+    elif action == "reachcheck":
+        running = reach_check_state["task"]
+        if running is not None and not running.done():
+            await message.edit_text(
+                "⏳ 正在检测中，请等这一轮结束再重新点。\n"
+                "检测期间机器人可正常使用，不会给任何用户发消息。",
+                reply_markup=back_keyboard(),
+            )
+            return
+        await message.edit_text(
+            "📡 开始检测用户可达性\n"
+            "━━━━━━━━━━━━━━\n"
+            "方式：给对方发一个「正在输入」状态，能发出去就是可达。\n"
+            "对方不会收到任何消息，最多看到一瞬间的输入提示。\n\n"
+            "检测期间领取、上传、备份都正常，进度会自动刷新。",
+        )
+        reach_check_state["task"] = spawn_background(
+            "reach-check", run_reach_check(message)
         )
     elif action == "scannerlogin":
         await message.edit_text(
