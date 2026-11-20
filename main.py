@@ -16,7 +16,7 @@ from pyrogram.types import (
     InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio,
     KeyboardButton, ReplyKeyboardMarkup, BotCommand,
 )
-from pyrogram.enums import ChatMemberStatus, ChatType
+from pyrogram.enums import ChatAction, ChatMemberStatus, ChatType
 from pyrogram.errors import (
     FloodWait, PeerIdInvalid, UserNotParticipant, SessionPasswordNeeded,
 )
@@ -856,29 +856,44 @@ reach_check_state = {"task": None}
 
 
 def classify_reach_error(exc):
-    text = str(exc).lower()
+    # Telegram mixes styles: "bot was blocked by the user" but "PEER_ID_INVALID".
+    text = str(exc).lower().replace("_", " ")
     if "blocked" in text:
         return "blocked"
     if "deactivated" in text:
         return "deactivated"
+    if "can't initiate conversation" in text or "cant initiate conversation" in text:
+        # The user never opened this bot, so no message can ever be delivered.
+        return "gone"
     if "chat not found" in text or "user not found" in text or "peer id invalid" in text:
         return "gone"
     return "unknown"
 
 
 async def probe_user_reach(user_id):
-    try:
-        await app.send_chat_action(user_id, "typing")
-        return "ok"
-    except FloodWait as exc:
-        await asyncio.sleep(int(getattr(exc, "value", 5) or 5) + 1)
+    """Return ok/blocked/deactivated/gone/unknown for one user."""
+    for attempt in range(2):
         try:
-            await app.send_chat_action(user_id, "typing")
+            # pyrogram expects a ChatAction enum here; a plain string raises
+            # AttributeError before any request is made.
+            await app.send_chat_action(user_id, ChatAction.TYPING)
             return "ok"
-        except Exception as exc2:
-            return classify_reach_error(exc2)
-    except Exception as exc:
-        return classify_reach_error(exc)
+        except FloodWait as exc:
+            await asyncio.sleep(int(getattr(exc, "value", 5) or 5) + 1)
+            continue
+        except Exception as exc:
+            status = classify_reach_error(exc)
+            if status != "unknown":
+                return status
+            # Keep the real reason visible: without it an unknown result is
+            # indistinguishable from a code bug (which is how the first run
+            # classified every user as unknown).
+            log.warning(
+                "Reach probe undetermined: user=%s attempt=%s error=%r",
+                user_id, attempt + 1, exc,
+            )
+            await asyncio.sleep(1)
+    return "unknown"
 
 
 def reach_summary_text(counts, note=""):
