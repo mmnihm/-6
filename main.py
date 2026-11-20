@@ -22,6 +22,7 @@ from pyrogram.errors import (
 )
 
 import config
+from alerts import AlertThrottle
 from database import Database, clean_file_name
 from web_catalog import create_catalog_app
 
@@ -279,6 +280,62 @@ async def get_upload_status_message(message, user_id, text):
 
 background_tasks = set()
 
+# Runtime failures only reach the log today, which nobody watches. These alerts
+# are deliberately throttled: a crash loop must not turn into a DM storm.
+ALERT_COOLDOWN_SECONDS = 900
+ALERT_HOURLY_LIMIT = 6
+alert_throttle = AlertThrottle(ALERT_COOLDOWN_SECONDS, ALERT_HOURLY_LIMIT)
+
+
+async def alert_admins(title, detail="", key="general"):
+    """DM the operators about a runtime failure. Never raises."""
+    try:
+        if not alert_throttle.allow(key, time.monotonic()):
+            log.warning("Alert suppressed by throttle: key=%s title=%s", key, title)
+            return False
+
+        admin_ids = []
+        if config.ADMIN_ID:
+            admin_ids.append(int(config.ADMIN_ID))
+        try:
+            stored = await db.get_admin_id()
+        except Exception:
+            stored = None
+        if stored and int(stored) not in admin_ids:
+            admin_ids.append(int(stored))
+        if not admin_ids:
+            return False
+
+        body = f"{title}"
+        if detail:
+            body += f"\n\n{detail}"
+        body += "\n\n（同类告警 15 分钟内只发一次，每小时最多 6 条）"
+        body = body[:3900]
+        for admin_id in admin_ids:
+            try:
+                await app.send_message(admin_id, body, disable_web_page_preview=True)
+            except Exception as exc:
+                log.warning("Alert could not reach admin %s: %s", admin_id, exc)
+        return True
+    except Exception:
+        log.exception("Alert dispatch failed")
+        return False
+
+
+def schedule_alert(title, detail="", key="general"):
+    """Fire an alert from sync context (done-callbacks, workers). Never raises."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        task = loop.create_task(alert_admins(title, detail=detail, key=key))
+    except Exception:
+        log.exception("Could not schedule alert: key=%s", key)
+        return
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
 
 def spawn_background(name, coro):
     """Run a fire-and-forget task while keeping a reference and logging crashes."""
@@ -294,6 +351,11 @@ def spawn_background(name, coro):
             log.error(
                 "Background task crashed: name=%s error=%r",
                 name, error, exc_info=(type(error), error, error.__traceback__),
+            )
+            schedule_alert(
+                f"🚨 后台任务崩溃：{name}",
+                f"错误：{type(error).__name__}: {error}",
+                key=f"task:{name}",
             )
 
     task.add_done_callback(_finished)
@@ -3489,6 +3551,7 @@ async def settings_retention_worker():
 async def backup_retry_worker(client):
     """Resume durable jobs and queue Cangku singles/albums only while idle."""
     global last_user_activity, backup_retry_manual_requested, scan_task
+    consecutive_cycle_failures = 0
     while True:
         try:
             if await db.get_setting("backup_retry_enabled") == "0":
@@ -3954,10 +4017,19 @@ async def backup_retry_worker(client):
                         "Could not send grouped backup failure summary (%s items)",
                         len(cycle_failure_notices),
                     )
+            consecutive_cycle_failures = 0
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             log.exception("Backup retry worker cycle failed")
+            consecutive_cycle_failures += 1
+            if consecutive_cycle_failures in (3, 10) or consecutive_cycle_failures % 20 == 0:
+                schedule_alert(
+                    "🚨 自动备份队列连续失败",
+                    f"已连续 {consecutive_cycle_failures} 轮出错，备份队列可能已停摆。\n"
+                    f"最新错误：{type(exc).__name__}: {exc}",
+                    key="backup-cycle",
+                )
         await asyncio.sleep(15)
 
 

@@ -4,6 +4,7 @@ import unittest
 from aiohttp.test_utils import TestClient, TestServer
 
 import web_catalog
+from alerts import AlertThrottle
 from captcha_image import CODE_LENGTH, OPTION_COUNT, build_captcha
 
 
@@ -129,3 +130,24 @@ class CatalogCacheTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AlertThrottleTests(unittest.TestCase):
+    def test_same_key_is_suppressed_inside_cooldown(self):
+        throttle = AlertThrottle(cooldown_seconds=900)
+        self.assertTrue(throttle.allow("task:backup", 1000.0))
+        self.assertFalse(throttle.allow("task:backup", 1001.0))
+        self.assertTrue(throttle.allow("task:backup", 1901.0))
+
+    def test_different_keys_are_independent(self):
+        throttle = AlertThrottle(cooldown_seconds=900)
+        self.assertTrue(throttle.allow("task:a", 1000.0))
+        self.assertTrue(throttle.allow("task:b", 1001.0))
+
+    def test_hourly_cap_stops_a_storm(self):
+        throttle = AlertThrottle(cooldown_seconds=1, hourly_limit=3)
+        for index in range(3):
+            self.assertTrue(throttle.allow(f"key{index}", 1000.0 + index))
+        self.assertFalse(throttle.allow("key3", 1005.0))
+        # An hour later the window has slid past the earlier alerts.
+        self.assertTrue(throttle.allow("key3", 5000.0))
