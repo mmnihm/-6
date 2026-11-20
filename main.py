@@ -23,6 +23,7 @@ from pyrogram.errors import (
 
 import config
 from alerts import AlertThrottle
+from newcomer import DEFAULT_HOURS, clamp_hours, window_active
 from database import Database, clean_file_name
 from web_catalog import create_catalog_app
 
@@ -974,6 +975,75 @@ async def run_reach_check(status_message):
             log.debug("Could not report reach check failure", exc_info=True)
     finally:
         reach_check_state["task"] = None
+
+
+# Newcomer guard: a member who just joined sees protected content for a while.
+# Telegram exposes no join timestamp, so the only trustworthy source is the
+# chat_member update the bot receives while it is an admin of the member group.
+NEWCOMER_GUARD_KEY = "newcomer_guard_enabled"
+NEWCOMER_HOURS_KEY = "newcomer_guard_hours"
+newcomer_guard_cache = {}
+
+
+async def newcomer_guard_hours():
+    return clamp_hours(await db.get_setting(NEWCOMER_HOURS_KEY) or DEFAULT_HOURS)
+
+
+async def newcomer_guard_active(user_id):
+    """True while this user is still inside the newcomer window."""
+    if await db.get_setting(NEWCOMER_GUARD_KEY) != "1":
+        return False
+    uid = int(user_id)
+    now = time.monotonic()
+    cached = newcomer_guard_cache.get(uid)
+    if cached and cached[0] > now:
+        return cached[1]
+    try:
+        joined_at = await db.get_group_join(uid)
+        hours = await newcomer_guard_hours()
+        active = window_active(joined_at, datetime.now(timezone.utc), hours)
+    except Exception:
+        log.exception("Newcomer guard check failed for user %s", uid)
+        active = False
+    if len(newcomer_guard_cache) >= 5000:
+        newcomer_guard_cache.clear()
+    newcomer_guard_cache[uid] = (now + (60 if active else 300), active)
+    return active
+
+
+@app.on_chat_member_updated()
+async def track_group_joins(client, update):
+    """Record joins/leaves in the bound member group."""
+    try:
+        group_id = await get_member_group_id()
+    except Exception:
+        log.exception("Could not read member group binding for join tracking")
+        return
+    if not group_id:
+        return
+    try:
+        if update.chat is None or int(update.chat.id) != int(group_id):
+            return
+        new = update.new_chat_member
+        if new is None or new.user is None:
+            return
+        user_id = int(new.user.id)
+        old_status = getattr(update.old_chat_member, "status", None)
+        if new.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+            await db.clear_group_join(user_id)
+            newcomer_guard_cache.pop(user_id, None)
+        elif new.status == ChatMemberStatus.MEMBER and old_status in (
+            None, ChatMemberStatus.LEFT, ChatMemberStatus.BANNED,
+        ):
+            await db.record_group_join(user_id)
+            newcomer_guard_cache.pop(user_id, None)
+        elif new.status == ChatMemberStatus.RESTRICTED and getattr(new, "is_member", False) and old_status in (
+            None, ChatMemberStatus.LEFT, ChatMemberStatus.BANNED,
+        ):
+            await db.record_group_join(user_id)
+            newcomer_guard_cache.pop(user_id, None)
+    except Exception:
+        log.exception("Could not record member group join change")
 
 
 SCANNER_WORKDIR = os.path.dirname(config.DATABASE_PATH) or "."
@@ -2386,6 +2456,8 @@ async def send_catalog_file(client, user_id, file_key, return_message_id=False,
             if settings is None:
                 settings = await get_member_delivery_settings()
             protect_content, _ = settings
+            if not protect_content and await newcomer_guard_active(user_id):
+                protect_content = True
             # copyMessage accepts a caption, so the watermark travels with the
             # file in the same request: no second edit call, no later rewrite.
             copy_caption = delivery_caption(
@@ -2482,6 +2554,8 @@ async def try_send_catalog_album(client, user_id, group, settings=None, schedule
     if settings is None:
         settings = await get_member_delivery_settings()
     protect_content, _ = settings
+    if not protect_content and await newcomer_guard_active(user_id):
+        protect_content = True
     copied = await telegram_bot_api("copyMessages", {
         "chat_id": int(user_id),
         "from_chat_id": source_chats.pop(),
@@ -7022,6 +7096,21 @@ async def admin_callback_handler(client, query):
             if len(parts) == 2 and parts[1] == "protect":
                 protect, _ = await get_member_delivery_settings()
                 await db.set_setting("member_content_protection", "0" if protect else "1")
+            elif len(parts) == 2 and parts[1] == "newcomer":
+                enabled = await db.get_setting(NEWCOMER_GUARD_KEY) == "1"
+                await db.set_setting(NEWCOMER_GUARD_KEY, "0" if enabled else "1")
+                newcomer_guard_cache.clear()
+            elif len(parts) == 3 and parts[1] == "newcomerhours":
+                try:
+                    hours = int(parts[2])
+                except ValueError:
+                    await query.answer("无效的时长", show_alert=True)
+                    return
+                if hours not in (12, 24, 48):
+                    await query.answer("无效的时长", show_alert=True)
+                    return
+                await db.set_setting(NEWCOMER_HOURS_KEY, str(hours))
+                newcomer_guard_cache.clear()
             elif len(parts) == 3 and parts[1] == "delete":
                 try:
                     seconds = int(parts[2])
@@ -7034,15 +7123,23 @@ async def admin_callback_handler(client, query):
             else:
                 return
         protect, delete_after = await get_member_delivery_settings()
+        newcomer_on = await db.get_setting(NEWCOMER_GUARD_KEY) == "1"
+        newcomer_hours = await newcomer_guard_hours()
         duration_labels = {0: "关闭", 60: "1 分钟", 300: "5 分钟", 600: "10 分钟", 1800: "30 分钟", 3600: "1 小时", 86400: "24 小时"}
         duration_label = duration_labels.get(delete_after, f"{delete_after // 60} 分钟")
         await message.edit_text(
             "🛡 会员资源内容保护与自动删除\n\n"
             f"内容保护：{'开启' if protect else '关闭'}\n"
-            f"自动删除：{duration_label}\n\n"
-            "内容保护用于限制会员转发/保存机器人发出的资源。自动删除只清理会员私聊里的机器人发送消息，不会删除主存储或备用存储频道原件。\n\n请选择要修改的项目：",
+            f"自动删除：{duration_label}\n"
+            f"新人保护：{'开启，入群后 ' + str(int(newcomer_hours)) + ' 小时内禁止保存/转发' if newcomer_on else '关闭'}\n\n"
+            "内容保护用于限制会员转发/保存机器人发出的资源。自动删除只清理会员私聊里的机器人发送消息，不会删除主存储或备用存储频道原件。\n"
+            "新人保护按入群时间计算，只记录部署之后新入群的人；已经在群里的老成员不受影响。\n\n请选择要修改的项目：",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(f"{'✅' if protect else '⏸'} 内容保护开关", callback_data="mc:guard:protect"),
+                 InlineKeyboardButton(f"{'✅' if newcomer_on else '⏸'} 新人保护", callback_data="mc:guard:newcomer")],
+                [InlineKeyboardButton("新人 12 小时", callback_data="mc:guard:newcomerhours:12"),
+                 InlineKeyboardButton("新人 24 小时", callback_data="mc:guard:newcomerhours:24")],
+                [InlineKeyboardButton("新人 48 小时", callback_data="mc:guard:newcomerhours:48"),
                  InlineKeyboardButton("关闭自动删除", callback_data="mc:guard:delete:0")],
                 [InlineKeyboardButton("1 分钟", callback_data="mc:guard:delete:60"),
                  InlineKeyboardButton("5 分钟", callback_data="mc:guard:delete:300")],

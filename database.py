@@ -319,6 +319,10 @@ class Database:
                 first_seen TEXT NOT NULL,
                 last_seen TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS group_joins (
+                user_id BIGINT PRIMARY KEY,
+                joined_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS categories (
                 name TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL
@@ -914,6 +918,29 @@ class Database:
                 ON CONFLICT(user_id) DO UPDATE SET last_seen=excluded.last_seen
             """, (user_id, now, now))
             await db.commit()
+
+    async def record_group_join(self, user_id: int):
+        """Remember when someone joined the member group (event-driven, best effort)."""
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT INTO group_joins(user_id, joined_at) VALUES(?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET joined_at=excluded.joined_at
+            """, (int(user_id), iso_now()))
+            await db.commit()
+
+    async def clear_group_join(self, user_id: int):
+        async with self.connect() as db:
+            await db.execute(
+                "DELETE FROM group_joins WHERE user_id=?", (int(user_id),)
+            )
+            await db.commit()
+
+    async def get_group_join(self, user_id: int):
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT joined_at FROM group_joins WHERE user_id=?", (int(user_id),)
+            )).fetchone()
+        return row["joined_at"] if row else None
 
     async def list_users_for_reach_check(self, limit: int = 200, offset: int = 0):
         async with self.connect() as db:

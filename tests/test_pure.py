@@ -1,10 +1,12 @@
 import io
 import unittest
+from datetime import datetime
 
 from aiohttp.test_utils import TestClient, TestServer
 
 import web_catalog
 from alerts import AlertThrottle
+from newcomer import clamp_hours, window_active
 from captcha_image import CODE_LENGTH, OPTION_COUNT, build_captcha
 
 
@@ -151,3 +153,26 @@ class AlertThrottleTests(unittest.TestCase):
         self.assertFalse(throttle.allow("key3", 1005.0))
         # An hour later the window has slid past the earlier alerts.
         self.assertTrue(throttle.allow("key3", 5000.0))
+
+class NewcomerWindowTests(unittest.TestCase):
+    def test_inside_the_window_is_protected(self):
+        joined = "2026-11-20T10:00:00+00:00"
+        now = datetime.fromisoformat("2026-11-20T20:00:00+00:00")
+        self.assertTrue(window_active(joined, now, 24))
+
+    def test_after_the_window_is_released(self):
+        joined = "2026-11-20T10:00:00+00:00"
+        now = datetime.fromisoformat("2026-11-21T11:00:00+00:00")
+        self.assertFalse(window_active(joined, now, 24))
+
+    def test_missing_join_time_never_restricts_anyone(self):
+        now = datetime.fromisoformat("2026-11-20T20:00:00+00:00")
+        self.assertFalse(window_active(None, now, 24))
+        self.assertFalse(window_active("", now, 24))
+        self.assertFalse(window_active("not-a-date", now, 24))
+
+    def test_hours_are_clamped_to_a_sane_range(self):
+        self.assertEqual(clamp_hours(None), 24.0)
+        self.assertEqual(clamp_hours("abc"), 24.0)
+        self.assertEqual(clamp_hours(-5), 0.0)
+        self.assertEqual(clamp_hours(999), 168.0)
