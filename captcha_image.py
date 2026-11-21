@@ -80,3 +80,17 @@ def render_code(answer):
     image.save(output, format="PNG")
     output.seek(0)
     return output
+
+
+def stored_answer_index(challenge):
+    """Read the correct option index out of a stored challenge.
+
+    A plain `int(value or -1)` silently turns a valid index 0 into -1, which
+    made one in six challenges reject its own correct button.
+    """
+    if not isinstance(challenge, dict):
+        return -1
+    try:
+        return int(challenge.get("answer_index", -1))
+    except (TypeError, ValueError):
+        return -1

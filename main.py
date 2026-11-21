@@ -23,6 +23,7 @@ from pyrogram.errors import (
 
 import config
 from alerts import AlertThrottle
+from captcha_image import stored_answer_index
 from newcomer import DEFAULT_HOURS, clamp_hours, window_active
 from database import Database, clean_file_name
 from web_catalog import create_catalog_app
@@ -830,10 +831,12 @@ async def remember_activity(user_id):
     if len(activity_touch_cache) >= ACTIVITY_TOUCH_CACHE_MAX:
         activity_touch_cache.clear()
     activity_touch_cache[uid] = now
+    # Fire and forget: this runs before every other handler, so a slow or
+    # locked database here would delay every reply in the bot.
     try:
-        await db.touch_user(uid)
+        spawn_background("activity-touch", db.touch_user(uid))
     except Exception as exc:
-        log.debug("Could not record activity for %s: %s", uid, exc)
+        log.debug("Could not queue activity touch for %s: %s", uid, exc)
 
 
 @app.on_message(filters.private, group=-1)
@@ -1293,8 +1296,9 @@ async def handle_captcha_choice(client, query):
         return
 
     options = challenge.get("options") or []
-    answer_index = int(challenge.get("answer_index", -1) or -1)
-    if index < 0 or index >= len(options) or answer_index < 0:
+    # A correct answer at position 0 must not be read as "no answer".
+    answer_index = stored_answer_index(challenge)
+    if index < 0 or index >= len(options) or answer_index < 0 or answer_index >= len(options):
         await query.answer("按钮无效，请重新验证。", show_alert=True)
         return
 
@@ -6726,10 +6730,19 @@ async def user_catalog_callback_handler(client, query):
             # Positions shift down whenever new resources are published, so a
             # stored cursor can land on files the member already received.
             # Recompute it from delivery history on every claim.
-            saved_offset = await db.compute_member_cursor_from_history(
-                user.id, member_progress_key, category["name"],
-                max_attempts=DELIVERY_MAX_ATTEMPTS,
-            )
+            try:
+                saved_offset = await db.compute_member_cursor_from_history(
+                    user.id, member_progress_key, category["name"],
+                    max_attempts=DELIVERY_MAX_ATTEMPTS,
+                )
+            except Exception:
+                log.exception(
+                    "Could not recompute member cursor; using the stored progress: "
+                    "user=%s share_key=%s", user.id, share_key,
+                )
+                saved_offset = await db.get_category_delivery_progress(
+                    user.id, member_progress_key
+                )
 
             # A completed member/folder cursor restarts only after the member
             # taps 「✅ 重新领取」, so one stray tap cannot resend the whole

@@ -7,7 +7,7 @@ from aiohttp.test_utils import TestClient, TestServer
 import web_catalog
 from alerts import AlertThrottle
 from newcomer import clamp_hours, window_active
-from captcha_image import CODE_LENGTH, OPTION_COUNT, build_captcha
+from captcha_image import CODE_LENGTH, OPTION_COUNT, build_captcha, stored_answer_index
 
 
 class CaptchaImageTests(unittest.TestCase):
@@ -176,3 +176,14 @@ class NewcomerWindowTests(unittest.TestCase):
         self.assertEqual(clamp_hours("abc"), 24.0)
         self.assertEqual(clamp_hours(-5), 0.0)
         self.assertEqual(clamp_hours(999), 168.0)
+
+class CaptchaAnswerIndexTests(unittest.TestCase):
+    def test_position_zero_is_a_valid_answer(self):
+        # Regression: `int(value or -1)` turned index 0 into -1, rejecting the
+        # correct button on one challenge in six.
+        self.assertEqual(stored_answer_index({"answer_index": 0}), 0)
+
+    def test_missing_or_garbage_falls_back_to_invalid(self):
+        self.assertEqual(stored_answer_index({}), -1)
+        self.assertEqual(stored_answer_index(None), -1)
+        self.assertEqual(stored_answer_index({"answer_index": "abc"}), -1)
