@@ -797,5 +797,74 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after["blocked"], 0)
         self.assertEqual(after["gone"], 1)
 
+    async def test_member_cursor_skips_new_uploads_and_delivered_files(self):
+        # Files are ordered newest first, so a fresh upload shifts everything
+        # down; the cursor must still point at the first unclaimed file.
+        stamps = [
+            ("k_old1", "2026-11-01T00:00:00+00:00"),
+            ("k_old2", "2026-11-02T00:00:00+00:00"),
+            ("k_old3", "2026-11-03T00:00:00+00:00"),
+        ]
+        async with self.db.connect() as conn:
+            await conn.execute(
+                "INSERT INTO categories(name, created_at) VALUES('测试目录', ?)",
+                (stamps[0][1],),
+            )
+            for key, stamp in stamps:
+                await conn.execute(
+                    "INSERT INTO files(file_key, owner_id, file_name, media_type, created_at, "
+                    "primary_message_id, backup_message_id, category) "
+                    "VALUES(?, 1, ?, 'document', ?, 1, 0, '测试目录')",
+                    (key, key, stamp),
+                )
+            # The member already received the newest file (k_old3).
+            await conn.execute(
+                "INSERT INTO user_history(user_id, file_key, accessed_at) VALUES(?, 'k_old3', ?)",
+                (555, stamps[2][1]),
+            )
+            await conn.commit()
+
+        cursor = await self.db.compute_member_cursor_from_history(
+            555, "member:share", "测试目录"
+        )
+        self.assertEqual(cursor, 1)
+
+        # A new upload lands at position 0 and pushes the rest down by one.
+        async with self.db.connect() as conn:
+            await conn.execute(
+                "INSERT INTO files(file_key, owner_id, file_name, media_type, created_at, "
+                "primary_message_id, backup_message_id, category) "
+                "VALUES('k_new', 1, 'k_new', 'document', '2026-11-20T00:00:00+00:00', 2, 0, '测试目录')"
+            )
+            await conn.commit()
+        shifted = await self.db.compute_member_cursor_from_history(
+            555, "member:share", "测试目录"
+        )
+        # New file is unclaimed and sits first, so delivery resumes exactly there
+        # instead of replaying already-received files.
+        self.assertEqual(shifted, 0)
+
+    async def test_member_cursor_treats_exhausted_failures_as_consumed(self):
+        async with self.db.connect() as conn:
+            await conn.execute(
+                "INSERT INTO categories(name, created_at) VALUES('坏文件目录', '2026-11-01T00:00:00+00:00')"
+            )
+            await conn.execute(
+                "INSERT INTO files(file_key, owner_id, file_name, media_type, created_at, "
+                "primary_message_id, backup_message_id, category) "
+                "VALUES('k_broken', 1, 'k_broken', 'document', '2026-11-01T00:00:00+00:00', 3, 0, '坏文件目录')"
+            )
+            await conn.execute(
+                "INSERT INTO delivery_failures(user_id, file_key, share_key, attempts, updated_at) "
+                "VALUES(666, 'k_broken', 'member:share', 3, '2026-11-02T00:00:00+00:00')"
+            )
+            await conn.commit()
+
+        cursor = await self.db.compute_member_cursor_from_history(
+            666, "member:share", "坏文件目录", max_attempts=3
+        )
+        # Nothing deliverable left in this folder: the cursor sits at the end.
+        self.assertEqual(cursor, 1)
+
 if __name__ == "__main__":
     unittest.main()

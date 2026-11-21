@@ -1610,6 +1610,52 @@ class Database:
             )
             await db.commit()
 
+    async def compute_member_cursor_from_history(
+        self, user_id, share_key, category, max_attempts=3
+    ) -> int:
+        """Position of the first file in this folder the member has not received.
+
+        The stored cursor is positional, but new uploads shift every position,
+        so it is recomputed from delivery history on each claim. Files that
+        already burned every delivery attempt count as consumed, otherwise the
+        cursor would keep rewinding onto them.
+        """
+        async with self.connect() as db:
+            row = await (await db.execute("""
+                WITH ordered AS (
+                    SELECT f.file_key,
+                           ROW_NUMBER() OVER (
+                               ORDER BY
+                                   COALESCE(
+                                       (SELECT MAX(g.created_at) FROM files g
+                                        WHERE g.album_group_id=f.album_group_id),
+                                       f.created_at
+                                   ) DESC,
+                                   CASE WHEN f.album_group_id IS NOT NULL
+                                        THEN f.album_position ELSE 0 END,
+                                   f.file_key
+                           ) - 1 AS position
+                    FROM files f
+                    WHERE f.category=?
+                ),
+                open_slots AS (
+                    SELECT o.position
+                    FROM ordered o
+                    LEFT JOIN user_history h
+                      ON h.user_id=? AND h.file_key=o.file_key
+                    LEFT JOIN delivery_failures df
+                      ON df.user_id=? AND df.share_key=? AND df.file_key=o.file_key
+                    WHERE h.file_key IS NULL
+                      AND COALESCE(df.attempts, 0) < ?
+                )
+                SELECT COALESCE(
+                    (SELECT MIN(position) FROM open_slots),
+                    (SELECT COUNT(*) FROM ordered),
+                    0
+                ) AS next_offset
+            """, (str(category), int(user_id), int(user_id), str(share_key), int(max_attempts)))).fetchone()
+        return max(0, int(row["next_offset"] or 0))
+
     async def repair_category_delivery_progress_from_history(
         self, user_id: int, share_key: str, category: str
     ) -> int:

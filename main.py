@@ -6723,10 +6723,13 @@ async def user_catalog_callback_handler(client, query):
             # Older releases advanced this cursor even when Telegram rejected a
             # copy. Repair each existing member/folder cursor once from successful
             # delivery history, without deleting that history or resetting users.
-            if saved_offset > 0:
-                saved_offset = await db.repair_category_delivery_progress_from_history(
-                    user.id, member_progress_key, category["name"]
-                )
+            # Positions shift down whenever new resources are published, so a
+            # stored cursor can land on files the member already received.
+            # Recompute it from delivery history on every claim.
+            saved_offset = await db.compute_member_cursor_from_history(
+                user.id, member_progress_key, category["name"],
+                max_attempts=DELIVERY_MAX_ATTEMPTS,
+            )
 
             # A completed member/folder cursor restarts only after the member
             # taps 「✅ 重新领取」, so one stray tap cannot resend the whole
