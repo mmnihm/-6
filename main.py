@@ -608,6 +608,20 @@ DEFAULT_WELCOME_MESSAGE = (
 )
 
 
+WELCOME_AUTO_DELETE_KEY = "welcome_auto_delete_seconds"
+WELCOME_AUTO_DELETE_ALLOWED = (0, 300, 1800, 3600, 86400)
+
+
+async def get_welcome_delete_seconds():
+    """Auto-delete delay for the group welcome message; 0 keeps it forever."""
+    raw = await db.get_setting(WELCOME_AUTO_DELETE_KEY)
+    try:
+        seconds = int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        return 0
+    return seconds if seconds in WELCOME_AUTO_DELETE_ALLOWED else 0
+
+
 async def get_welcome_settings():
     """Return (enabled, template) for the group welcome message.
 
@@ -654,9 +668,12 @@ async def render_captcha_admin(message, notice=""):
 
 async def render_welcome_admin(message, notice=""):
     enabled, template = await get_welcome_settings()
+    delete_after = await get_welcome_delete_seconds()
+    delete_labels = {0: "不删除", 300: "5 分钟", 1800: "30 分钟", 3600: "1 小时", 86400: "24 小时"}
     body = (
         "👋 进群欢迎设置\n\n"
-        f"当前状态：{'开启' if enabled else '关闭'}\n\n"
+        f"当前状态：{'开启' if enabled else '关闭'}\n"
+        f"欢迎语自动删除：{delete_labels.get(delete_after, '不删除')}\n\n"
         f"当前文案：\n{template}\n"
     )
     if notice:
@@ -666,8 +683,13 @@ async def render_welcome_admin(message, notice=""):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(f"{'✅' if enabled else '⏸'} 自动欢迎开关", callback_data="mc:welcome:toggle"),
              InlineKeyboardButton("✏️ 修改文案", callback_data="mc:welcome:edit")],
-            [InlineKeyboardButton("♻️ 恢复默认文案", callback_data="mc:welcome:reset"),
-             InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")],
+            [InlineKeyboardButton("不删除", callback_data="mc:welcome:del:0"),
+             InlineKeyboardButton("5 分钟后删", callback_data="mc:welcome:del:300")],
+            [InlineKeyboardButton("30 分钟", callback_data="mc:welcome:del:1800"),
+             InlineKeyboardButton("1 小时", callback_data="mc:welcome:del:3600")],
+            [InlineKeyboardButton("24 小时", callback_data="mc:welcome:del:86400"),
+             InlineKeyboardButton("♻️ 恢复默认文案", callback_data="mc:welcome:reset")],
+            [InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")],
         ]),
     )
 
@@ -4672,12 +4694,31 @@ async def welcome_new_members_handler(client, message):
 
     bot_url = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
     text = render_welcome_message(template, names, bot_url)
+    sent = None
     try:
-        await message.reply_text(
+        sent = await message.reply_text(
             text, parse_mode=None, disable_web_page_preview=True
         )
     except Exception:
         log.exception("Could not send welcome message to group %s", group_id)
+        return
+
+    # The greeting is only meant to catch the newcomer's eye; keeping dozens of
+    # them in the group history makes the member list unreadable.
+    delete_after = await get_welcome_delete_seconds()
+    if not delete_after or sent is None or not getattr(sent, "message_id", None):
+        return
+    delete_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=delete_after)
+    ).isoformat()
+    try:
+        await db.add_pending_deletions(group_id, [sent.message_id], delete_at)
+    except Exception:
+        log.exception("Could not persist welcome auto-deletion: group=%s", group_id)
+    spawn_background(
+        "welcome-delete",
+        _delete_later(client, group_id, [sent.message_id], delete_at),
+    )
 
 
 @app.on_message(filters.group & filters.command("bindgroup"))
@@ -7290,6 +7331,16 @@ async def admin_callback_handler(client, query):
             enabled, _ = await get_welcome_settings()
             await db.set_setting(WELCOME_ENABLED_KEY, "0" if enabled else "1")
             notice = "✅ 已切换自动欢迎开关。"
+        elif op == "del":
+            try:
+                seconds = int(parts[2]) if len(parts) > 2 else -1
+            except ValueError:
+                seconds = -1
+            if seconds not in WELCOME_AUTO_DELETE_ALLOWED:
+                await query.answer("无效的删除时间", show_alert=True)
+                return
+            await db.set_setting(WELCOME_AUTO_DELETE_KEY, str(seconds))
+            notice = "✅ 已改为不自动删除。" if seconds == 0 else "✅ 欢迎语将按新时间自动删除。"
         elif op == "reset":
             await db.set_setting(WELCOME_MESSAGE_KEY, "")
             notice = "♻️ 已恢复默认欢迎文案。"
