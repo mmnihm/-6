@@ -1287,12 +1287,16 @@ async def handle_captcha_choice(client, query):
     except (TypeError, ValueError, json.JSONDecodeError):
         challenge = {}
     if not challenge or float(challenge.get("expires_at", 0) or 0) <= now:
+        await query.answer("验证码已过期，正在发送新的一张。", show_alert=True)
         try:
             await message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await send_captcha_challenge(client, user.id)
-        await query.answer("验证码已过期，已发送新验证码。", show_alert=True)
+        try:
+            await send_captcha_challenge(client, user.id)
+        except Exception:
+            log.exception("Could not resend expired CAPTCHA: user=%s", user.id)
+            await message.reply_text("⚠️ 新验证码发送失败，请稍后重新发送 /start。")
         return
 
     options = challenge.get("options") or []
@@ -1317,11 +1321,29 @@ async def handle_captcha_choice(client, query):
             await query.answer("连续错误 5 次，已限制 15 分钟。", show_alert=True)
             await message.reply_text("⛔ 验证失败次数过多，请 15 分钟后再试。")
             return
-        await send_captcha_challenge(
-            client, user.id, attempts=attempts,
-            notice=f"❌ 没有选中图片上的数字，还可尝试 {CAPTCHA_MAX_ATTEMPTS - attempts} 次。",
+        remaining = max(0, CAPTCHA_MAX_ATTEMPTS - attempts)
+        # Answer the tap before regenerating the image: the click must get
+        # feedback immediately even if the new CAPTCHA takes a second.
+        await query.answer(
+            f"❌ 选错了，还可以再试 {remaining} 次。已发一张新的验证码。",
+            show_alert=True,
         )
-        await query.answer("选择不正确，已更换验证码。", show_alert=True)
+        try:
+            await send_captcha_challenge(
+                client, user.id, attempts=attempts,
+                notice=(
+                    f"❌ 刚才那组不对。请看这张新图，点数字完全一致的那一组"
+                    f"（还剩 {remaining} 次机会）。"
+                ),
+            )
+        except Exception:
+            log.exception(
+                "Could not regenerate CAPTCHA after a wrong choice: user=%s", user.id
+            )
+            await message.reply_text(
+                f"❌ 选错了，还可以再试 {remaining} 次。\n"
+                "新验证码生成失败，请稍后重新发送 /start。"
+            )
         return
 
     await db.set_setting(
@@ -1445,7 +1467,16 @@ async def captcha_private_callback_middleware(client, query):
     user = query.from_user
     message = query.message
     if query.data and str(query.data).startswith("captcha_pick:"):
-        await handle_captcha_choice(client, query)
+        try:
+            await handle_captcha_choice(client, query)
+        except StopPropagation:
+            raise
+        except Exception:
+            log.exception("CAPTCHA choice handling failed")
+            try:
+                await query.answer("验证时出错了，请重新发送 /start 再试。", show_alert=True)
+            except Exception:
+                log.debug("Could not answer failed CAPTCHA tap", exc_info=True)
         raise StopPropagation
     if (
         not user or user.is_bot or not message or message.chat.type != ChatType.PRIVATE
