@@ -2575,7 +2575,7 @@ async def send_catalog_batch(
     client, user_id, share_key, offset, batch, track_progress=True, ignore_history=False
 ):
     """Send complete media units and advance folder progress only over successful items."""
-    sent = failed = skipped = 0
+    sent = failed = skipped = already = 0
     next_offset = offset
     last_sent_message_id = None
     storage = await get_storage_channels()
@@ -2690,6 +2690,7 @@ async def send_catalog_batch(
             if (is_album and all(key in delivered_keys for key in unit_keys)) or (
                 not is_album and unit_keys[0] in delivered_keys
             ):
+                already += len(unit)
                 completed.update(entry[0] for entry in unit)
                 await advance_progress()
                 continue
@@ -2858,7 +2859,7 @@ async def send_catalog_batch(
                 user_id, unit[0][1]["album_group_id"], len(unit), attempts,
             )
             await flush_batch_writes()
-            return sent, failed, skipped, next_offset, last_sent_message_id
+            return sent, failed, skipped, already, next_offset, last_sent_message_id
 
         # Only genuine single files use the individual copy path.
         for entry in unit:
@@ -2897,10 +2898,10 @@ async def send_catalog_batch(
                     item["file_key"], error_text,
                 )
                 await flush_batch_writes()
-                return sent, failed, skipped, next_offset, last_sent_message_id
+                return sent, failed, skipped, already, next_offset, last_sent_message_id
 
     await flush_batch_writes()
-    return sent, failed, skipped, next_offset, last_sent_message_id
+    return sent, failed, skipped, already, next_offset, last_sent_message_id
 
 
 @app.on_message(filters.private & filters.command("start"))
@@ -6230,7 +6231,7 @@ async def user_catalog_callback_handler(client, query):
             if pace:
                 await message.reply_text(pace)
                 return
-            sent, failed, skipped, _, _last_sent_message_id = await send_catalog_batch(
+            sent, failed, skipped, _already, _, _last_sent_message_id = await send_catalog_batch(
                 client, user.id, "random", 0, rows, track_progress=False
             )
             summary = f"🎲 随机发送完成：成功 {sent}/{len(rows)} 个文件。"
@@ -6626,6 +6627,70 @@ async def user_catalog_callback_handler(client, query):
         )
         return
 
+    if action[1] == "resend" and len(action) == 4:
+        # Explicitly re-send a batch that was skipped as "already delivered".
+        # Progress is left untouched: this must never move the folder cursor.
+        share_key = action[2]
+        try:
+            start = max(0, int(action[3]))
+        except ValueError:
+            await query.answer("参数无效，请重新打开目录。")
+            return
+        now = asyncio.get_running_loop().time()
+        remaining = 5.0 - (now - float(last_getfolder_click_at.get(int(user.id), 0.0)))
+        if remaining > 0:
+            await query.answer(f"⏳ 操作太快，请 {remaining:.1f} 秒后再试。", show_alert=True)
+            return
+        last_getfolder_click_at[int(user.id)] = now
+        category = await db.get_category_by_share_key(share_key)
+        if not category:
+            await query.answer("文件夹不存在或已被移除。", show_alert=True)
+            return
+        if not await has_access(user.id, force_refresh=True):
+            await query.answer("⛔ 请先加入管理员指定的会员群后再获取资源。", show_alert=True)
+            return
+        pace = None if await is_admin(user.id) else delivery_pace_hint(user.id)
+        if pace:
+            await query.answer(pace, show_alert=True)
+            return
+        delivery_key = (int(user.id), str(share_key))
+        if delivery_key in category_delivery_in_progress:
+            await query.answer("⏳ 这一批资源正在发送，请稍候。", show_alert=True)
+            return
+        category_delivery_in_progress.add(delivery_key)
+        try:
+            batch = await db.list_category_files(
+                category["name"], limit=20, offset=start
+            )
+            batch = await db.complete_album_groups(batch)
+            if not batch:
+                await query.answer("这个位置已经没有资源了。", show_alert=True)
+                return
+            await query.answer("开始重新发送…")
+            sent, failed, skipped, _already, _next, _last = await send_catalog_batch(
+                client, user.id, f"member:{share_key}", start, batch,
+                track_progress=False, ignore_history=True,
+            )
+            lines = ["🔁 重新发送完成\n", f"✅ 成功发送：{sent} 个"]
+            if failed:
+                lines.append(f"❌ 发送失败：{failed} 个（可稍后重试）")
+            if skipped:
+                lines.append(f"⚠️ 多次失败已跳过：{skipped} 个")
+            lines.append("\n领取进度没有变化，可以继续领取后面的资源。")
+            try:
+                await client.send_message(user.id, "\n".join(lines))
+            except Exception:
+                log.exception("Could not send resend summary: user=%s", user.id)
+        except Exception:
+            log.exception("Resend batch failed: user=%s share_key=%s", user.id, share_key)
+            try:
+                await query.answer("重新发送时出错，请稍后再试。", show_alert=True)
+            except Exception:
+                pass
+        finally:
+            category_delivery_in_progress.discard(delivery_key)
+        return
+
     if (action[1] == "getfolder" and len(action) == 4) or (
         action[1] == "reget" and len(action) == 3
     ):
@@ -6709,7 +6774,7 @@ async def user_catalog_callback_handler(client, query):
                 if pace:
                     await message.reply_text(pace)
                     return
-                sent, failed, skipped, next_offset, last_sent_message_id = await send_catalog_batch(
+                sent, failed, skipped, already, next_offset, last_sent_message_id = await send_catalog_batch(
                     client, user.id, member_progress_key, offset, batch,
                     ignore_history=repeat_delivery,
                 )
@@ -6723,21 +6788,36 @@ async def user_catalog_callback_handler(client, query):
                         ))
                     except Exception:
                         log.exception("Could not probe folder tail: share_key=%s", share_key)
+                # Never claim success when nothing was actually delivered.
+                if sent:
+                    header = "📦 本批资源发送完成！"
+                elif already and not failed:
+                    header = "ℹ️ 本批没有重复发送"
+                else:
+                    header = "⚠️ 本批没有文件成功发出"
                 lines = [
-                    "📦 本批资源发送完成！\n",
+                    header + "\n",
                     f"📁 目录：{category['name']}",
                     f"📥 本批处理：{len(batch)} 个",
                     f"✅ 成功发送：{sent} 个",
                 ]
                 if failed:
                     lines.append(f"❌ 发送失败：{failed} 个（已保留，下次继续尝试）")
+                if already:
+                    lines.append(f"⏭ 之前已领过、未重复发送：{already} 个")
                 if skipped:
-                    lines.append(f"⏭ 暂时无法取回、已跳过：{skipped} 个")
+                    lines.append(f"⚠️ 多次失败已跳过：{skipped} 个")
                 lines.append(f"📊 领取进度：{next_offset}/{max(total, next_offset)}")
-                lines.append(
-                    "\n还有资源，点击下方按钮继续领取（单文件每批20个，相册整组）。"
-                    if has_more else "\n🎉 该目录资源已全部领取完毕。"
-                )
+                if already and not sent and not failed:
+                    lines.append(
+                        "\n上面这些资源你之前已经领取过，机器人不会重复发送，"
+                        "所以这一批没有文件。确实要再拿一次，点下方「🔁 重新发送本批」。"
+                    )
+                else:
+                    lines.append(
+                        "\n还有资源，点击下方按钮继续领取（单文件每批20个，相册整组）。"
+                        if has_more else "\n🎉 该目录资源已全部领取完毕。"
+                    )
                 text_result = "\n".join(lines) + "\n"
             except Exception as exc:
                 log.exception(
@@ -6756,6 +6836,11 @@ async def user_catalog_callback_handler(client, query):
                 )
 
             button_rows = []
+            if already and not sent:
+                button_rows.append([InlineKeyboardButton(
+                    "🔁 重新发送本批",
+                    callback_data=f"uc:resend:{share_key}:{offset}",
+                )])
             if has_more:
                 button_rows.append([InlineKeyboardButton(
                     "📥 继续领取（单文件20个，相册整组）",
@@ -7642,7 +7727,7 @@ async def admin_callback_handler(client, query):
                 f"📥 正在发送「{row['category']}」资源（单文件每批20个，相册整组）…"
             )
             try:
-                sent, failed, skipped, next_offset, _last_sent_message_id = await send_catalog_batch(
+                sent, failed, skipped, _already, next_offset, _last_sent_message_id = await send_catalog_batch(
                     client, user.id, f"admin:{share_key}", offset, batch,
                     track_progress=False,
                 )
