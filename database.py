@@ -7,7 +7,6 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 
-import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from datetime import datetime, timezone, timedelta

@@ -3,22 +3,20 @@ import json
 import aiohttp
 import logging
 import os
-import re
 import secrets
 import time
 from datetime import datetime, timezone, timedelta
 
 from aiohttp import web
 
-from pyrogram import Client, filters, raw, utils, StopPropagation
+from pyrogram import Client, filters, StopPropagation
 from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio,
     KeyboardButton, ReplyKeyboardMarkup, BotCommand,
 )
 from pyrogram.enums import ChatAction, ChatMemberStatus, ChatType
 from pyrogram.errors import (
-    FloodWait, PeerIdInvalid, UserNotParticipant, SessionPasswordNeeded,
+    FloodWait, SessionPasswordNeeded,
 )
 
 import config
