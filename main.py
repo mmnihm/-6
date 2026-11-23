@@ -3846,7 +3846,7 @@ async def settings_retention_worker():
 
 async def backup_retry_worker(client):
     """Resume durable jobs and queue Cangku singles/albums only while idle."""
-    global last_user_activity, backup_retry_manual_requested, scan_task
+    global backup_retry_manual_requested, scan_task
     consecutive_cycle_failures = 0
     while True:
         try:
