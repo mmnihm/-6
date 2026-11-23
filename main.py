@@ -23,6 +23,7 @@ import config
 from alerts import AlertThrottle
 from captcha_image import stored_answer_index
 from newcomer import DEFAULT_HOURS, clamp_hours, window_active
+from upload_report import add_failure, render_failures
 from database import Database, clean_file_name
 from web_catalog import create_catalog_app
 
@@ -62,6 +63,9 @@ pending_upload_tasks = {}
 upload_finish_in_progress = set()
 upload_copy_semaphore = asyncio.Semaphore(2)
 upload_received_counts = {}
+# Per-admin upload failures collected during the current batch; surfaced in the
+# finish summary and cleared once the batch is published or canceled.
+upload_failures = {}
 pending_upload_confirmation_tasks = {}
 upload_confirmation_messages = {}
 upload_latest_messages = {}
@@ -376,6 +380,13 @@ def track_upload_task(user_id, task):
             log.error("Background upload task failed for user %s: %s", uid, error, exc_info=(type(error), error, error.__traceback__))
     task.add_done_callback(_finished)
     return task
+
+
+def record_upload_failure(uid, name, step, error):
+    """Keep a bounded record of one file/album that failed to land in this batch."""
+    if uid is None:
+        return
+    add_failure(upload_failures.setdefault(int(uid), []), name, step, error)
 
 async def _show_upload_confirmation_after_idle(client, user_id):
     uid = int(user_id)
@@ -3069,6 +3080,10 @@ async def _flush_album_upload(client, key):
             "user=%s chat=%s group=%s",
             key[0], key[1], key[2],
         )
+        record_upload_failure(
+            key[0], f"相册（{len(queued)} 个）", "相册完整性校验",
+            "Telegram 未能确认整组相册完整",
+        )
         try:
             await anchor.reply_text(
                 "⚠️ Telegram 未能确认这组相册完整，暂未入库。请重新发送整组相册。"
@@ -3092,6 +3107,10 @@ async def _flush_album_upload(client, key):
         log.error(
             "Refusing to split incomplete album: user=%s chat=%s group=%s received=%s",
             key[0], key[1], key[2], len(messages),
+        )
+        record_upload_failure(
+            key[0], f"相册（{len(messages)} 个）", "相册完整性校验",
+            "相册成员不完整，拒绝拆分入库",
         )
         try:
             await anchor.reply_text(
@@ -3253,6 +3272,11 @@ async def _flush_album_upload(client, key):
             )
     except Exception as exc:
         log.exception("Grouped album upload failed for user %s", user.id)
+        duplicate = "相册中存在已入库的重复文件" in str(exc)
+        record_upload_failure(
+            user.id, f"相册（{len(messages)} 个）",
+            "重复去重" if duplicate else "相册入库", exc,
+        )
         if status is not None:
             try:
                 if "相册中存在已入库的重复文件" in str(exc):
@@ -4487,6 +4511,7 @@ async def _upload_single_handler(client, message):
             )
     except Exception as exc:
         log.exception("Upload/store failed at step: %s", step)
+        record_upload_failure(user.id, file_name, step, exc)
         # Never delete a successfully stored channel copy on a later-stage error.
         detail = f"{type(exc).__name__}: {str(exc)[:350]}"
         if status is not None:
@@ -4812,6 +4837,7 @@ async def cancel_upload_category_handler(client, message):
         await reply_admin_only(message)
         return
     selected = pending_upload_categories.pop(user.id, None)
+    upload_failures.pop(user.id, None)
     await message.reply_text(
         f"✅ 已取消目录选择（原目录：{selected}）。后续上传将按文件说明自动分类。"
         if selected else "当前没有选择上传目录。"
@@ -4961,6 +4987,7 @@ async def scanner_login_input_handler(client, message):
                 return
             if result.get("category") and int(result.get("published", 0)) > 0:
                 await notify_folder_subscribers(client, result["category"], "new_resources")
+            failure_suffix = render_failures(upload_failures.get(uid))
             upload_received_counts.pop(uid, None)
             upload_progress_state.pop(uid, None)
             pending_upload_categories.pop(uid, None)
@@ -4968,6 +4995,7 @@ async def scanner_login_input_handler(client, message):
             upload_status_messages.pop(uid, None)
             upload_confirmation_messages.pop(uid, None)
             upload_latest_messages.pop(uid, None)
+            upload_failures.pop(uid, None)
             if result.get("category") is None:
                 completion_text = "目前没有待发布的上传批次。"
             else:
@@ -4977,6 +5005,7 @@ async def scanner_login_input_handler(client, message):
                     f"📦 成功入库：{published} 个文件"
                     + (f"\n⚠️ 未成功入库：{max(0, received_count - published)} 个，请检查部署日志。" if received_count > published else "")
                 )
+            completion_text += failure_suffix
             await status.reply_text(completion_text, reply_markup=admin_home_keyboard())
         finally:
             upload_finish_in_progress.discard(uid)
@@ -7047,7 +7076,8 @@ async def render_backup_admin(message, notice=""):
          InlineKeyboardButton("⏯️ 继续上次", callback_data="mc:backupcontinue")],
         [InlineKeyboardButton("⏸ 暂停备份", callback_data="mc:backuppause"),
          InlineKeyboardButton("📊 刷新进度", callback_data="mc:backuprefresh")],
-        [InlineKeyboardButton("⚡ 立即执行一轮", callback_data="mc:backuprun"),
+        [InlineKeyboardButton("⚡ 立即执行一轮", callback_data="mc:backuprun")],
+        [InlineKeyboardButton("📋 失败清单", callback_data="mc:backupfailures"),
          InlineKeyboardButton("⬅️ 返回管理面板", callback_data="mc:home")],
     ])
     await message.edit_text(body, reply_markup=keyboard)
@@ -7156,6 +7186,7 @@ async def admin_callback_handler(client, query):
 
             if result.get("category") and int(result.get("published", 0)) > 0:
                 await notify_folder_subscribers(client, result["category"], "new_resources")
+            failure_suffix = render_failures(upload_failures.get(uid))
             upload_received_counts.pop(uid, None)
             upload_progress_state.pop(uid, None)
             pending_upload_categories.pop(uid, None)
@@ -7163,6 +7194,7 @@ async def admin_callback_handler(client, query):
             upload_status_messages.pop(uid, None)
             upload_confirmation_messages.pop(uid, None)
             upload_latest_messages.pop(uid, None)
+            upload_failures.pop(uid, None)
 
             if result.get("category") is None:
                 completion_text = "目前没有待发布的上传批次。"
@@ -7173,6 +7205,7 @@ async def admin_callback_handler(client, query):
                     f"📦 成功入库：{published} 个文件"
                     + (f"\n⚠️ 未成功入库：{max(0, received_count - published)} 个，请检查部署日志。" if received_count > published else "")
                 )
+            completion_text += failure_suffix
             try:
                 await message.edit_text(completion_text, reply_markup=None)
             except Exception as exc:
@@ -7186,6 +7219,25 @@ async def admin_callback_handler(client, query):
         return
     if action == "backup":
         await render_backup_admin(message)
+    elif action == "backupfailures":
+        failures = await db.list_backup_failures(limit=20)
+        if not failures:
+            body = "📋 备份失败清单\n\n当前没有超过重试次数的失败文件。"
+        else:
+            lines = ["📋 备份失败清单（最近 20 条）", "━━━━━━━━━━━━━━"]
+            for row in failures:
+                name = str(row["file_name"] or "未命名资源")[:40]
+                category = str(row["category"] or "未分类")
+                error = str(row["last_error"] or "")[:80]
+                failed_at = format_cn_datetime(row["failed_at"])
+                lines.append(f"• {name}\n　📂 {category}　🕐 {failed_at}\n　⚠️ {error}")
+            body = "\n\n".join(lines)
+        await message.edit_text(
+            body,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ 返回备份管理", callback_data="mc:backup")]
+            ]),
+        )
     elif action in ("backuprefresh", "backupenable", "backuppause", "backuprun", "backupstart", "backupcontinue"):
         global backup_retry_manual_requested, last_user_activity
         if action == "backupstart":

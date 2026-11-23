@@ -8,6 +8,7 @@ import web_catalog
 from alerts import AlertThrottle
 from newcomer import clamp_hours, window_active
 from captcha_image import CODE_LENGTH, OPTION_COUNT, build_captcha, stored_answer_index
+from upload_report import add_failure, render_failures
 
 
 class CaptchaImageTests(unittest.TestCase):
@@ -187,3 +188,30 @@ class CaptchaAnswerIndexTests(unittest.TestCase):
         self.assertEqual(stored_answer_index({}), -1)
         self.assertEqual(stored_answer_index(None), -1)
         self.assertEqual(stored_answer_index({"answer_index": "abc"}), -1)
+
+
+class UploadReportTests(unittest.TestCase):
+    def test_empty_bucket_renders_empty_suffix(self):
+        self.assertEqual(render_failures([]), "")
+        self.assertEqual(render_failures(None), "")
+
+    def test_recorded_failure_is_rendered_with_step_and_error(self):
+        bucket = []
+        add_failure(bucket, "资料.zip", "保存主频道", "Telegram 500: boom")
+        text = render_failures(bucket)
+        self.assertIn("资料.zip", text)
+        self.assertIn("保存主频道", text)
+        self.assertIn("boom", text)
+
+    def test_bucket_is_bounded_and_render_truncation_note(self):
+        bucket = []
+        for index in range(10):
+            add_failure(bucket, f"file{index}.zip", "步骤", "错误", cap=6)
+        self.assertEqual(len(bucket), 6)
+        text = render_failures(bucket, limit=2)
+        self.assertIn("其余 4 条", text)
+
+    def test_missing_name_falls_back_to_placeholder(self):
+        bucket = []
+        add_failure(bucket, None, "", None)
+        self.assertIn("未命名文件", render_failures(bucket))
