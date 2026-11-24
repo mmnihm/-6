@@ -473,10 +473,10 @@ async def update_admin_upload_progress(message, user_id, category, increment=1, 
 
 
 async def admin_home_text():
-    users, files, _, _ = await db.stats()
-    activity = await db.activity_stats()
-    categories = await db.list_categories()
-    catalog = await db.catalog_stats()
+    stats_row, activity, categories, catalog = await asyncio.gather(
+        db.stats(), db.activity_stats(), db.list_categories(), db.catalog_stats()
+    )
+    users, files, _, _ = stats_row
     album_groups = sum(int(row["album_count"] or 0) for row in categories)
     return (
         "⚙️ 资源管理中心\n"
@@ -8554,10 +8554,12 @@ async def main():
     try:
         # Keep database initialization inside the cleanup scope. A migration
         # error must not leave AsyncConnectionPool worker tasks behind.
+        boot_t0 = time.monotonic()
         await db.initialize()
         log.info(
-            "Database backend: %s",
+            "Database backend: %s (%.1fs)",
             "PostgreSQL" if db.uses_postgres else "SQLite (local fallback)",
+            time.monotonic() - boot_t0,
         )
 
         # Restore the scanner from the database-backed session string. This is
@@ -8607,8 +8609,35 @@ async def main():
             scanner = None
             log.warning("No persistent scanner session found; admin must use /scanlogin")
 
-        await app.start()
+        # Cold-start handshake: a first-hit 500/network blip must not exit the
+        # process and trigger a platform restart loop. Retry a bounded number
+        # of times with a short backoff before giving up.
+        handshake_attempts = 3
+        last_start_error = None
+        for attempt in range(1, handshake_attempts + 1):
+            attempt_t0 = time.monotonic()
+            try:
+                await app.start()
+                last_start_error = None
+                break
+            except Exception as start_exc:
+                last_start_error = start_exc
+                log.warning(
+                    "Telegram handshake attempt %s/%s failed (%.1fs): %s",
+                    attempt, handshake_attempts,
+                    time.monotonic() - attempt_t0, type(start_exc).__name__,
+                )
+                if app.is_connected:
+                    try:
+                        await app.disconnect()
+                    except Exception:
+                        log.exception("Could not disconnect after failed handshake")
+                if attempt < handshake_attempts:
+                    await asyncio.sleep(3)
+        if last_start_error is not None:
+            raise last_start_error
         app_started = True
+        log.info("Telegram handshake completed (%.1fs)", time.monotonic() - attempt_t0)
         # Publish the Telegram chat command menu for all users.
         # /admin remains protected by the existing is_admin() check.
         await app.set_bot_commands([
