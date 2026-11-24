@@ -5167,12 +5167,16 @@ async def scanner_login_input_handler(client, message):
         phone = value.replace(" ", "").replace("-", "")
         try:
             sent = await login_client.send_code(phone)
-            delivery_type = type(getattr(sent, "type", None)).__name__
-            next_delivery_type = type(getattr(sent, "next_type", None)).__name__
+            delivery_type = getattr(sent.type, "name", str(sent.type))
+            next_delivery_type = (
+                getattr(sent.next_type, "name", str(sent.next_type))
+                if sent.next_type else None
+            )
             log.info(
-                "Scanner login code request accepted by Telegram: delivery_type=%s next_delivery_type=%s",
+                "Scanner login code request accepted by Telegram: delivery_type=%s next_delivery_type=%s timeout=%s",
                 delivery_type,
                 next_delivery_type,
+                getattr(sent, "timeout", None),
             )
             state.update({
                 "step": "code",
@@ -5181,14 +5185,39 @@ async def scanner_login_input_handler(client, message):
                 "delivery_type": delivery_type,
                 "next_delivery_type": next_delivery_type,
             })
+            if delivery_type == "APP":
+                delivery_instruction = (
+                    "📲 请打开你这个手机号已登录的 Telegram 官方应用，"
+                    "查看服务通知账号 777000 发来的登录验证码。"
+                    "验证码不会发送到当前机器人聊天中。"
+                )
+            elif delivery_type == "SMS":
+                delivery_instruction = "📩 请查看该手机号收到的短信验证码。"
+            elif delivery_type == "EMAIL_CODE":
+                delivery_instruction = "📧 请查看 Telegram 指定邮箱收到的验证码。"
+            elif delivery_type == "CALL":
+                delivery_instruction = "📞 请留意 Telegram 发起的语音来电，并按语音提示获取验证码。"
+            elif delivery_type == "FLASH_CALL":
+                delivery_instruction = "📞 请留意 Telegram 的闪呼验证来电，按 Telegram 的验证要求操作。"
+            elif delivery_type == "MISSED_CALL":
+                delivery_instruction = "📞 请留意 Telegram 的未接来电验证，按 Telegram 的验证要求操作。"
+            elif delivery_type == "FRAGMENT_SMS":
+                delivery_instruction = "📩 Telegram 指定了 Fragment 短信验证，请按 Telegram 页面提示完成验证。"
+            else:
+                delivery_instruction = "请按 Telegram 指定的方式查看验证码。"
             await message.reply_text(
                 "📩 Telegram 已接受验证码请求。\n"
                 f"当前发送方式：{delivery_type}\n"
                 + (
                     f"备用发送方式：{next_delivery_type}\n"
-                    if next_delivery_type != "NoneType" else ""
+                    if next_delivery_type else ""
                 )
-                + "请按 Telegram 指定的方式查看验证码；如果没有收到，先不要重复请求，把这里显示的发送方式告诉管理员。"
+                + delivery_instruction
+                + (
+                    f"\n如需等待，请按 Telegram 提示；重试等待时间：{sent.timeout} 秒。"
+                    if getattr(sent, "timeout", None) is not None else ""
+                )
+                + "\n如果没有收到，请先不要重复申请验证码。"
             )
         except Exception:
             log.exception("Could not request scanner login code")
