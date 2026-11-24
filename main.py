@@ -4861,7 +4861,7 @@ async def scanner_login_status_handler(client, message):
     if state.get("step") == "code" and not next_delivery:
         lines.append("Telegram 暂未提供备用发送方式，不能强制切换成短信。")
     lines.append("收到验证码后直接发到当前机器人私聊。")
-    await message.reply_text("\\n".join(lines))
+    await message.reply_text("\n".join(lines))
 
 
 @app.on_message(filters.private & filters.command("scanresend"))
@@ -4915,9 +4915,9 @@ async def scanner_login_resend_handler(client, message):
             delivery_type, next_type, getattr(sent, "timeout", None),
         )
         await message.reply_text(
-            f"📩 Telegram 已处理备用验证码请求。\\n当前发送方式：{delivery_type}"
-            + (f"\\n下一备用方式：{next_type}" if next_type else "")
-            + "\\n请按这个方式查收验证码，收到后直接发送到当前机器人私聊。"
+            f"📩 Telegram 已处理备用验证码请求。\n当前发送方式：{delivery_type}"
+            + (f"\n下一备用方式：{next_type}" if next_type else "")
+            + "\n请按这个方式查收验证码，收到后直接发送到当前机器人私聊。"
         )
     except Exception as exc:
         log.exception("Could not resend scanner login code")
