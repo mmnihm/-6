@@ -8619,9 +8619,12 @@ async def main():
             timeout=aiohttp.ClientTimeout(total=12, connect=5, sock_read=10)
         )
         await resume_pending_deletions(app)
-        await startup_self_check(app)
 
-        if scanner is not None:
+        async def _connect_scanner():
+            global scanner
+            nonlocal scanner_started
+            if scanner is None:
+                return
             try:
                 await scanner.start()
                 scanner_started = True
@@ -8635,11 +8638,18 @@ async def main():
                 )
                 if scanner_started:
                     try:
-                        await scanner.stop()
+                        if scanner.is_connected:
+                            await scanner.stop()
                     except Exception:
                         log.exception("Could not stop failed history scanner session")
                     scanner_started = False
                 scanner = None
+
+        # Channel-permission self-check and scanner login are not required
+        # before the bot can answer messages. Run them in the background so
+        # the first /start is not blocked on extra Telegram round trips.
+        spawn_background("startup-self-check", startup_self_check(app))
+        spawn_background("scanner-connect", _connect_scanner())
 
         last_user_activity = asyncio.get_running_loop().time()
         me = await app.get_me()
