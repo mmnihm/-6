@@ -4,6 +4,7 @@ import aiohttp
 import logging
 import os
 import secrets
+import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -1084,6 +1085,21 @@ SCANNER_WORKDIR = os.path.dirname(config.DATABASE_PATH) or "."
 os.makedirs(SCANNER_WORKDIR, exist_ok=True)
 SCANNER_SESSION_PATH = os.path.join(SCANNER_WORKDIR, "member_cloud_scanner.session")
 SCANNER_SESSION_SETTING_KEY = "scanner_session_string_v1"
+
+def legacy_scanner_session_is_authorized(path):
+    """Return True only for an existing, already-authorized Pyrogram session."""
+    if not os.path.isfile(path):
+        return False
+    try:
+        uri = "file:" + os.path.abspath(path) + "?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=2) as connection:
+            row = connection.execute(
+                "SELECT user_id, auth_key FROM sessions LIMIT 1"
+            ).fetchone()
+        return bool(row and row[0] and row[1] and len(row[1]) >= 256)
+    except (sqlite3.Error, OSError, TypeError):
+        return False
+
 # The authoritative scanner login is stored in the database, not the
 # deployment filesystem, which may be replaced during every redeploy.
 scanner = None
@@ -8720,7 +8736,7 @@ async def main():
                 session_string=stored_scanner_session,
             )
             log.info("Persistent scanner session loaded from database")
-        elif os.path.exists(SCANNER_SESSION_PATH):
+        elif legacy_scanner_session_is_authorized(SCANNER_SESSION_PATH):
             # One-time migration for deployments that still have the old
             # file-based Pyrogram session available.
             legacy_scanner = Client(
@@ -8754,7 +8770,13 @@ async def main():
                 scanner = None
         else:
             scanner = None
-            log.warning("No persistent scanner session found; admin must use /scanlogin")
+            if os.path.exists(SCANNER_SESSION_PATH):
+                log.warning(
+                    "Legacy scanner session file exists but is not an authorized session; "
+                    "skipping interactive migration. Admin can use /scanlogin."
+                )
+            else:
+                log.warning("No persistent scanner session found; admin must use /scanlogin")
 
         # Cold-start handshake: a first-hit 500/network blip must not exit the
         # process and trigger a platform restart loop. Retry a bounded number
