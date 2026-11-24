@@ -8333,7 +8333,7 @@ async def admin_callback_handler(client, query):
             "🔐 扫描账号设置\n\n"
             "使用普通 Telegram 用户账号读取主、备份频道历史。建议使用专用账号，并先将它加入两个私有频道。\n\n"
             "点击下方按钮后，机器人会引导你输入手机号、登录验证码及（如有）两步验证密码。敏感输入会尝试立即删除。\n"
-            "扫描进度保存在数据库中；登录会话保存在本地文件。若部署平台没有持久化文件存储，重新部署后可能需要重新登录扫描账号。",
+            "扫描进度和扫描账号登录会话均保存在 PostgreSQL 数据库中。重新部署后会自动恢复，无需重复登录。",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔑 开始登录", callback_data="mc:scannerloginstart"),
                  InlineKeyboardButton("🏠 管理首页", callback_data="mc:home")],
@@ -8349,11 +8349,14 @@ async def admin_callback_handler(client, query):
                     await old_client.disconnect()
                 except Exception:
                     pass
+            # Use the same isolated in-memory login flow as /scanlogin.
+            # The verified session is exported and persisted to PostgreSQL
+            # only after an independent reconnect check succeeds.
             login_client = Client(
-                "member_cloud_scanner",
+                "member_cloud_scanner_login",
                 api_id=config.API_ID,
                 api_hash=config.API_HASH,
-                workdir=SCANNER_WORKDIR,
+                in_memory=True,
             )
             try:
                 await login_client.connect()
