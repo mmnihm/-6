@@ -2397,7 +2397,9 @@ async def startup_self_check(client):
             problems.append(f"无法检查会员群权限：{str(exc)[:120]}")
 
     try:
-        session = await db.get_setting(SCANNER_SESSION_SETTING_KEY)
+        session = os.getenv("SCANNER_SESSION_STRING", "").strip()
+        if not session:
+            session = await db.get_setting(SCANNER_SESSION_SETTING_KEY)
         if session and (scanner is None or not scanner.is_connected):
             problems.append("扫描账号已保存但当前未连接（重启后可能需要重新 /scanlogin）")
     except Exception:
@@ -8562,9 +8564,11 @@ async def main():
             time.monotonic() - boot_t0,
         )
 
-        # Restore the scanner from the database-backed session string. This is
-        # durable across container replacement and does not rely on /app/data.
-        stored_scanner_session = await db.get_setting(SCANNER_SESSION_SETTING_KEY)
+        # Restore the scanner from a session string. An environment variable
+        # takes precedence; otherwise fall back to the database-backed setting.
+        stored_scanner_session = os.getenv("SCANNER_SESSION_STRING", "").strip()
+        if not stored_scanner_session:
+            stored_scanner_session = await db.get_setting(SCANNER_SESSION_SETTING_KEY)
         if stored_scanner_session:
             scanner = Client(
                 "member_cloud_scanner",
