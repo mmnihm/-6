@@ -4826,10 +4826,104 @@ async def scanner_login_start_handler(client, message):
     await message.reply_text(
         "🔐 扫描账号登录\n\n"
         "请发送专门用于扫描的普通 Telegram 账号手机号（含国家区号，例如 +1）。\n"
-        "接下来 Telegram 会发送登录验证码，你需要在这里输入验证码；如开启两步验证，还需要输入密码。\n\n"
+        "手机号提交后，机器人会显示 Telegram 实际选择的验证码接收方式。收到验证码后，请直接在当前机器人私聊发送；如开启两步验证，还需要输入密码。\n\n"
         "⚠️ 建议使用专用扫描账号，不要使用存有重要私聊的主账号。验证码/两步验证密码会短暂经过本机器人私聊，处理后会尝试立即删除输入消息。\n"
         "发送 /scancancel 可取消。"
     )
+
+
+@app.on_message(filters.private & filters.command("scanstatus"))
+async def scanner_login_status_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    if scanner is not None and scanner.is_connected:
+        await message.reply_text("✅ 扫描账号已经完成登录，当前连接正常。")
+        return
+    state = scanner_login_states.get(user.id)
+    if not state:
+        await message.reply_text("当前没有进行中的扫描账号登录。发送 /scanlogin 开始登录。")
+        return
+    step_names = {
+        "phone": "等待输入手机号",
+        "code": "等待输入 Telegram 验证码",
+        "password": "等待输入两步验证密码",
+    }
+    detail = step_names.get(state.get("step"), "登录处理中")
+    delivery = state.get("delivery_type")
+    next_delivery = state.get("next_delivery_type")
+    lines = ["🔐 扫描账号登录状态", f"当前步骤：{detail}"]
+    if delivery:
+        lines.append(f"当前验证码方式：{delivery}")
+    if next_delivery:
+        lines.append(f"Telegram 提供的备用方式：{next_delivery}")
+    if state.get("step") == "code" and not next_delivery:
+        lines.append("Telegram 暂未提供备用发送方式，不能强制切换成短信。")
+    lines.append("收到验证码后直接发到当前机器人私聊。")
+    await message.reply_text("\\n".join(lines))
+
+
+@app.on_message(filters.private & filters.command("scanresend"))
+async def scanner_login_resend_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    state = scanner_login_states.get(user.id)
+    login_client = scanner_login_clients.get(user.id)
+    if not state or state.get("step") != "code" or not login_client:
+        await message.reply_text("当前没有等待验证码的登录流程。请先发送 /scanlogin。")
+        return
+    next_delivery = state.get("next_delivery_type")
+    if not next_delivery:
+        await message.reply_text(
+            "Telegram 这次没有返回备用验证码方式（next_type 为空）。"
+            "机器人不能自行强制改成短信或电话。"
+            "请先在扫描账号已登录的另一台设备中查看 777000；"
+            "如果没有任何已登录设备，请使用 Telegram 官方 App 登录。"
+        )
+        return
+    timeout = state.get("timeout")
+    sent_at = float(state.get("sent_at") or 0)
+    if timeout is not None and sent_at:
+        remaining = int(timeout - (time.monotonic() - sent_at))
+        if remaining > 0:
+            await message.reply_text(
+                f"Telegram 要求再等待 {remaining} 秒，时间到后再发送 /scanresend。"
+            )
+            return
+    try:
+        sent = await login_client.resend_code(
+            state["phone"], state["phone_code_hash"]
+        )
+        delivery_type = getattr(sent.type, "name", str(sent.type))
+        next_type = (
+            getattr(sent.next_type, "name", str(sent.next_type))
+            if sent.next_type else None
+        )
+        state.update({
+            "step": "code",
+            "phone_code_hash": sent.phone_code_hash,
+            "delivery_type": delivery_type,
+            "next_delivery_type": next_type,
+            "sent_at": time.monotonic(),
+            "timeout": getattr(sent, "timeout", None),
+        })
+        log.info(
+            "Scanner login code resent: delivery_type=%s next_delivery_type=%s timeout=%s",
+            delivery_type, next_type, getattr(sent, "timeout", None),
+        )
+        await message.reply_text(
+            f"📩 Telegram 已处理备用验证码请求。\\n当前发送方式：{delivery_type}"
+            + (f"\\n下一备用方式：{next_type}" if next_type else "")
+            + "\\n请按这个方式查收验证码，收到后直接发送到当前机器人私聊。"
+        )
+    except Exception as exc:
+        log.exception("Could not resend scanner login code")
+        await message.reply_text(
+            f"❌ Telegram 暂时无法重新发送：{type(exc).__name__}: {str(exc)[:180]}"
+        )
 
 
 @app.on_message(filters.private & filters.command("uploadcancel"))
@@ -5184,12 +5278,14 @@ async def scanner_login_input_handler(client, message):
                 "phone_code_hash": sent.phone_code_hash,
                 "delivery_type": delivery_type,
                 "next_delivery_type": next_delivery_type,
+                "sent_at": time.monotonic(),
+                "timeout": getattr(sent, "timeout", None),
             })
             if delivery_type == "APP":
                 delivery_instruction = (
-                    "📲 请打开你这个手机号已登录的 Telegram 官方应用，"
-                    "查看服务通知账号 777000 发来的登录验证码。"
-                    "验证码不会发送到当前机器人聊天中。"
+                    "📲 Telegram 已选择应用内验证码：请在扫描账号其他已登录的 Telegram 设备中，"
+                    "打开服务通知账号 777000 查看验证码。"
+                    "如果所有设备都已退出，这种方式就没有可接收验证码的设备。"
                 )
             elif delivery_type == "SMS":
                 delivery_instruction = "📩 请查看该手机号收到的短信验证码。"
@@ -5217,7 +5313,9 @@ async def scanner_login_input_handler(client, message):
                     f"\n如需等待，请按 Telegram 提示；重试等待时间：{sent.timeout} 秒。"
                     if getattr(sent, "timeout", None) is not None else ""
                 )
-                + "\n如果没有收到，请先不要重复申请验证码。"
+                + "\n\n➡️ 收到验证码后，请直接把验证码发送到当前机器人私聊；机器人会自动验证并保存登录会话。"
+                + "\n如 Telegram 提供备用发送方式，可在等待时间结束后发送 /scanresend。"
+                + "\n如果当前显示 APP 且没有其他已登录设备，请不要连续申请；APP 验证码不会发到短信。"
             )
         except Exception:
             log.exception("Could not request scanner login code")
