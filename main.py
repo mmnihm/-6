@@ -5167,15 +5167,28 @@ async def scanner_login_input_handler(client, message):
         phone = value.replace(" ", "").replace("-", "")
         try:
             sent = await login_client.send_code(phone)
+            delivery_type = type(getattr(sent, "type", None)).__name__
+            next_delivery_type = type(getattr(sent, "next_type", None)).__name__
+            log.info(
+                "Scanner login code request accepted by Telegram: delivery_type=%s next_delivery_type=%s",
+                delivery_type,
+                next_delivery_type,
+            )
             state.update({
                 "step": "code",
                 "phone": phone,
                 "phone_code_hash": sent.phone_code_hash,
+                "delivery_type": delivery_type,
+                "next_delivery_type": next_delivery_type,
             })
             await message.reply_text(
-                "📩 已请求 Telegram 登录验证码。\n"
-                "请查看 Telegram 官方服务消息或短信，把收到的验证码发送到这里。\n"
-                "不要发送其他账号的验证码。"
+                "📩 Telegram 已接受验证码请求。\n"
+                f"当前发送方式：{delivery_type}\n"
+                + (
+                    f"备用发送方式：{next_delivery_type}\n"
+                    if next_delivery_type != "NoneType" else ""
+                )
+                + "请按 Telegram 指定的方式查看验证码；如果没有收到，先不要重复请求，把这里显示的发送方式告诉管理员。"
             )
         except Exception:
             log.exception("Could not request scanner login code")
