@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 from aiohttp import web
 
 from pyrogram import Client, filters, StopPropagation, raw
+from pyrogram.session import Auth, Session
 from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     KeyboardButton, ReplyKeyboardMarkup, BotCommand,
@@ -4893,6 +4894,58 @@ async def _activate_scanner_session(message, login_client):
         )
 
 
+async def _complete_scanner_dc_migration(login_client, result):
+    """Complete Telegram's QR-login DC migration and move the live client session."""
+    if not isinstance(result, raw.types.auth.LoginTokenMigrateTo):
+        return result
+
+    source_session = login_client.session
+    dc_id = int(result.dc_id)
+    test_mode = await login_client.storage.test_mode()
+    target_session = Session(
+        login_client,
+        dc_id,
+        await Auth(login_client, dc_id, test_mode).create(),
+        test_mode,
+    )
+    try:
+        await target_session.start()
+        exported = await source_session.invoke(
+            raw.functions.auth.ExportAuthorization(dc_id=dc_id)
+        )
+        await target_session.invoke(
+            raw.functions.auth.ImportAuthorization(
+                id=exported.id, bytes=exported.bytes
+            )
+        )
+        migrated = await target_session.invoke(
+            raw.functions.auth.ImportLoginToken(token=result.token)
+        )
+        if not isinstance(migrated, raw.types.auth.LoginTokenSuccess):
+            raise RuntimeError(
+                "Telegram did not complete QR login after DC migration: "
+                + type(migrated).__name__
+            )
+
+        user = migrated.authorization.user
+        await source_session.stop()
+        await login_client.storage.dc_id(dc_id)
+        await login_client.storage.auth_key(target_session.auth_key)
+        await login_client.storage.user_id(user.id)
+        await login_client.storage.is_bot(bool(user.bot))
+        await login_client.storage.date(0)
+        await login_client.storage.save()
+        login_client.session = target_session
+        log.info("Scanner QR login migrated to Telegram DC %s", dc_id)
+        return migrated
+    except Exception:
+        try:
+            await target_session.stop()
+        except Exception:
+            log.exception("Could not stop failed scanner migration session")
+        raise
+
+
 async def _refresh_scanner_qr(message, login_client, state) -> bool:
     """Request a fresh login token and post its QR code. Returns True if authorized."""
     result = await login_client.invoke(
@@ -4900,9 +4953,14 @@ async def _refresh_scanner_qr(message, login_client, state) -> bool:
             api_id=config.API_ID, api_hash=config.API_HASH, except_ids=[]
         )
     )
+    result = await _complete_scanner_dc_migration(login_client, result)
     if isinstance(result, raw.types.auth.LoginTokenSuccess):
         await _activate_scanner_session(message, login_client)
         return True
+    if not isinstance(result, raw.types.auth.LoginToken):
+        raise RuntimeError(
+            "Unexpected Telegram QR login response: " + type(result).__name__
+        )
     state["token"] = result.token
     state["expires"] = int(result.expires)
     link = _scanner_qr_deep_link(result.token)
@@ -4925,9 +4983,16 @@ async def _scanner_qr_poll(message, login_client, state):
                     api_id=config.API_ID, api_hash=config.API_HASH, except_ids=[]
                 )
             )
+            result = await _complete_scanner_dc_migration(login_client, result)
             if isinstance(result, raw.types.auth.LoginTokenSuccess):
                 await _activate_scanner_session(message, login_client)
                 return
+            if not isinstance(result, raw.types.auth.LoginToken):
+                raise RuntimeError(
+                    "Unexpected Telegram QR login response: " + type(result).__name__
+                )
+            state["token"] = result.token
+            state["expires"] = int(result.expires)
             if state["expires"] - time.time() < SCANNER_QR_REFRESH_MARGIN:
                 await _refresh_scanner_qr(message, login_client, state)
     except asyncio.CancelledError:
