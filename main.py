@@ -4910,9 +4910,26 @@ async def _complete_scanner_dc_migration(login_client, result):
     )
     try:
         await target_session.start()
-        migrated = await target_session.invoke(
-            raw.functions.auth.ImportLoginToken(token=result.token)
-        )
+        try:
+            migrated = await target_session.invoke(
+                raw.functions.auth.ImportLoginToken(token=result.token)
+            )
+        except Exception as exc:
+            if exc.__class__.__name__ != "SessionPasswordNeeded":
+                raise
+            # The QR token is accepted, but Telegram requires the account's
+            # 2FA password on this migrated DC. Keep this authorized-in-progress
+            # session attached so Client.check_password() can finish SRP auth.
+            await source_session.stop()
+            await login_client.storage.dc_id(dc_id)
+            await login_client.storage.auth_key(target_session.auth_key)
+            await login_client.storage.user_id(0)
+            await login_client.storage.is_bot(False)
+            await login_client.storage.date(0)
+            await login_client.storage.save()
+            login_client.session = target_session
+            log.info("Scanner QR login requires the account 2FA password on DC %s", dc_id)
+            raise
         if not isinstance(migrated, raw.types.auth.LoginTokenSuccess):
             raise RuntimeError(
                 "Telegram did not complete QR login after DC migration: "
@@ -4989,7 +5006,25 @@ async def _scanner_qr_poll(message, login_client, state):
                 await _refresh_scanner_qr(message, login_client, state)
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if exc.__class__.__name__ == "SessionPasswordNeeded":
+            state["step"] = "password"
+            state["expires"] = 0
+            try:
+                hint = await login_client.get_password_hint()
+            except Exception:
+                hint = ""
+            prompt = (
+                "🔐 Telegram 账号已开启两步验证，请发送该账号的云密码以完成登录。\n"
+                "密码消息会立即尝试删除，只用于本次验证，不会保存到数据库或日志。\n"
+                "发送 /scancancel 可取消。"
+            )
+            if hint:
+                prompt += f"\n密码提示：{hint}"
+            await message.reply_text(prompt)
+            return
         log.exception("Scanner QR login poll failed")
         try:
             await message.reply_text("❌ 二维码登录中断，请重新发送 /scanlogin。")
@@ -5168,6 +5203,24 @@ async def scanner_login_input_handler(client, message):
     login_client = scanner_login_clients.get(user.id)
     value = (message.text or "").strip()
     if not value:
+        return
+
+    if state and state.get("step") == "password" and login_client:
+        # Remove the incoming password message before attempting SRP verification.
+        try:
+            await message.delete()
+        except Exception:
+            log.warning("Could not delete scanner 2FA password message")
+        try:
+            await login_client.check_password(value)
+            state["step"] = "activating"
+            await _activate_scanner_session(message, login_client)
+        except Exception as exc:
+            if exc.__class__.__name__ in ("PasswordHashInvalid", "PasswordEmpty"):
+                await message.reply_text("❌ 云密码不正确，请重新输入；发送 /scancancel 可取消。")
+            else:
+                log.exception("Scanner 2FA password verification failed")
+                await message.reply_text("❌ 两步验证处理失败，请检查日志；可重新输入或发送 /scancancel。")
         return
 
     if int(user.id) in pending_welcome_edit:
