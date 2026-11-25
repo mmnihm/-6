@@ -4910,14 +4910,6 @@ async def _complete_scanner_dc_migration(login_client, result):
     )
     try:
         await target_session.start()
-        exported = await source_session.invoke(
-            raw.functions.auth.ExportAuthorization(dc_id=dc_id)
-        )
-        await target_session.invoke(
-            raw.functions.auth.ImportAuthorization(
-                id=exported.id, bytes=exported.bytes
-            )
-        )
         migrated = await target_session.invoke(
             raw.functions.auth.ImportLoginToken(token=result.token)
         )
