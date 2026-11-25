@@ -4947,11 +4947,13 @@ async def _complete_scanner_dc_migration(login_client, result):
         login_client.session = target_session
         log.info("Scanner QR login migrated to Telegram DC %s", dc_id)
         return migrated
-    except Exception:
-        try:
-            await target_session.stop()
-        except Exception:
-            log.exception("Could not stop failed scanner migration session")
+    except Exception as exc:
+        # Keep the target DC session alive while waiting for the 2FA password.
+        if exc.__class__.__name__ != "SessionPasswordNeeded":
+            try:
+                await target_session.stop()
+            except Exception:
+                log.exception("Could not stop failed scanner migration session")
         raise
 
 
@@ -5004,8 +5006,6 @@ async def _scanner_qr_poll(message, login_client, state):
             state["expires"] = int(result.expires)
             if state["expires"] - time.time() < SCANNER_QR_REFRESH_MARGIN:
                 await _refresh_scanner_qr(message, login_client, state)
-    except asyncio.CancelledError:
-        raise
     except asyncio.CancelledError:
         raise
     except Exception as exc:
