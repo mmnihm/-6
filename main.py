@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import io
 import json
 import aiohttp
 import logging
@@ -10,15 +12,17 @@ from datetime import datetime, timezone, timedelta
 
 from aiohttp import web
 
-from pyrogram import Client, filters, StopPropagation
+from pyrogram import Client, filters, StopPropagation, raw
 from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     KeyboardButton, ReplyKeyboardMarkup, BotCommand,
 )
 from pyrogram.enums import ChatAction, ChatMemberStatus, ChatType
 from pyrogram.errors import (
-    FloodWait, SessionPasswordNeeded,
+    FloodWait,
 )
+
+import qrcode
 
 import config
 from alerts import AlertThrottle
@@ -4808,21 +4812,149 @@ async def bind_member_group_in_chat_handler(client, message):
     )
 
 
-@app.on_message(filters.private & filters.command("scanlogin"))
-async def scanner_login_start_handler(client, message):
+SCANNER_QR_POLL_INTERVAL = 3.0
+SCANNER_QR_REFRESH_MARGIN = 10.0
+
+
+def _scanner_qr_deep_link(token: bytes) -> str:
+    token_b64 = base64.urlsafe_b64encode(token).rstrip(b"=").decode()
+    return f"tg://login?token={token_b64}"
+
+
+def _render_scanner_qr_png(link: str) -> io.BytesIO:
+    qr = qrcode.QRCode(box_size=6, border=2)
+    qr.add_data(link)
+    qr.make(fit=True)
+    buf = io.BytesIO()
+    qr.make_image(fill_color="black", back_color="white").save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+async def _activate_scanner_session(message, login_client):
+    """Validate the authorized login client and persist its session string."""
+    global scanner
     user = message.from_user
-    if not user or not await is_admin(user.id):
-        await reply_admin_only(message)
-        return
+    candidate_scanner = None
+    try:
+        me = await login_client.get_me()
+        if getattr(me, "is_bot", False):
+            await login_client.log_out()
+            await message.reply_text("❌ 不能使用机器人账号，请使用普通 Telegram 用户账号。")
+            return
+        session_string = await login_client.export_session_string()
+        if not session_string:
+            raise RuntimeError("Pyrogram returned an empty scanner session string")
+        # First prove that the exported string can independently restore an
+        # authorized Pyrogram client. Do not report success based on export alone.
+        await login_client.disconnect()
+        candidate_scanner = Client(
+            "member_cloud_scanner",
+            api_id=config.API_ID,
+            api_hash=config.API_HASH,
+            session_string=session_string,
+        )
+        await candidate_scanner.start()
+        scanner_me = await candidate_scanner.get_me()
+        if scanner_me.is_bot:
+            raise RuntimeError("Scanner login must be a normal user account")
+        # Persist only after the independent restore test succeeds, then read
+        # the value back from the same database used by the next deployment.
+        await db.set_setting(SCANNER_SESSION_SETTING_KEY, session_string)
+        persisted_session = await db.get_setting(SCANNER_SESSION_SETTING_KEY)
+        if persisted_session != session_string:
+            raise RuntimeError("Scanner session database write/read verification failed")
+        scanner = candidate_scanner
+        log.info("Scanner session persisted and read-back verified for user %s", scanner_me.id)
+        scanner_login_clients.pop(user.id, None)
+        scanner_login_states.pop(user.id, None)
+        await message.reply_text(
+            "✅ 扫描账号登录成功！\n"
+            f"账号 ID：{scanner_me.id}\n"
+            "登录会话已安全保存到机器人数据库，后续重新部署会自动恢复，不需要重复登录。\n\n"
+            "现在可以发送 /scan 只扫描主存储频道。"
+        )
+    except Exception:
+        log.exception("Could not activate or persist scanner after QR login")
+        try:
+            await login_client.disconnect()
+        except Exception:
+            pass
+        try:
+            if candidate_scanner is not None and candidate_scanner.is_connected:
+                await candidate_scanner.stop()
+        except Exception:
+            log.exception("Could not stop unpersisted scanner validation client")
+        scanner = None
+        scanner_login_clients.pop(user.id, None)
+        scanner_login_states.pop(user.id, None)
+        await message.reply_text(
+            "⚠️ 验证通过，但扫描账号启动失败。请检查部署日志；可重新部署后自动恢复，必要时再执行 /scanlogin。"
+        )
+
+
+async def _refresh_scanner_qr(message, login_client, state) -> bool:
+    """Request a fresh login token and post its QR code. Returns True if authorized."""
+    result = await login_client.invoke(
+        raw.functions.auth.ExportLoginToken(
+            api_id=config.API_ID, api_hash=config.API_HASH, except_ids=[]
+        )
+    )
+    if isinstance(result, raw.types.auth.LoginTokenSuccess):
+        await _activate_scanner_session(message, login_client)
+        return True
+    state["token"] = result.token
+    state["expires"] = int(result.expires)
+    link = _scanner_qr_deep_link(result.token)
+    buf = _render_scanner_qr_png(link)
+    await message.reply_photo(
+        buf,
+        caption="📷 用登录扫描号的设备扫码：设置 → 设备 → 关联桌面设备。二维码过期会自动刷新。",
+    )
+    return False
+
+
+async def _scanner_qr_poll(message, login_client, state):
+    try:
+        while True:
+            await asyncio.sleep(SCANNER_QR_POLL_INTERVAL)
+            if not login_client.is_connected:
+                return
+            result = await login_client.invoke(
+                raw.functions.auth.ExportLoginToken(
+                    api_id=config.API_ID, api_hash=config.API_HASH, except_ids=[]
+                )
+            )
+            if isinstance(result, raw.types.auth.LoginTokenSuccess):
+                await _activate_scanner_session(message, login_client)
+                return
+            if state["expires"] - time.time() < SCANNER_QR_REFRESH_MARGIN:
+                await _refresh_scanner_qr(message, login_client, state)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Scanner QR login poll failed")
+        try:
+            await message.reply_text("❌ 二维码登录中断，请重新发送 /scanlogin。")
+        except Exception:
+            pass
+
+
+async def _start_scanner_qr_login(message):
+    user = message.from_user
     if scanner is not None and scanner.is_connected:
         await message.reply_text("✅ 扫描账号已经登录。可以直接发送 /scan 开始扫描。")
         return
     old_client = scanner_login_clients.pop(user.id, None)
+    old_state = scanner_login_states.pop(user.id, None)
     if old_client:
         try:
             await old_client.disconnect()
         except Exception:
             pass
+    if old_state and old_state.get("poll_task"):
+        old_state["poll_task"].cancel()
+
     # Keep the temporary login in memory. Its authorized session is exported
     # to the database after verification, so no local disk persistence is needed.
     login_client = Client(
@@ -4834,18 +4966,38 @@ async def scanner_login_start_handler(client, message):
     try:
         await login_client.connect()
     except Exception:
-        log.exception("Could not connect scanner login client")
-        await message.reply_text("❌ 无法连接 Telegram 登录服务，请稍后重试。")
-        return
+        try:
+            await login_client.disconnect()
+        except Exception:
+            pass
+        raise
+    state = {"step": "qr", "token": None, "expires": 0, "poll_task": None}
     scanner_login_clients[user.id] = login_client
-    scanner_login_states[user.id] = {"step": "phone"}
+    scanner_login_states[user.id] = state
+
     await message.reply_text(
-        "🔐 扫描账号登录\n\n"
-        "请发送专门用于扫描的普通 Telegram 账号手机号（含国家区号，例如 +1）。\n"
-        "手机号提交后，机器人会显示 Telegram 实际选择的验证码接收方式。收到验证码后，请直接在当前机器人私聊发送；如开启两步验证，还需要输入密码。\n\n"
-        "⚠️ 建议使用专用扫描账号，不要使用存有重要私聊的主账号。验证码/两步验证密码会短暂经过本机器人私聊，处理后会尝试立即删除输入消息。\n"
+        "🔐 扫描账号二维码登录\n\n"
+        "请用**已经登录扫描号**的 Telegram 设备批准：\n"
+        "设置 → 设备 → 关联桌面设备，扫描下方二维码。\n"
         "发送 /scancancel 可取消。"
     )
+    if not await _refresh_scanner_qr(message, login_client, state):
+        state["poll_task"] = spawn_background(
+            "scanner-qr-poll", _scanner_qr_poll(message, login_client, state)
+        )
+
+
+@app.on_message(filters.private & filters.command("scanlogin"))
+async def scanner_login_start_handler(client, message):
+    user = message.from_user
+    if not user or not await is_admin(user.id):
+        await reply_admin_only(message)
+        return
+    try:
+        await _start_scanner_qr_login(message)
+    except Exception:
+        log.exception("Could not start scanner QR login")
+        await message.reply_text("❌ 无法启动登录流程，请稍后重试。")
 
 
 @app.on_message(filters.private & filters.command("scanstatus"))
@@ -4861,23 +5013,10 @@ async def scanner_login_status_handler(client, message):
     if not state:
         await message.reply_text("当前没有进行中的扫描账号登录。发送 /scanlogin 开始登录。")
         return
-    step_names = {
-        "phone": "等待输入手机号",
-        "code": "等待输入 Telegram 验证码",
-        "password": "等待输入两步验证密码",
-    }
-    detail = step_names.get(state.get("step"), "登录处理中")
-    delivery = state.get("delivery_type")
-    next_delivery = state.get("next_delivery_type")
-    lines = ["🔐 扫描账号登录状态", f"当前步骤：{detail}"]
-    if delivery:
-        lines.append(f"当前验证码方式：{delivery}")
-    if next_delivery:
-        lines.append(f"Telegram 提供的备用方式：{next_delivery}")
-    if state.get("step") == "code" and not next_delivery:
-        lines.append("Telegram 暂未提供备用发送方式，不能强制切换成短信。")
-    lines.append("收到验证码后直接发到当前机器人私聊。")
-    await message.reply_text("\n".join(lines))
+    await message.reply_text(
+        "🔐 扫描账号登录状态：等待已登录扫描号的设备扫码批准。\n"
+        "可发送 /scanresend 刷新二维码，/scancancel 取消。"
+    )
 
 
 @app.on_message(filters.private & filters.command("scanresend"))
@@ -4888,58 +5027,14 @@ async def scanner_login_resend_handler(client, message):
         return
     state = scanner_login_states.get(user.id)
     login_client = scanner_login_clients.get(user.id)
-    if not state or state.get("step") != "code" or not login_client:
-        await message.reply_text("当前没有等待验证码的登录流程。请先发送 /scanlogin。")
+    if not state or state.get("step") != "qr" or not login_client:
+        await message.reply_text("当前没有进行中的二维码登录。请先发送 /scanlogin。")
         return
-    next_delivery = state.get("next_delivery_type")
-    if not next_delivery:
-        await message.reply_text(
-            "Telegram 这次没有返回备用验证码方式（next_type 为空）。"
-            "机器人不能自行强制改成短信或电话。"
-            "请先在扫描账号已登录的另一台设备中查看 777000；"
-            "如果没有任何已登录设备，请使用 Telegram 官方 App 登录。"
-        )
-        return
-    timeout = state.get("timeout")
-    sent_at = float(state.get("sent_at") or 0)
-    if timeout is not None and sent_at:
-        remaining = int(timeout - (time.monotonic() - sent_at))
-        if remaining > 0:
-            await message.reply_text(
-                f"Telegram 要求再等待 {remaining} 秒，时间到后再发送 /scanresend。"
-            )
-            return
     try:
-        sent = await login_client.resend_code(
-            state["phone"], state["phone_code_hash"]
-        )
-        delivery_type = getattr(sent.type, "name", str(sent.type))
-        next_type = (
-            getattr(sent.next_type, "name", str(sent.next_type))
-            if sent.next_type else None
-        )
-        state.update({
-            "step": "code",
-            "phone_code_hash": sent.phone_code_hash,
-            "delivery_type": delivery_type,
-            "next_delivery_type": next_type,
-            "sent_at": time.monotonic(),
-            "timeout": getattr(sent, "timeout", None),
-        })
-        log.info(
-            "Scanner login code resent: delivery_type=%s next_delivery_type=%s timeout=%s",
-            delivery_type, next_type, getattr(sent, "timeout", None),
-        )
-        await message.reply_text(
-            f"📩 Telegram 已处理备用验证码请求。\n当前发送方式：{delivery_type}"
-            + (f"\n下一备用方式：{next_type}" if next_type else "")
-            + "\n请按这个方式查收验证码，收到后直接发送到当前机器人私聊。"
-        )
-    except Exception as exc:
-        log.exception("Could not resend scanner login code")
-        await message.reply_text(
-            f"❌ Telegram 暂时无法重新发送：{type(exc).__name__}: {str(exc)[:180]}"
-        )
+        await _refresh_scanner_qr(message, login_client, state)
+    except Exception:
+        log.exception("Could not refresh scanner QR code")
+        await message.reply_text("❌ 二维码刷新失败，请重新发送 /scanlogin。")
 
 
 @app.on_message(filters.private & filters.command("uploadcancel"))
@@ -4991,7 +5086,9 @@ async def scanner_login_cancel_handler(client, message):
         await reply_admin_only(message)
         return
     login_client = scanner_login_clients.pop(user.id, None)
-    scanner_login_states.pop(user.id, None)
+    state = scanner_login_states.pop(user.id, None)
+    if state and state.get("poll_task"):
+        state["poll_task"].cancel()
     if login_client:
         try:
             await login_client.disconnect()
@@ -5004,7 +5101,6 @@ async def scanner_login_cancel_handler(client, message):
     filters.private & filters.text & ~filters.regex(r"^/")
 )
 async def scanner_login_input_handler(client, message):
-    global scanner
     user = message.from_user
     if not user or not await is_admin(user.id):
         return
@@ -5273,180 +5369,8 @@ async def scanner_login_input_handler(client, message):
     if not state or not login_client:
         return
 
-    if state["step"] == "phone":
-        phone = value.replace(" ", "").replace("-", "")
-        try:
-            sent = await login_client.send_code(phone)
-            delivery_type = getattr(sent.type, "name", str(sent.type))
-            next_delivery_type = (
-                getattr(sent.next_type, "name", str(sent.next_type))
-                if sent.next_type else None
-            )
-            log.info(
-                "Scanner login code request accepted by Telegram: delivery_type=%s next_delivery_type=%s timeout=%s",
-                delivery_type,
-                next_delivery_type,
-                getattr(sent, "timeout", None),
-            )
-            state.update({
-                "step": "code",
-                "phone": phone,
-                "phone_code_hash": sent.phone_code_hash,
-                "delivery_type": delivery_type,
-                "next_delivery_type": next_delivery_type,
-                "sent_at": time.monotonic(),
-                "timeout": getattr(sent, "timeout", None),
-            })
-            if delivery_type == "APP":
-                delivery_instruction = (
-                    "📲 Telegram 已选择应用内验证码：请在扫描账号其他已登录的 Telegram 设备中，"
-                    "打开服务通知账号 777000 查看验证码。"
-                    "如果所有设备都已退出，这种方式就没有可接收验证码的设备。"
-                )
-            elif delivery_type == "SMS":
-                delivery_instruction = "📩 请查看该手机号收到的短信验证码。"
-            elif delivery_type == "EMAIL_CODE":
-                delivery_instruction = "📧 请查看 Telegram 指定邮箱收到的验证码。"
-            elif delivery_type == "CALL":
-                delivery_instruction = "📞 请留意 Telegram 发起的语音来电，并按语音提示获取验证码。"
-            elif delivery_type == "FLASH_CALL":
-                delivery_instruction = "📞 请留意 Telegram 的闪呼验证来电，按 Telegram 的验证要求操作。"
-            elif delivery_type == "MISSED_CALL":
-                delivery_instruction = "📞 请留意 Telegram 的未接来电验证，按 Telegram 的验证要求操作。"
-            elif delivery_type == "FRAGMENT_SMS":
-                delivery_instruction = "📩 Telegram 指定了 Fragment 短信验证，请按 Telegram 页面提示完成验证。"
-            else:
-                delivery_instruction = "请按 Telegram 指定的方式查看验证码。"
-            await message.reply_text(
-                "📩 Telegram 已接受验证码请求。\n"
-                f"当前发送方式：{delivery_type}\n"
-                + (
-                    f"备用发送方式：{next_delivery_type}\n"
-                    if next_delivery_type else ""
-                )
-                + delivery_instruction
-                + (
-                    f"\n如需等待，请按 Telegram 提示；重试等待时间：{sent.timeout} 秒。"
-                    if getattr(sent, "timeout", None) is not None else ""
-                )
-                + "\n\n➡️ 收到验证码后，请直接把验证码发送到当前机器人私聊；机器人会自动验证并保存登录会话。"
-                + "\n如 Telegram 提供备用发送方式，可在等待时间结束后发送 /scanresend。"
-                + "\n如果当前显示 APP 且没有其他已登录设备，请不要连续申请；APP 验证码不会发到短信。"
-            )
-        except Exception:
-            log.exception("Could not request scanner login code")
-            await message.reply_text("❌ 验证码发送失败，请检查手机号和网络后发送 /scancancel，再重新 /scanlogin。")
-        return
-
-    if state["step"] == "code":
-        try:
-            signed_in = await login_client.sign_in(
-                state["phone"], state["phone_code_hash"], value
-            )
-        except SessionPasswordNeeded:
-            state["step"] = "password"
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            await message.reply_text(
-                "🔒 这个账号开启了两步验证。\n"
-                "请发送该扫描账号的两步验证密码。处理后会尝试立即删除密码消息。"
-            )
-            return
-        except Exception:
-            log.exception("Scanner account verification code failed")
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            await message.reply_text("❌ 验证码无效或已过期。请发送 /scancancel 后重新 /scanlogin。")
-            return
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        if getattr(signed_in, "is_bot", False):
-            await login_client.log_out()
-            scanner_login_clients.pop(user.id, None)
-            scanner_login_states.pop(user.id, None)
-            await message.reply_text("❌ 不能使用机器人账号，请使用普通 Telegram 用户账号。")
-            return
-    elif state["step"] == "password":
-        try:
-            signed_in = await login_client.check_password(value)
-        except Exception:
-            log.exception("Scanner account two-step password failed")
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            await message.reply_text("❌ 两步验证密码不正确。请重新输入，或发送 /scancancel 取消。")
-            return
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        if getattr(signed_in, "is_bot", False):
-            await login_client.log_out()
-            scanner_login_clients.pop(user.id, None)
-            scanner_login_states.pop(user.id, None)
-            await message.reply_text("❌ 不能使用机器人账号，请使用普通 Telegram 用户账号。")
-            return
-    else:
-        return
-
-    candidate_scanner = None
-    try:
-        session_string = await login_client.export_session_string()
-        if not session_string:
-            raise RuntimeError("Pyrogram returned an empty scanner session string")
-        # First prove that the exported string can independently restore an
-        # authorized Pyrogram client. Do not report success based on export alone.
-        await login_client.disconnect()
-        candidate_scanner = Client(
-            "member_cloud_scanner",
-            api_id=config.API_ID,
-            api_hash=config.API_HASH,
-            session_string=session_string,
-        )
-        await candidate_scanner.start()
-        scanner_me = await candidate_scanner.get_me()
-        if scanner_me.is_bot:
-            raise RuntimeError("Scanner login must be a normal user account")
-        # Persist only after the independent restore test succeeds, then read
-        # the value back from the same database used by the next deployment.
-        await db.set_setting(SCANNER_SESSION_SETTING_KEY, session_string)
-        persisted_session = await db.get_setting(SCANNER_SESSION_SETTING_KEY)
-        if persisted_session != session_string:
-            raise RuntimeError("Scanner session database write/read verification failed")
-        scanner = candidate_scanner
-        log.info("Scanner session persisted and read-back verified for user %s", scanner_me.id)
-        scanner_login_clients.pop(user.id, None)
-        scanner_login_states.pop(user.id, None)
-        await message.reply_text(
-            "✅ 扫描账号登录成功！\n"
-            f"账号 ID：{scanner_me.id}\n"
-            "登录会话已安全保存到机器人数据库，后续重新部署会自动恢复，不需要重复登录。\n\n"
-            "现在可以发送 /scan 只扫描主存储频道。"
-        )
-    except Exception:
-        log.exception("Could not activate or persist scanner after login")
-        try:
-            await login_client.disconnect()
-        except Exception:
-            pass
-        try:
-            if candidate_scanner is not None and candidate_scanner.is_connected:
-                await candidate_scanner.stop()
-        except Exception:
-            log.exception("Could not stop unpersisted scanner validation client")
-        scanner = None
-        scanner_login_clients.pop(user.id, None)
-        scanner_login_states.pop(user.id, None)
-        await message.reply_text(
-            "⚠️ 验证通过，但扫描账号启动失败。请检查部署日志；会话已尝试保存到数据库，可重新部署后自动恢复，必要时再执行 /scanlogin。"
-        )
+    # QR login waits for scan approval in a background poll; text input is not consumed.
+    return
 
 
 async def resolve_scanner_chat(channel_id):
@@ -5950,7 +5874,9 @@ async def scanner_logout_handler(client, message):
         await message.reply_text("⚠️ 扫描正在运行，请先发送 /scanstop，暂停后再退出账号。")
         return
     pending = scanner_login_clients.pop(user.id, None)
-    scanner_login_states.pop(user.id, None)
+    pending_state = scanner_login_states.pop(user.id, None)
+    if pending_state and pending_state.get("poll_task"):
+        pending_state["poll_task"].cancel()
     if pending:
         try:
             await pending.disconnect()
@@ -8356,37 +8282,11 @@ async def admin_callback_handler(client, query):
             ]),
         )
     elif action == "scannerloginstart":
-        if scanner is not None and scanner.is_connected:
-            await message.edit_text("✅ 扫描账号已经登录，可以直接发送 /scan 开始扫描。", reply_markup=back_keyboard())
-        else:
-            old_client = scanner_login_clients.pop(user.id, None)
-            if old_client:
-                try:
-                    await old_client.disconnect()
-                except Exception:
-                    pass
-            # Use the same isolated in-memory login flow as /scanlogin.
-            # The verified session is exported and persisted to PostgreSQL
-            # only after an independent reconnect check succeeds.
-            login_client = Client(
-                "member_cloud_scanner_login",
-                api_id=config.API_ID,
-                api_hash=config.API_HASH,
-                in_memory=True,
-            )
-            try:
-                await login_client.connect()
-                scanner_login_clients[user.id] = login_client
-                scanner_login_states[user.id] = {"step": "phone"}
-                await message.edit_text(
-                    "🔐 请发送扫描账号的手机号（含国家区号，例如 +1）。\n\n"
-                    "随后按提示输入 Telegram 登录验证码；如开启两步验证，还需要输入密码。\n"
-                    "建议使用专用扫描账号。验证码/密码会短暂经过本机器人私聊，处理后会尝试立即删除。\n\n"
-                    "发送 /scancancel 可取消。"
-                )
-            except Exception:
-                log.exception("Could not start scanner login from admin panel")
-                await message.edit_text("❌ 无法启动登录流程，请稍后重试。", reply_markup=back_keyboard())
+        try:
+            await _start_scanner_qr_login(message)
+        except Exception:
+            log.exception("Could not start scanner QR login from admin panel")
+            await message.edit_text("❌ 无法启动登录流程，请稍后重试。", reply_markup=back_keyboard())
     elif action == "commands":
         await message.edit_text(
             "📖 管理命令速查\n\n管理员名单：打开 /admin → 管理员管理（仅超级管理员）\n\n"

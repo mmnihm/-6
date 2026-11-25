@@ -5,3 +5,4 @@ python-dotenv==1.2.4
 aiohttp==3.11.18
 psycopg[pool,binary]==3.3.9
 Pillow==10.4.0
+qrcode[pil]==8.2
