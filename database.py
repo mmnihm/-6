@@ -1290,6 +1290,7 @@ class Database:
         created_at, owner_id, file_key, album_group_id=None, album_position=0
     ):
         async with self.connect() as db:
+            category = str(category or "").strip()
             if album_group_id and not category:
                 existing_album_category = await (await db.execute("""
                     SELECT category FROM files
@@ -1305,6 +1306,14 @@ class Database:
                 ) VALUES(?, ?, ?, ?, ?, ?, ?)
             """, (channel_id, message_id, fingerprint, file_name,
                   media_type, category, created_at))
+            # A rescan may discover an album tag the first pass missed; refresh
+            # the stored label instead of leaving the old empty one in place.
+            if category:
+                await db.execute("""
+                    UPDATE scanner_messages SET category=?
+                    WHERE channel_id=? AND fingerprint=?
+                      AND (category IS NULL OR category='' OR category<>?)
+                """, (category, channel_id, fingerprint, category))
             await db.execute("""
                 INSERT INTO scanner_progress(
                     channel_id, last_message_id, scanned_count, completed, updated_at
@@ -1335,21 +1344,44 @@ class Database:
             primary = current if channel_id == primary_channel_id else other
             backup = other if channel_id == primary_channel_id else current
             inserted = False
-            # Uploads copy the media into this channel before writing their row,
-            # so a history scan would index the bot's own copy a second time
-            # under a "canku:" fingerprint. Skip any message the upload path has
-            # already stored (its fingerprint never starts with "cangku:").
+            # Match existing indexed rows by the stable cangku fingerprint so a
+            # rescan can refresh the album tag.
+            existing_file = await (await db.execute(
+                "SELECT file_key, category FROM files WHERE source_fingerprint=? LIMIT 1",
+                (fingerprint,),
+            )).fetchone()
+            # The bot uploads its own copy into this channel before writing its
+            # row; a history scan must not index that copy a second time under a
+            # cangku: fingerprint.
             scanned_column = (
                 "primary_message_id" if channel_id == primary_channel_id
                 else "backup_message_id"
             )
-            already_indexed = await (await db.execute(
+            uploaded_copy = await (await db.execute(
                 f"SELECT file_key FROM files WHERE {scanned_column}=? "
                 "AND (source_fingerprint IS NULL "
                 "OR substr(source_fingerprint, 1, 7) <> 'cangku:') LIMIT 1",
                 (int(message_id),),
             )).fetchone()
-            if primary and not already_indexed:
+            if primary and uploaded_copy:
+                pass
+            elif primary and existing_file:
+                old_category = str(existing_file["category"] or "").strip()
+                new_category = str(primary["category"] or "").strip()
+                if new_category and old_category != new_category:
+                    await db.execute(
+                        "UPDATE files SET category=? WHERE file_key=?",
+                        (new_category, str(existing_file["file_key"])),
+                    )
+                    await self._refresh_category_stats(db, old_category, create=False, force=True)
+                    await self._refresh_category_stats(db, new_category, force=True)
+                if backup:
+                    await db.execute("""
+                        UPDATE files SET backup_message_id=?
+                        WHERE source_fingerprint=? AND primary_message_id=?
+                          AND backup_message_id=0
+                    """, (backup["message_id"], fingerprint, primary["message_id"]))
+            elif primary and not existing_file:
                 primary_id = primary["message_id"]
                 backup_id = backup["message_id"] if backup else 0
                 cur = await db.execute("""
@@ -2317,8 +2349,6 @@ class Database:
         category = str(category or "").strip()[:120]
         if not category or not 2 <= len(ids) <= 10:
             return 0
-        fingerprints = [f"backup:{int(backup_chat_id)}:{message_id}" for message_id in ids]
-        placeholders = ",".join("?" for _ in fingerprints)
         async with self.connect() as db:
             rows = await (await db.execute(
                 f"SELECT file_key, category, source_fingerprint FROM files "

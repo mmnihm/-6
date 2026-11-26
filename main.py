@@ -1899,20 +1899,27 @@ def parse_category(message) -> str:
     return "未分类"
 
 
-def parse_chinese_album_category(messages) -> str:
-    """Find a Chinese hashtag anywhere in any caption belonging to an album."""
+def parse_album_category(messages) -> str:
+    """Find the album folder tag: a #Chinese hashtag or a 分类：xxx caption."""
     import re
 
-    pattern = re.compile(
+    hash_pattern = re.compile(
         r"(?<![A-Za-z0-9_])#([\u3400-\u4dbf\u4e00-\u9fff]"
         r"[\u3400-\u4dbf\u4e00-\u9fff0-9A-Za-z_-]{0,39})"
     )
     for message in messages:
         caption = (getattr(message, "caption", None) or "").strip()
-        match = pattern.search(caption)
+        match = hash_pattern.search(caption)
         if match:
             return match.group(1).rstrip("_-")[:40]
+        first = caption.splitlines()[0].strip() if caption else ""
+        if first.startswith("分类:") or first.startswith("分类："):
+            return first[3:].strip()[:40]
     return ""
+
+
+# Backward-compatible alias for existing callers.
+parse_chinese_album_category = parse_album_category
 
 
 def guess_category(message, media_type, file_name):
@@ -1969,16 +1976,14 @@ async def run_history_scan(primary_channel_id, backup_channel_id=None):
                 # album share media_group_id; no get_media_group verification is
                 # needed during history indexing.
                 fingerprint = f"cangku:{resolved_channel_id}:{current_message_id}"
-                caption_category = (
-                    parse_chinese_album_category([item]) if is_album_member else ""
-                )
+                caption_category = parse_album_category([item])
                 if caption_category and album_key:
                     album_category_cache[album_key] = caption_category
                     category = caption_category
                 elif album_key:
                     category = album_category_cache.get(album_key, "")
                 else:
-                    category = ""
+                    category = caption_category
 
                 created_at = (
                     item.date.isoformat() if getattr(item, "date", None)
@@ -5931,21 +5936,19 @@ async def scan_history_handler(client, message):
         return
     progress = await db.get_scan_progress(primary)
     if progress["completed"]:
-        categories = await db.list_categories()
-        _, total_files, _, _ = await db.stats()
+        # Re-read the whole source channel to reconcile already-indexed album
+        # tags; existing index rows are preserved, only labels are refreshed.
+        await db.reset_scan_progress_for_full_rescan(primary)
         await message.reply_text(
-            "✅ 主频道历史扫描已经完成。\n"
-            f"📁 当前目录：{len(categories)} 个\n"
-            f"📦 当前资源：{total_files} 个\n\n"
-            "如需重新建立索引，请先发送 /catalogreset，再发送 /scan。"
+            "🔄 已重新读取全频道，刷新已有资源的相册目录标签（不删除现有索引）…"
         )
-        return
+    else:
+        await message.reply_text(
+            "🚀 已启动主存储频道历史扫描。\n"
+            "只读取主频道并建立数据库索引，不扫描备份频道、不下载或删除原始文件。\n\n"
+            "发送 /scanstatus 查看进度；发送 /scanstop 可暂停，之后可继续。"
+        )
     scan_task = spawn_background("history-scan", run_history_scan(primary))
-    await message.reply_text(
-        "🚀 已启动主存储频道历史扫描。\n"
-        "只读取主频道并建立数据库索引，不扫描备份频道、不下载或删除原始文件。\n\n"
-        "发送 /scanstatus 查看进度；发送 /scanstop 可暂停，之后可继续。"
-    )
 
 
 @app.on_message(filters.private & filters.command("scanstatus"))

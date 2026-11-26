@@ -509,6 +509,22 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         rows = await self.db.list_files(50)
         self.assertEqual([row["file_key"] for row in rows], ["legacyrow"])
 
+    async def test_rescan_refreshes_existing_album_category(self):
+        """A second scan reconciles an already-indexed file's album tag."""
+        now = "2026-11-11T00:00:00+00:00"
+        fp = "cangku:555:9001"
+        await self.db.save_scanned_message(
+            555, None, 555, 9001, fp, "a.mp4", "video", "",
+            now, 1, "row-a", album_group_id="cangku-single:555:9001", album_position=0,
+        )
+        await self.db.save_scanned_message(
+            555, None, 555, 9001, fp, "a.mp4", "video", "教程",
+            now, 1, "row-a", album_group_id="cangku-single:555:9001", album_position=0,
+        )
+        rows = await self.db.list_files(50)
+        self.assertEqual([row["file_key"] for row in rows], ["row-a"])
+        self.assertEqual(rows[0]["category"], "教程")
+
     async def test_delivery_failure_attempts_accumulate_per_user_and_unit(self):
         """A unit that keeps failing must be countable, and clearable on success."""
         self.assertEqual(
