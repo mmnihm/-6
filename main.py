@@ -5479,6 +5479,16 @@ async def scanner_login_input_handler(client, message):
                 await message.reply_text(f"✅ 目录已重命名：{old_name} → {value[:120]}")
             else:
                 await message.reply_text("❌ 重命名失败：新名称可能已存在，或名称无效。请重新发送新的名称。")
+        elif pending_category["action"] == "description":
+            target_name = pending_category["name"]
+            new_desc = "" if value.strip() == "清空" else value[:1000]
+            if await db.set_category_description(target_name, new_desc):
+                pending_category_actions.pop(user.id, None)
+                await message.reply_text(
+                    f"✅ 目录简介已保存：{target_name}" + ("" if new_desc else "（已清空）")
+                )
+            else:
+                await message.reply_text("❌ 保存失败：目录可能已被删除，请重新打开目录管理。")
         return
 
     if not state or not login_client:
@@ -8012,7 +8022,8 @@ async def admin_callback_handler(client, query):
         buttons = [
             [InlineKeyboardButton("📂 查看内容", callback_data=f"mc:dircontent:{index}"),
              InlineKeyboardButton("📤 上传资源", callback_data=f"mc:dirupload:{index}")],
-            [InlineKeyboardButton("✏️ 修改目录名称", callback_data=f"mc:dirrename:{index}")],
+            [InlineKeyboardButton("✏️ 修改目录名称", callback_data=f"mc:dirrename:{index}"),
+             InlineKeyboardButton("📝 编辑简介", callback_data=f"mc:dirdesc:{index}")],
         ]
         if count == 0:
             buttons.append([InlineKeyboardButton("🗑 删除空目录", callback_data=f"mc:dirdelete:{index}")])
@@ -8030,6 +8041,8 @@ async def admin_callback_handler(client, query):
             f"📏 大小已知：{measured}/{count} 个\n"
             f"🔗 分享链接：{folder_share_url(str(row['share_key'])) if row['share_key'] and BOT_USERNAME else '机器人启动后可用'}"
         )
+        current_desc = str(row["description"] or "").strip()
+        detail += "\n📝 简介：" + (current_desc if current_desc else "（未设置）")
         if measured < count:
             detail += "\n\n⚠️ 部分文件大小未知，容量仅为已知文件合计。"
         detail += "\n\n" + ("这是空目录，可以删除。" if count == 0 else "目录含有资源，只能修改名称，不能删除资源。")
@@ -8147,6 +8160,22 @@ async def admin_callback_handler(client, query):
         await message.edit_text(
             f"✏️ 修改目录名称\n\n当前名称：{row['category']}\n请发送新的目录名称。\n"
             "目录内的资源会同步更名，不会删除或移动文件。",
+            reply_markup=back_keyboard(),
+        )
+    elif action.startswith("dirdesc:"):
+        try:
+            index = int(action.split(":", 1)[1])
+            row = (await db.list_categories())[index]
+        except (ValueError, IndexError):
+            await message.edit_text("⚠️ 目录列表已更新，请重新打开目录管理。", reply_markup=back_keyboard())
+            return
+        pending_category_actions[user.id] = {"action": "description", "name": row["category"]}
+        current_desc = str(row["description"] or "").strip()
+        await message.edit_text(
+            f"📝 编辑目录简介\n\n目录：{row['category']}\n"
+            f"当前简介：{current_desc if current_desc else '（未设置）'}\n\n"
+            "请直接发送简介文字（最多 1000 字），会员打开目录时会显示在名称下方。\n"
+            "发送「清空」可删除现有简介。",
             reply_markup=back_keyboard(),
         )
     elif action.startswith("dirdelete:"):

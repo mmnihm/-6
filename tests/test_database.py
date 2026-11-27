@@ -354,6 +354,19 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.db.delete_empty_category("待删除空目录"))
         self.assertFalse(await self.db.delete_empty_category("待删除空目录"))
 
+    async def test_category_description_can_be_set_updated_and_cleared(self):
+        await self.db.save_category("简介目录")
+        self.assertTrue(await self.db.set_category_description("简介目录", "首批合集简介"))
+        row = (await self.db.list_categories("简介目录"))[0]
+        self.assertEqual(row["description"], "首批合集简介")
+        self.assertTrue(await self.db.set_category_description("简介目录", "更新后的简介"))
+        row = (await self.db.list_categories("简介目录"))[0]
+        self.assertEqual(row["description"], "更新后的简介")
+        self.assertTrue(await self.db.set_category_description("简介目录", ""))
+        row = (await self.db.list_categories("简介目录"))[0]
+        self.assertEqual(row["description"], "")
+        self.assertFalse(await self.db.set_category_description("不存在的目录", "x"))
+
     async def test_bulk_file_lookup_and_history(self):
         await self.db.add_file("bulk001", 101, "one.mp4", "video", 11, 22, "电影")
         await self.db.add_file("bulk002", 101, "two.mp4", "video", 12, 23, "电影")

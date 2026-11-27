@@ -2685,6 +2685,20 @@ class Database:
             await db.commit()
             return existing is None
 
+    async def set_category_description(self, name: str, description: str) -> bool:
+        name = str(name or "").strip()[:120]
+        description = str(description or "").strip()[:1000]
+        if not name:
+            return False
+        now = iso_now()
+        async with self.connect() as db:
+            cur = await db.execute(
+                "UPDATE categories SET description=?, updated_at=? WHERE name=?",
+                (description, now, name),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
     async def refresh_category_stats(self, categories):
         """Refresh summaries for a set of changed folders in one database transaction."""
         names = sorted({str(name or "").strip() for name in categories if str(name or "").strip()})
